@@ -14,6 +14,32 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::reload;
 use tracing_subscriber::util::SubscriberInitExt;
 
+#[cfg(windows)]
+fn open_dashboard_when_ready(port: u16) {
+    tokio::spawn(async move {
+        let url = format!("http://127.0.0.1:{port}");
+        for _ in 0..50 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                if let Err(error) = std::process::Command::new("cmd")
+                    .args(["/C", "start", "", url.as_str()])
+                    .spawn()
+                {
+                    tracing::warn!(?error, "failed to open Live Replay dashboard");
+                }
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        tracing::warn!(url, "Live Replay started but the dashboard did not become reachable");
+    });
+}
+
+#[cfg(not(windows))]
+fn open_dashboard_when_ready(_port: u16) {}
+
 #[tokio::main]
 async fn main() -> AppResult<()> {
     // a builder for `FmtSubscriber`.
@@ -25,7 +51,12 @@ async fn main() -> AppResult<()> {
     //     .finish();
 
     // tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
-    let cli = Cli::parse();
+    let launched_without_args = std::env::args_os().len() == 1;
+    let cli = if launched_without_args {
+        Cli::parse_from(["live-replay", "server"])
+    } else {
+        Cli::parse()
+    };
 
     // use of deprecated function `time::util::local_offset::set_soundness`: no longer needed; TZ is refreshed manually
     // unsafe {
@@ -45,6 +76,10 @@ async fn main() -> AppResult<()> {
         .init();
 
     let user_cookie = expand_path(cli.user_cookie);
+
+    if launched_without_args {
+        open_dashboard_when_ready(19159);
+    }
 
     match cli.command {
         Commands::Login => login(user_cookie, cli.proxy.as_deref()).await?,

@@ -822,7 +822,13 @@ async fn filesystem_outbox_max_part(session_id: i64) -> i64 {
             _ => break,
         };
         let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+        let filename = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        if path.extension().and_then(|value| value.to_str()) != Some("json")
+            && !filename.ends_with(".json.tmp")
+        {
             continue;
         }
         let Ok(bytes) = tokio::fs::read(&path).await else {
@@ -1146,6 +1152,37 @@ async fn persist_outbox_record(
     .await
     .change_context(AppError::Unknown)?;
 
+    let outbox_row = sqlx::query(
+        "SELECT file_path, file_identity FROM replay_outbox \
+         WHERE session_id = ? AND part_number = ?",
+    )
+    .bind(record.session_id)
+    .bind(record.part_number)
+    .fetch_optional(&mut *tx)
+    .await
+    .change_context(AppError::Unknown)?
+    .ok_or_else(|| {
+        AppError::Custom(format!(
+            "replay outbox identity conflict at session={}, part={}",
+            record.session_id, record.part_number
+        ))
+    })?;
+    let outbox_path: String = outbox_row
+        .try_get("file_path")
+        .change_context(AppError::Unknown)?;
+    let outbox_identity: String = outbox_row
+        .try_get("file_identity")
+        .change_context(AppError::Unknown)?;
+    if outbox_path != record.file_path.display().to_string()
+        || outbox_identity != record.file_identity
+    {
+        return Err(AppError::Custom(format!(
+            "replay outbox collision at session={}, part={}; preserving new manifest and file",
+            record.session_id, record.part_number
+        ))
+        .into());
+    }
+
     sqlx::query(
         "INSERT OR IGNORE INTO recording_segments \
          (session_id, part_number, file_path, original_file_path, danmaku_file_path, file_size, file_mtime_ns, file_identity) \
@@ -1167,14 +1204,33 @@ async fn persist_outbox_record(
     .execute(&mut *tx)
     .await
     .change_context(AppError::Unknown)?;
-    let segment_id: i64 = sqlx::query_scalar(
-        "SELECT id FROM recording_segments WHERE session_id = ? AND part_number = ?",
+    let segment_row = sqlx::query(
+        "SELECT id, file_path, file_identity FROM recording_segments \
+         WHERE session_id = ? AND part_number = ?",
     )
     .bind(record.session_id)
     .bind(record.part_number)
     .fetch_one(&mut *tx)
     .await
     .change_context(AppError::Unknown)?;
+    let segment_id: i64 = segment_row
+        .try_get("id")
+        .change_context(AppError::Unknown)?;
+    let segment_path: String = segment_row
+        .try_get("file_path")
+        .change_context(AppError::Unknown)?;
+    let segment_identity: Option<String> = segment_row
+        .try_get("file_identity")
+        .change_context(AppError::Unknown)?;
+    if segment_path != record.file_path.display().to_string()
+        || segment_identity.as_deref() != Some(record.file_identity.as_str())
+    {
+        return Err(AppError::Custom(format!(
+            "recording segment collision at session={}, part={}; preserving new manifest and file",
+            record.session_id, record.part_number
+        ))
+        .into());
+    }
     sqlx::query("INSERT OR IGNORE INTO upload_jobs (segment_id) VALUES (?)")
         .bind(segment_id)
         .execute(&mut *tx)

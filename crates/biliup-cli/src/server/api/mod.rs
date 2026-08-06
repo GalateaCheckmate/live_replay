@@ -4,6 +4,8 @@ pub mod auth;
 pub mod bilibili_endpoints;
 /// 通用API端点
 pub mod endpoints;
+/// Live Replay 场次与上传队列端点
+pub mod replay_endpoints;
 /// 单页应用静态文件处理
 pub mod spa;
 pub mod ws;

@@ -229,26 +229,55 @@ pub async fn bind_replay_submission(
     Path(id): Path<i64>,
     Json(payload): Json<BindSubmissionRequest>,
 ) -> Result<Json<()>, Response> {
+    let aid = match i64::try_from(payload.aid) {
+        Ok(value) if value > 0 => value,
+        _ => {
+            return Err((axum::http::StatusCode::BAD_REQUEST, "AID 格式不正确").into_response());
+        }
+    };
+    let bvid = payload
+        .bvid
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
     let mut tx = pool
         .begin()
         .await
         .change_context(AppError::Unknown)
         .map_err(report_to_response)?;
-    let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM live_sessions WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await
-        .change_context(AppError::Unknown)
-        .map_err(report_to_response)?;
-    if exists.is_none() {
+    let row = sqlx::query(
+        "SELECT submit_state, aid, ended_at FROM live_sessions WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await
+    .change_context(AppError::Unknown)
+    .map_err(report_to_response)?;
+    let Some(row) = row else {
         return Err((axum::http::StatusCode::NOT_FOUND, "Replay session not found").into_response());
+    };
+    let submit_state: String = row.try_get("submit_state").map_err(sql_error)?;
+    let existing_aid: Option<i64> = row.try_get("aid").map_err(sql_error)?;
+    let ended_at: Option<String> = row.try_get("ended_at").map_err(sql_error)?;
+    if submit_state != "uncertain" || existing_aid.is_some() {
+        return Err((
+            axum::http::StatusCode::CONFLICT,
+            "只有首稿结果不确定且尚未绑定AID的场次才能绑定稿件",
+        )
+            .into_response());
     }
+
     sqlx::query(
         "UPDATE live_sessions SET aid = ?, bvid = ?, submit_state = 'created', \
-         status = 'recording_complete', last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+         status = ?, last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
     )
-    .bind(payload.aid as i64)
-    .bind(payload.bvid)
+    .bind(aid)
+    .bind(bvid)
+    .bind(if ended_at.is_none() {
+        "recording"
+    } else {
+        "recording_complete"
+    })
     .bind(id)
     .execute(&mut *tx)
     .await
@@ -298,10 +327,53 @@ pub async fn reset_replay_submission(
         .await
         .change_context(AppError::Unknown)
         .map_err(report_to_response)?;
+    let row = sqlx::query(
+        "SELECT submit_state, aid, ended_at FROM live_sessions WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await
+    .change_context(AppError::Unknown)
+    .map_err(report_to_response)?;
+    let Some(row) = row else {
+        return Err((axum::http::StatusCode::NOT_FOUND, "Replay session not found").into_response());
+    };
+    let submit_state: String = row.try_get("submit_state").map_err(sql_error)?;
+    let existing_aid: Option<i64> = row.try_get("aid").map_err(sql_error)?;
+    let ended_at: Option<String> = row.try_get("ended_at").map_err(sql_error)?;
+    if submit_state != "uncertain" || existing_aid.is_some() {
+        return Err((
+            axum::http::StatusCode::CONFLICT,
+            "只有首稿结果不确定且尚未绑定AID的场次才能确认无稿并重建",
+        )
+            .into_response());
+    }
+    let uncertain_first_part: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM recording_segments \
+         WHERE session_id = ? AND part_number = 1 AND status = 'submission_uncertain'",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await
+    .change_context(AppError::Unknown)
+    .map_err(report_to_response)?;
+    if uncertain_first_part.is_none() {
+        return Err((
+            axum::http::StatusCode::CONFLICT,
+            "当前场次不是首P投稿结果不确定，不能重建稿件",
+        )
+            .into_response());
+    }
+
     sqlx::query(
         "UPDATE live_sessions SET aid = NULL, bvid = NULL, submit_state = 'new', \
-         status = 'recording_complete', last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+         status = ?, last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
     )
+    .bind(if ended_at.is_none() {
+        "recording"
+    } else {
+        "recording_complete"
+    })
     .bind(id)
     .execute(&mut *tx)
     .await

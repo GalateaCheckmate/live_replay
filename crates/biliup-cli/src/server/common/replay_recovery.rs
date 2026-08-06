@@ -49,29 +49,36 @@ pub async fn recover_pending_sessions(
     .await
     .change_context(AppError::Unknown)?;
 
-    // 上传动作中断时可以安全重试；远端 filename 核对会避免重复追加。
+    // 只恢复已经关闭的旧场次。当前进程刚启动的上传可能已经进入 uploading，
+    // 绝不能被恢复器重置为 queued。
     sqlx::query(
         "UPDATE recording_segments SET status = CASE \
            WHEN remote_filename IS NOT NULL THEN 'uploaded_to_storage' ELSE 'queued' END, \
-         next_retry_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE status = 'uploading'",
+         next_retry_at = NULL, updated_at = CURRENT_TIMESTAMP \
+         WHERE status = 'uploading' AND session_id IN \
+           (SELECT id FROM live_sessions WHERE ended_at IS NOT NULL)",
     )
     .execute(&mut *tx)
     .await
     .change_context(AppError::Unknown)?;
     sqlx::query(
         "UPDATE upload_jobs SET status = 'queued', next_attempt_at = NULL, locked_at = NULL, \
-         updated_at = CURRENT_TIMESTAMP WHERE status = 'uploading'",
+         updated_at = CURRENT_TIMESTAMP WHERE status = 'uploading' AND segment_id IN \
+           (SELECT r.id FROM recording_segments r JOIN live_sessions s ON s.id = r.session_id \
+            WHERE s.ended_at IS NOT NULL)",
     )
     .execute(&mut *tx)
     .await
     .change_context(AppError::Unknown)?;
 
     // 首稿请求发出后没有保存到 AID 的窗口无法自动判定。宁可暂停，也绝不重复投稿。
+    // 同样只处理已经关闭的旧场次，避免干扰当前仍在等待网络响应的提交。
     sqlx::query(
         "UPDATE recording_segments SET status = 'submission_uncertain', \
          last_error = COALESCE(last_error, '首个投稿在程序退出时处于提交中；已暂停自动重投') \
          WHERE status = 'submitting' AND session_id IN \
-           (SELECT id FROM live_sessions WHERE aid IS NULL AND submit_state = 'submitting')",
+           (SELECT id FROM live_sessions \
+            WHERE ended_at IS NOT NULL AND aid IS NULL AND submit_state = 'submitting')",
     )
     .execute(&mut *tx)
     .await
@@ -79,7 +86,10 @@ pub async fn recover_pending_sessions(
     sqlx::query(
         "UPDATE upload_jobs SET status = 'submission_uncertain', locked_at = NULL, \
          last_error = COALESCE(last_error, '首个投稿结果不确定') \
-         WHERE segment_id IN (SELECT id FROM recording_segments WHERE status = 'submission_uncertain')",
+         WHERE segment_id IN ( \
+           SELECT r.id FROM recording_segments r JOIN live_sessions s ON s.id = r.session_id \
+           WHERE r.status = 'submission_uncertain' AND s.ended_at IS NOT NULL \
+         )",
     )
     .execute(&mut *tx)
     .await
@@ -87,7 +97,7 @@ pub async fn recover_pending_sessions(
     sqlx::query(
         "UPDATE live_sessions SET submit_state = 'uncertain', status = 'submission_uncertain', \
          last_error = COALESCE(last_error, '首个投稿结果不确定，等待绑定AID/BVID') \
-         WHERE aid IS NULL AND submit_state = 'submitting'",
+         WHERE ended_at IS NOT NULL AND aid IS NULL AND submit_state = 'submitting'",
     )
     .execute(&mut *tx)
     .await

@@ -4,6 +4,7 @@ use std::str::FromStr;
 
 pub mod download;
 pub mod replay;
+pub mod replay_recovery;
 pub mod upload;
 /// 通用工具函数
 pub mod util;

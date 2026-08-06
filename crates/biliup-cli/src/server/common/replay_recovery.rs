@@ -1,6 +1,6 @@
 use crate::server::common::replay;
 use crate::server::errors::{AppError, AppResult};
-use crate::server::infrastructure::connection_pool::ConnectionPool;
+use crate::server::infrastructure::connection_pool::{ConnectionPool, startup_cutoff};
 use crate::server::infrastructure::context::{Context, Worker};
 use crate::server::infrastructure::models::upload_streamer::UploadStreamer;
 use biliup::downloader::live::{DownloaderHint, LiveStream};
@@ -28,15 +28,12 @@ pub async fn recover_pending_sessions(
     pool: ConnectionPool,
     workers: Vec<Arc<Worker>>,
 ) -> AppResult<usize> {
-    let outbox_count = replay::recover_filesystem_outbox(&pool).await?;
-    if outbox_count > 0 {
-        info!(outbox_count, "restored filesystem replay outbox records");
-    }
-
+    let cutoff = startup_cutoff();
     let mut tx = pool.begin().await.change_context(AppError::Unknown)?;
 
-    // 进程退出时的活动录像已不可能仍在录制。将它们关闭为可恢复状态，
-    // 否则所有分段处理完后 session_can_finish 会永久等待 recording 结束。
+    // 只关闭本进程启动前已经停止活动的场次。监控器可能在恢复器运行前发现开播，
+    // 并创建新场次或重新启用旧场次；这些场次的 last_activity_at 会晚于 cutoff，
+    // 不能被当成上次崩溃遗留而误关。
     sqlx::query(
         "UPDATE live_sessions SET ended_at = COALESCE(ended_at, CURRENT_TIMESTAMP), \
          status = CASE \
@@ -44,8 +41,10 @@ pub async fn recover_pending_sessions(
            WHEN expected_parts = verified_parts THEN 'complete' \
            ELSE 'recording_complete' \
          END, updated_at = CURRENT_TIMESTAMP \
-         WHERE ended_at IS NULL",
+         WHERE ended_at IS NULL \
+           AND datetime(COALESCE(last_activity_at, updated_at, created_at)) < datetime(?)",
     )
+    .bind(cutoff)
     .execute(&mut *tx)
     .await
     .change_context(AppError::Unknown)?;
@@ -94,6 +93,13 @@ pub async fn recover_pending_sessions(
     .await
     .change_context(AppError::Unknown)?;
     tx.commit().await.change_context(AppError::Unknown)?;
+
+    // 先关闭旧场次，再导入文件系统 outbox。否则 outbox 恢复会刷新 last_activity_at，
+    // 让真正的崩溃遗留场次看起来像本次启动后仍在录制。
+    let outbox_count = replay::recover_filesystem_outbox(&pool).await?;
+    if outbox_count > 0 {
+        info!(outbox_count, "restored filesystem replay outbox records");
+    }
 
     let rows = sqlx::query(
         "SELECT s.id, s.live_streamer_id, s.source_streamer_info_id, s.streamer_name, \

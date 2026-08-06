@@ -7,7 +7,9 @@ ALTER TABLE live_sessions ADD COLUMN submit_token TEXT;
 ALTER TABLE live_sessions ADD COLUMN delete_after_success INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE live_sessions ADD COLUMN preserve_danmaku INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE live_sessions ADD COLUMN next_part_to_upload INTEGER NOT NULL DEFAULT 1;
-ALTER TABLE live_sessions ADD COLUMN last_activity_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP;
+ALTER TABLE live_sessions ADD COLUMN last_activity_at DATETIME;
+UPDATE live_sessions SET last_activity_at = COALESCE(updated_at, CURRENT_TIMESTAMP)
+WHERE last_activity_at IS NULL;
 
 ALTER TABLE recording_segments ADD COLUMN original_file_path TEXT;
 ALTER TABLE recording_segments ADD COLUMN file_identity TEXT;
@@ -38,7 +40,6 @@ CREATE TABLE IF NOT EXISTS replay_outbox
     UNIQUE(file_path)
 );
 
--- 未完成任务存在时，禁止删除监控主播。否则原有级联关系会把上传队列一起删掉。
 CREATE TRIGGER IF NOT EXISTS protect_pending_replay_streamer_delete
 BEFORE DELETE ON livestreamers
 WHEN EXISTS (
@@ -52,7 +53,6 @@ BEGIN
     SELECT RAISE(ABORT, '该主播仍有未完成的 Live Replay 上传任务，不能删除');
 END;
 
--- 投稿模板被主播引用时禁止直接删除，避免 ON DELETE CASCADE 连带删除主播及队列。
 CREATE TRIGGER IF NOT EXISTS protect_referenced_upload_template_delete
 BEFORE DELETE ON uploadstreamers
 WHEN EXISTS (SELECT 1 FROM livestreamers WHERE upload_streamers_id = OLD.id)
@@ -60,7 +60,6 @@ BEGIN
     SELECT RAISE(ABORT, '投稿模板仍被主播使用，请先解除关联');
 END;
 
--- 历史记录仍被未完成队列引用时禁止删除。
 CREATE TRIGGER IF NOT EXISTS protect_pending_streamerinfo_delete
 BEFORE DELETE ON streamerinfo
 WHEN EXISTS (

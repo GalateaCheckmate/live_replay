@@ -1,3 +1,3 @@
-Run final Full validation after the second static audit.
-Triggered: 2026-08-06T21:55:00+08:00
-Purpose: verify tests, Windows release build, and portable ZIP on the audited main branch.
+Run final Full validation for the Windows packaging fixes.
+Triggered: 2026-08-06T22:36:00+08:00
+Purpose: verify no-argument executable startup, dashboard response, release build, and single-layer artifact contents.

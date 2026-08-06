@@ -65,16 +65,16 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist/live-replay | Out-Null
           Copy-Item target/release/biliup.exe dist/live-replay/live-replay.exe
+          Copy-Item '启动 Live Replay.bat' 'dist/live-replay/启动 Live Replay.bat'
           Copy-Item LICENSE dist/live-replay/LICENSE
           Copy-Item README.md dist/live-replay/README.md
           Copy-Item LIVE_REPLAY.md dist/live-replay/LIVE_REPLAY.md
           Copy-Item public/config.toml dist/live-replay/config.example.toml
-          Compress-Archive -Path dist/live-replay/* -DestinationPath dist/live-replay-windows.zip -Force
 
       - name: Upload Windows package
         uses: actions/upload-artifact@v4
         with:
           name: live-replay-windows
-          path: dist/live-replay-windows.zip
+          path: dist/live-replay/*
           if-no-files-found: error
           retention-days: 14

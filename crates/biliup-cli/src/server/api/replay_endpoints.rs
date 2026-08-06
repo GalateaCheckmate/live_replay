@@ -163,7 +163,6 @@ pub async fn get_replay_jobs(
     Ok(Json(result))
 }
 
-/// 清除退避并真正唤醒当前场次工作器。
 pub async fn retry_replay_job(
     State(pool): State<ConnectionPool>,
     Path(id): Path<i64>,
@@ -225,7 +224,6 @@ pub async fn retry_replay_job(
     Ok(Json(()))
 }
 
-/// 首稿结果不确定时，用户从B站稿件页确认后绑定已有稿件。
 pub async fn bind_replay_submission(
     State(pool): State<ConnectionPool>,
     Path(id): Path<i64>,
@@ -283,7 +281,6 @@ pub async fn bind_replay_submission(
     Ok(Json(()))
 }
 
-/// 只有用户明确确认B站端没有生成稿件时，才允许重新创建首稿。
 pub async fn reset_replay_submission(
     State(pool): State<ConnectionPool>,
     Path(id): Path<i64>,
@@ -310,8 +307,10 @@ pub async fn reset_replay_submission(
     .await
     .change_context(AppError::Unknown)
     .map_err(report_to_response)?;
+    // 明确确认无稿后，清除临时上传标识并重新上传本地文件，避免复用已过期的B站存储对象。
     sqlx::query(
-        "UPDATE recording_segments SET status = 'queued', last_error = NULL, next_retry_at = NULL, \
+        "UPDATE recording_segments SET status = 'queued', remote_filename = NULL, \
+         uploaded_filename = NULL, uploaded_at = NULL, last_error = NULL, next_retry_at = NULL, \
          updated_at = CURRENT_TIMESTAMP WHERE session_id = ? AND status = 'submission_uncertain'",
     )
     .bind(id)

@@ -309,6 +309,16 @@ pub async fn start_download_workflow(
     sender: Sender<UploaderMessage>,
     rooms_handle: Arc<Monitor>,
 ) {
+    if let Err(error) = ctx.ensure_recording_space() {
+        error!(
+            error = ?error,
+            url = ctx.live_streamer().url,
+            "recording skipped by disk-space protection"
+        );
+        rooms_handle.wake_waker(ctx.worker_id()).await;
+        return;
+    }
+
     let task = Arc::new(DownloadTask::new(downloader_runtime(
         ctx.config().downloader,
         ctx.live_stream(),

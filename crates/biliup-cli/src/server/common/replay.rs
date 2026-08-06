@@ -723,7 +723,12 @@ async fn freeze_upload_config(
             .await
             .change_context(AppError::Unknown)?;
         let target = Path::new(CREDENTIAL_DIR).join(format!("{session_key}.json"));
-        tokio::fs::copy(source_path, &target)
+        let temporary = target.with_extension("json.part");
+        let _ = tokio::fs::remove_file(&temporary).await;
+        tokio::fs::copy(source_path, &temporary)
+            .await
+            .change_context(AppError::Unknown)?;
+        tokio::fs::rename(&temporary, &target)
             .await
             .change_context(AppError::Unknown)?;
         frozen.user_cookie = Some(target.display().to_string());
@@ -894,7 +899,33 @@ async fn move_file(source: &Path, destination: &Path) -> AppResult<()> {
     match tokio::fs::rename(source, destination).await {
         Ok(()) => Ok(()),
         Err(_) => {
-            tokio::fs::copy(source, destination)
+            let temporary = destination.with_extension(format!(
+                "{}.move-part",
+                destination
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("file")
+            ));
+            let _ = tokio::fs::remove_file(&temporary).await;
+            tokio::fs::copy(source, &temporary)
+                .await
+                .change_context(AppError::Unknown)?;
+            let source_size = tokio::fs::metadata(source)
+                .await
+                .change_context(AppError::Unknown)?
+                .len();
+            let copied_size = tokio::fs::metadata(&temporary)
+                .await
+                .change_context(AppError::Unknown)?
+                .len();
+            if copied_size != source_size {
+                let _ = tokio::fs::remove_file(&temporary).await;
+                return Err(AppError::Custom(format!(
+                    "cross-device copy size mismatch: source={source_size}, copied={copied_size}"
+                ))
+                .into());
+            }
+            tokio::fs::rename(&temporary, destination)
                 .await
                 .change_context(AppError::Unknown)?;
             tokio::fs::remove_file(source)
@@ -1188,6 +1219,8 @@ async fn remux_to_mp4(source: &Path) -> AppResult<PathBuf> {
     {
         return Ok(destination);
     }
+    let temporary = destination.with_extension("mp4.part");
+    let _ = tokio::fs::remove_file(&temporary).await;
     let extension = source
         .extension()
         .and_then(|value| value.to_str())
@@ -1207,8 +1240,10 @@ async fn remux_to_mp4(source: &Path) -> AppResult<PathBuf> {
             "+faststart",
             "-avoid_negative_ts",
             "make_zero",
+            "-f",
+            "mp4",
         ])
-        .arg(&destination)
+        .arg(&temporary)
         .kill_on_drop(true);
     let status = command
         .status()
@@ -1217,20 +1252,23 @@ async fn remux_to_mp4(source: &Path) -> AppResult<PathBuf> {
             "failed to start ffmpeg remux".to_string(),
         ))?;
     if !status.success() {
-        let _ = tokio::fs::remove_file(&destination).await;
+        let _ = tokio::fs::remove_file(&temporary).await;
         return Err(AppError::Custom(format!(
             "ffmpeg remux failed for {}",
             source.display()
         ))
         .into());
     }
-    let metadata = tokio::fs::metadata(&destination)
+    let metadata = tokio::fs::metadata(&temporary)
         .await
         .change_context(AppError::Unknown)?;
     if metadata.len() == 0 {
-        let _ = tokio::fs::remove_file(&destination).await;
+        let _ = tokio::fs::remove_file(&temporary).await;
         return Err(AppError::Custom("ffmpeg produced an empty MP4".to_string()).into());
     }
+    tokio::fs::rename(&temporary, &destination)
+        .await
+        .change_context(AppError::Unknown)?;
     Ok(destination)
 }
 

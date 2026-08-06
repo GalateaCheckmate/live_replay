@@ -1,3 +1,4 @@
+use crate::server::common::replay;
 use crate::server::common::upload::UploaderMessage;
 use crate::server::common::util::FileValidator;
 use crate::server::core::downloader::cover_downloader;
@@ -60,50 +61,60 @@ impl SegmentEventProcessor {
 
     /// 处理分段事件
     pub fn process(&mut self, event: SegmentInfo) -> AppResult<()> {
-        // 验证文件有效性
+        // 只有下载器已关闭并通过文件验证的完整分段，才允许进入上传队列。
         self.file_validator.validate(&event.prev_file_path)?;
 
-        // 上一轮 process_with_upload 可能因上传失败提前返回，UActor 已 drop rx，
-        // 这里挂着的 tx 是死的；丢弃后下面会重建一条新的管道。
         if let Some(tx) = &self.channel
             && tx.is_closed()
         {
             warn!(
                 url = self.ctx.live_streamer().url,
-                "upload channel closed by uploader, reopening"
+                "segment channel closed, reopening"
             );
             self.channel = None;
         }
 
         match &self.channel {
             None => {
-                let (tx, rx) = async_channel::bounded(32); // Use tokio channel for async
+                // 无界通道只负责快速登记分段。上传重试在独立数据库队列中执行，
+                // 网络或账号故障不会反向阻塞录制线程。
+                let (tx, rx) = async_channel::unbounded();
 
-                // 发送到上传器
-                let res = self
-                    .uploader
-                    .force_send(UploaderMessage::SegmentEvent(rx.clone(), self.ctx.clone()))
-                    .change_context(AppError::Custom("Failed to send to uploader".to_string()))?;
-                if let Some(prev) = res {
-                    warn!(SegmentEvent = ?prev, "replace an existing message in the channel");
+                match self.ctx.upload_config().clone() {
+                    Some(config) if !config.is_noop_uploader() => {
+                        let ctx = self.ctx.clone();
+                        tokio::spawn(async move {
+                            replay::process_session(rx, ctx, config).await;
+                        });
+                    }
+                    _ => {
+                        // Noop 或无上传配置继续沿用原版后处理链路。
+                        let res = self
+                            .uploader
+                            .force_send(UploaderMessage::SegmentEvent(rx, self.ctx.clone()))
+                            .change_context(AppError::Custom(
+                                "Failed to send to uploader".to_string(),
+                            ))?;
+                        if let Some(prev) = res {
+                            warn!(SegmentEvent = ?prev, "replace an existing uploader message");
+                        }
+                    }
                 }
 
-                // 发送到缓冲区
                 let res = tx
                     .force_send(event)
-                    .change_context(AppError::Custom("Failed to send to buffer".to_string()))?;
+                    .change_context(AppError::Custom("Failed to persist segment event".to_string()))?;
                 if let Some(prev) = res {
-                    warn!(SegmentEvent = ?prev, "replace an existing message in the channel");
+                    warn!(SegmentEvent = ?prev, "replace an existing segment event");
                 }
                 self.channel = Some(tx);
             }
             Some(tx) => {
-                // 发送到缓冲区
                 let res = tx
                     .force_send(event)
-                    .change_context(AppError::Custom("Failed to send to buffer".to_string()))?;
+                    .change_context(AppError::Custom("Failed to persist segment event".to_string()))?;
                 if let Some(prev) = res {
-                    warn!(SegmentEvent = ?prev, "replace an existing message in the channel");
+                    warn!(SegmentEvent = ?prev, "replace an existing segment event");
                 }
             }
         }
@@ -139,7 +150,7 @@ impl DownloadTask {
         let mut retry_count = 0;
         let max_retries = 3; // 最大重试次数
         let base_delay = Duration::from_secs(2); // 基础延迟时间（2秒）
-        let max_delay = Duration::from_secs(ctx.config().delay); // 最大延迟时间（60秒）
+        let max_delay = Duration::from_secs(ctx.config().delay); // 最大延迟时间
         let url = ctx.live_streamer().url.clone();
         let mut stream = ctx.live_stream().clone();
         let filename_prefix = ctx
@@ -154,17 +165,12 @@ impl DownloadTask {
         );
         // 启动弹幕客户端
         if let Some(ref client) = danmaku_client {
-            // 启动弹幕下载逻辑
             info!("Starting danmaku client for stream: {}", url);
             client.download().await?;
         }
 
-        // 初始化组件
         let mut processor = SegmentEventProcessor::new(sender, ctx.clone());
         let result = loop {
-            // 创建守卫确保清理
-            // 创建事件处理器
-            // 执行下载
             let components = self
                 .download(&mut processor, ctx.clone(), danmaku_client.clone(), &stream)
                 .await;
@@ -185,17 +191,14 @@ impl DownloadTask {
                         url = url,
                         "Stream is still live, preparing to retry. attempt: {}", retry_count
                     );
-                    // 成功下载后重置计数
                     retry_count = 0;
                 }
                 Ok(LiveStatus::Offline) => {
                     retry_count += 1;
-                    // 继续循环，重新执行下载
                     info!(url = url, "Stream went offline, stopping download");
                 }
                 Err(e) => {
                     retry_count += 1;
-                    // 继续循环，重新执行下载
                     warn!(
                         url = url,
                         "Failed to check stream status: {:?}, stopping download", e
@@ -218,25 +221,21 @@ impl DownloadTask {
                 max_retries
             );
 
-            // 计算指数退避延迟: delay = base_delay * 2^retry_count
             let delay = if retry_count != 0 {
                 base_delay * 2_u32.pow(retry_count)
             } else {
                 Duration::ZERO
             };
-            let delay = delay.min(max_delay); // 限制最大延迟时间
+            let delay = delay.min(max_delay);
 
             info!("Retrying download in {:?}...", delay);
             tokio::time::sleep(delay).await;
         };
-        // 异步清理任务
         if let Some(client) = danmaku_client.clone()
             && let Err(e) = client.stop().await
         {
             error!("Error stopping danmaku client: {}", e);
         }
-        // 清理资源
-        // 确保状态更新和资源清理
         rooms_handle.wake_waker(ctx.worker_id()).await;
         info!("Download task completed: {:?}", result);
         self.done_notify.notify_one();
@@ -250,19 +249,14 @@ impl DownloadTask {
         danmaku_client: Option<Arc<dyn DanmakuClient + Send + Sync>>,
         stream: &LiveStream,
     ) -> AppResult<DownloadStatus> {
-        // 获取配置和主播信息
         let streamer = ctx.live_streamer();
 
-        // 执行下载
-        // let hook = processor.create_hook(danmaku_client.clone());
         let hook = |event| {
             match event {
                 SegmentEvent::Start { .. } => {
                     warn!("Ignoring unexpected segment start event");
                 }
                 SegmentEvent::Segment(mut event) => {
-                    // 分段时，获取到的是已下载的文件名
-                    // 触发弹幕滚动保存
                     if let Some(ref client) = danmaku_client {
                         let danmaku_file_path = event.prev_file_path.with_extension("xml");
                         match client.rolling(&danmaku_file_path.display().to_string()) {
@@ -271,8 +265,6 @@ impl DownloadTask {
                             Err(e) => error!("Danmaku rolling error: {}", e),
                         }
                     }
-                    // 异步处理事件
-                    // let processor = processor.clone();
                     if let Err(e) = processor.process(event) {
                         error!("Failed to process segment event: {}", e);
                     }
@@ -295,14 +287,11 @@ impl DownloadTask {
             .await
             .change_context(AppError::Custom("Failed to download segment".into()))?;
 
-        // 处理结果
         info!(url=streamer.url,result=?result, "finished downloading");
         Ok(result)
     }
 
     pub(crate) async fn stop(&self) -> AppResult<()> {
-        // 仅发出取消信号并更新状态
-        // 如果底层下载函数不支持取消，这里不能真正中断正在进行的下载
         self.token.cancel();
         self.downloader.stop().await?;
         self.done_notify.notified().await;

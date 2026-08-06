@@ -38,12 +38,15 @@ SET next_part_to_upload = COALESCE(
            AND r.status NOT IN ('deleted', 'retained')),
         expected_parts + 1
     ),
-    verified_parts = COALESCE(
-        (SELECT MAX(r.part_number)
-         FROM recording_segments r
-         WHERE r.session_id = live_sessions.id
-           AND r.status IN ('deleted', 'retained')),
-        verified_parts
+    verified_parts = MAX(
+        verified_parts,
+        COALESCE(
+            (SELECT MAX(r.part_number)
+             FROM recording_segments r
+             WHERE r.session_id = live_sessions.id
+               AND r.status IN ('deleted', 'retained')),
+            0
+        )
     );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_live_sessions_session_key

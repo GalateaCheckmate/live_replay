@@ -1,4 +1,4 @@
-use crate::server::common::upload::{build_studio, execute_postprocessor, submit_to_bilibili};
+use crate::server::common::upload::{build_studio, submit_to_bilibili};
 use crate::server::core::downloader::SegmentInfo;
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
@@ -15,7 +15,7 @@ use error_stack::ResultExt;
 use futures::StreamExt;
 use rand::random;
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, Sqlite};
+use sqlx::Row;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -29,6 +29,7 @@ const VERIFY_INTERVAL_SECONDS: u64 = 10;
 const RETRY_DELAYS: [u64; 5] = [60, 300, 900, 1800, 3600];
 const DEFAULT_REPLAY_TITLE: &str = "{streamer} 直播回放 %Y-%m-%d %H-%M";
 const OUTBOX_DIR: &str = "data/replay-outbox";
+const CREDENTIAL_DIR: &str = "data/replay-credentials";
 
 #[derive(Debug, Clone)]
 struct SessionRecord {
@@ -36,7 +37,6 @@ struct SessionRecord {
     aid: Option<u64>,
     bvid: Option<String>,
     submit_state: String,
-    next_part_to_upload: i64,
     delete_after_success: bool,
     preserve_danmaku: bool,
 }
@@ -47,7 +47,6 @@ struct SegmentRecord {
     session_id: i64,
     part_number: i64,
     file_path: PathBuf,
-    original_file_path: Option<PathBuf>,
     processed_file_path: Option<PathBuf>,
     danmaku_file_path: Option<PathBuf>,
     status: String,
@@ -65,6 +64,14 @@ struct OutboxRecord {
     file_size: i64,
     file_mtime_ns: i64,
     file_identity: String,
+}
+
+#[derive(Debug)]
+enum RemotePartState {
+    Missing,
+    MatchingProcessing,
+    MatchingReady,
+    Conflict(String),
 }
 
 struct UploadRuntime {
@@ -85,7 +92,6 @@ fn notifiers() -> &'static Mutex<HashMap<i64, Arc<Notify>>> {
 }
 
 fn upload_slots() -> &'static Semaphore {
-    // 旧电脑默认只允许一个录像文件上传；文件内部仍可使用分片线程。
     static SLOTS: OnceLock<Semaphore> = OnceLock::new();
     SLOTS.get_or_init(|| Semaphore::new(1))
 }
@@ -109,37 +115,37 @@ async fn wait_or_wake(session_id: i64, seconds: u64) {
     }
 }
 
-/// 接收一个直播场次产生的所有完整分段。登记与上传完全解耦。
 pub async fn process_session(
     rx: Receiver<SegmentInfo>,
     ctx: Context,
     upload_config: UploadStreamer,
 ) {
-    let session = match ensure_session(&ctx, &upload_config).await {
-        Ok(session) => session,
+    let (session, frozen_upload_config) = match ensure_session(&ctx, &upload_config).await {
+        Ok(value) => value,
         Err(e) => {
             error!(error = ?e, url = ctx.live_streamer().url, "failed to create replay session");
             return;
         }
     };
 
-    spawn_queue_worker(session.id, ctx.clone(), upload_config.clone()).await;
+    spawn_queue_worker(session.id, ctx.clone(), frozen_upload_config.clone()).await;
 
     while let Ok(event) = rx.recv().await {
         match register_segment(&ctx, session.id, &event).await {
             Ok(_) => {
                 wake_session(session.id).await;
-                spawn_queue_worker(session.id, ctx.clone(), upload_config.clone()).await;
+                spawn_queue_worker(session.id, ctx.clone(), frozen_upload_config.clone()).await;
             }
             Err(e) => {
-                // 文件已经先移动到唯一的安全队列目录，并写入文件系统 outbox。
-                // SQLite 恢复后会重新登记，不会丢失这段录像。
                 error!(error = ?e, file = ?event.prev_file_path, "segment persisted to filesystem outbox");
                 let pool = ctx.pool().clone();
                 tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_secs(15)).await;
-                    if let Err(error) = recover_filesystem_outbox(&pool).await {
-                        error!(error = ?error, "delayed replay outbox recovery failed");
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        match recover_filesystem_outbox(&pool).await {
+                            Ok(_) => break,
+                            Err(error) => error!(error = ?error, "delayed replay outbox recovery failed"),
+                        }
                     }
                 });
             }
@@ -150,10 +156,9 @@ pub async fn process_session(
         error!(error = ?e, session_id = session.id, "failed to close replay session");
     }
     wake_session(session.id).await;
-    spawn_queue_worker(session.id, ctx, upload_config).await;
+    spawn_queue_worker(session.id, ctx, frozen_upload_config).await;
 }
 
-/// 恢复器直接按 session_id 启动，避免通过时间窗口重新猜测场次。
 pub async fn resume_session(session_id: i64, ctx: Context, upload_config: UploadStreamer) {
     spawn_queue_worker(session_id, ctx, upload_config).await;
 }
@@ -167,7 +172,6 @@ async fn spawn_queue_worker(session_id: i64, ctx: Context, upload_config: Upload
     }
 
     tokio::spawn(async move {
-        // 数据库或网络的瞬时错误不应永久杀死工作器。
         loop {
             match run_queue_worker(session_id, &ctx, &upload_config).await {
                 Ok(()) => break,
@@ -189,8 +193,7 @@ async fn run_queue_worker(
 ) -> AppResult<()> {
     loop {
         if let Some(segment) = next_ready_segment(ctx.pool(), session_id).await? {
-            let result = process_segment(ctx, upload_config, &segment).await;
-            if let Err(e) = result {
+            if let Err(e) = process_segment(ctx, upload_config, &segment).await {
                 let current = load_segment(ctx.pool(), segment.id).await?;
                 if matches!(current.status.as_str(), "conflict" | "submission_uncertain") {
                     warn!(session_id, part = segment.part_number, status = current.status, "segment requires manual resolution");
@@ -222,8 +225,7 @@ async fn process_segment(
     segment: &SegmentRecord,
 ) -> AppResult<()> {
     let session = load_session(ctx.pool(), segment.session_id).await?;
-
-    if matches!(segment.status.as_str(), "remote_verified" | "postprocessing" | "cleanup_pending") {
+    if matches!(segment.status.as_str(), "remote_verified" | "cleanup_pending") {
         return resume_cleanup(ctx, &session, segment).await;
     }
 
@@ -234,7 +236,15 @@ async fn process_segment(
     let remote_filename = if let Some(filename) = current.remote_filename.clone() {
         filename
     } else {
-        let paths = prepare_paths(ctx.pool(), &current, ctx.live_streamer().segment_processor.as_deref().unwrap_or_default()).await?;
+        let paths = prepare_paths(
+            ctx.pool(),
+            &current,
+            ctx.live_streamer()
+                .segment_processor
+                .as_deref()
+                .unwrap_or_default(),
+        )
+        .await?;
         let upload_path = paths
             .first()
             .cloned()
@@ -249,18 +259,21 @@ async fn process_segment(
     video.title = Some(part_title(&current));
 
     let aid = if let Some(aid) = session.aid {
-        match remote_part_identity(&runtime.bilibili, aid, current.part_number as usize).await? {
-            Some(filename) if filename == remote_filename => aid,
-            Some(filename) => {
+        match remote_part_state(&runtime.bilibili, aid, current.part_number as usize, &remote_filename).await? {
+            RemotePartState::MatchingReady | RemotePartState::MatchingProcessing => aid,
+            RemotePartState::Conflict(filename) => {
                 mark_conflict(
                     ctx.pool(),
                     &current,
-                    &format!("远端 P{} 文件标识为 {filename}，本地上传标识为 {remote_filename}", current.part_number),
+                    &format!(
+                        "远端 P{} 文件标识为 {filename}，本地上传标识为 {remote_filename}",
+                        current.part_number
+                    ),
                 )
                 .await?;
                 return Ok(());
             }
-            None => {
+            RemotePartState::Missing => {
                 append_video(
                     &runtime.bilibili,
                     aid,
@@ -274,7 +287,7 @@ async fn process_segment(
             }
         }
     } else {
-        if session.submit_state == "submitting" || session.submit_state == "uncertain" {
+        if matches!(session.submit_state.as_str(), "submitting" | "uncertain") {
             mark_submission_uncertain(
                 ctx.pool(),
                 &current,
@@ -301,7 +314,13 @@ async fn process_segment(
             .title
             .clone()
             .or_else(|| Some(DEFAULT_REPLAY_TITLE.to_string()));
-        let studio = build_studio(&submission_config, &runtime.bilibili, vec![video], &recorder).await?;
+        let studio = build_studio(
+            &submission_config,
+            &runtime.bilibili,
+            vec![video],
+            &recorder,
+        )
+        .await?;
 
         mark_submitting(ctx.pool(), current.session_id, current.id).await?;
         let response = match submit_to_bilibili(
@@ -327,7 +346,39 @@ async fn process_segment(
         aid
     };
 
-    verify_remote_part_exact(&runtime.bilibili, aid, current.part_number as usize, &remote_filename).await?;
+    match wait_for_remote_ready(
+        &runtime.bilibili,
+        aid,
+        current.part_number as usize,
+        &remote_filename,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(error) => {
+            if let Ok(RemotePartState::Conflict(filename)) = remote_part_state(
+                &runtime.bilibili,
+                aid,
+                current.part_number as usize,
+                &remote_filename,
+            )
+            .await
+            {
+                mark_conflict(
+                    ctx.pool(),
+                    &current,
+                    &format!(
+                        "远端 P{} 文件标识为 {filename}，本地上传标识为 {remote_filename}",
+                        current.part_number
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+            return Err(error);
+        }
+    }
+
     mark_remote_verified(ctx.pool(), &current).await?;
     let verified = load_segment(ctx.pool(), current.id).await?;
     let session = load_session(ctx.pool(), current.session_id).await?;
@@ -362,7 +413,10 @@ async fn append_video(
     studio.aid = Some(aid);
     studio.videos.push(video);
     if submit_api.is_some_and(|value| value.eq_ignore_ascii_case("web")) {
-        bilibili.edit_by_web(&studio).await.change_context(AppError::Unknown)?;
+        bilibili
+            .edit_by_web(&studio)
+            .await
+            .change_context(AppError::Unknown)?;
     } else {
         bilibili
             .edit_by_app(&studio, None)
@@ -372,43 +426,61 @@ async fn append_video(
     Ok(())
 }
 
-async fn remote_part_identity(
+async fn remote_part_state(
     bilibili: &BiliBili,
     aid: u64,
     part_number: usize,
-) -> AppResult<Option<String>> {
-    let studio = bilibili
-        .studio_data(&Vid::Aid(aid), None)
+    expected_filename: &str,
+) -> AppResult<RemotePartState> {
+    let data = bilibili
+        .video_data(&Vid::Aid(aid), None)
         .await
         .change_context(AppError::Unknown)?;
-    Ok(studio
-        .videos
-        .get(part_number.saturating_sub(1))
-        .map(|video| video.filename.clone()))
+    let Some(part) = data
+        .get("videos")
+        .and_then(|value| value.as_array())
+        .and_then(|videos| videos.get(part_number.saturating_sub(1)))
+    else {
+        return Ok(RemotePartState::Missing);
+    };
+    let filename = part
+        .get("filename")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if filename != expected_filename {
+        return Ok(RemotePartState::Conflict(filename));
+    }
+    let duration = part
+        .get("duration")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    if duration > 0 {
+        Ok(RemotePartState::MatchingReady)
+    } else {
+        Ok(RemotePartState::MatchingProcessing)
+    }
 }
 
-async fn verify_remote_part_exact(
+async fn wait_for_remote_ready(
     bilibili: &BiliBili,
     aid: u64,
     part_number: usize,
     expected_filename: &str,
 ) -> AppResult<()> {
     for _ in 0..VERIFY_ATTEMPTS {
-        let studio = bilibili
-            .studio_data(&Vid::Aid(aid), None)
-            .await
-            .change_context(AppError::Unknown)?;
-        if let Some(remote) = studio.videos.get(part_number.saturating_sub(1)) {
-            if remote.filename == expected_filename {
-                return Ok(());
+        match remote_part_state(bilibili, aid, part_number, expected_filename).await? {
+            RemotePartState::MatchingReady => return Ok(()),
+            RemotePartState::Conflict(filename) => {
+                return Err(AppError::Custom(format!(
+                    "remote identity conflict at P{part_number}: expected {expected_filename}, got {filename}"
+                ))
+                .into());
             }
-            return Err(AppError::Custom(format!(
-                "remote identity conflict at P{part_number}: expected {expected_filename}, got {}",
-                remote.filename
-            ))
-            .into());
+            RemotePartState::Missing | RemotePartState::MatchingProcessing => {
+                tokio::time::sleep(Duration::from_secs(VERIFY_INTERVAL_SECONDS)).await;
+            }
         }
-        tokio::time::sleep(Duration::from_secs(VERIFY_INTERVAL_SECONDS)).await;
     }
     Err(AppError::Custom(format!(
         "remote part verification timed out: aid={aid}, part={part_number}"
@@ -416,33 +488,37 @@ async fn verify_remote_part_exact(
     .into())
 }
 
-async fn resume_cleanup(ctx: &Context, session: &SessionRecord, segment: &SegmentRecord) -> AppResult<()> {
+async fn resume_cleanup(
+    ctx: &Context,
+    session: &SessionRecord,
+    segment: &SegmentRecord,
+) -> AppResult<()> {
+    let paths = prepared_paths(segment);
     if !session.delete_after_success {
+        // 只保留最终可播放的 MP4；自动直封装产生的源容器可在远端验证后安全清理。
+        if let Some(processed) = &segment.processed_file_path
+            && processed != &segment.file_path
+        {
+            let _ = tokio::fs::remove_file(&segment.file_path).await;
+        }
         return mark_terminal(ctx.pool(), segment, "retained").await;
     }
 
-    let paths = prepared_paths(segment);
-    if segment.status == "remote_verified" {
-        mark_cleanup_state(ctx.pool(), segment.id, "postprocessing").await?;
-    }
-
-    if matches!(segment.status.as_str(), "remote_verified" | "postprocessing") {
-        execute_postprocessor(paths.clone(), ctx).await?;
-        mark_cleanup_state(ctx.pool(), segment.id, "cleanup_pending").await?;
-    }
-
-    // 自定义 run/mv 后处理可能把文件移动到未知位置；这时宁可保留记录，也不猜测删除。
-    let has_unknown_path_effect = ctx
+    // Live Replay 的清理必须完全幂等。自定义 run/mv 后处理无法证明执行结果，
+    // 因此不自动执行，也不猜测删除；保留文件并交给用户处理。
+    let unsafe_postprocessor = ctx
         .live_streamer()
         .postprocessor
         .as_deref()
         .unwrap_or_default()
         .iter()
-        .any(|step| matches!(step, HookStep::Run { .. } | HookStep::Move { .. }));
-    if has_unknown_path_effect {
+        .any(|step| !matches!(step, HookStep::Remove(command) if command == "rm"));
+    if unsafe_postprocessor {
+        warn!(session_id = segment.session_id, part = segment.part_number, "custom postprocessor is not crash-idempotent; retaining verified files");
         return mark_terminal(ctx.pool(), segment, "retained").await;
     }
 
+    mark_cleanup_state(ctx.pool(), segment.id, "cleanup_pending").await?;
     safe_delete_paths(segment, &paths, session.preserve_danmaku).await?;
     mark_terminal(ctx.pool(), segment, "deleted").await
 }
@@ -451,7 +527,6 @@ async fn initialize_upload_runtime(
     ctx: &Context,
     upload_config: &UploadStreamer,
 ) -> AppResult<UploadRuntime> {
-    // 每次重试都重新读取 Cookie 文件。用户重新扫码后无需重启服务。
     let cookie_file = upload_config
         .user_cookie
         .clone()
@@ -506,7 +581,12 @@ async fn upload_single_file(file_path: &Path, runtime: &UploadRuntime) -> AppRes
         .await
         .change_context(AppError::Unknown)?;
     let elapsed_ms = started.elapsed().as_millis().max(1);
-    info!(file = file_name, seconds = elapsed_ms as f64 / 1000.0, mb_per_second = total_size as f64 / 1000.0 / elapsed_ms as f64, "Live Replay upload completed");
+    info!(
+        file = file_name,
+        seconds = elapsed_ms as f64 / 1000.0,
+        mb_per_second = total_size as f64 / 1000.0 / elapsed_ms as f64,
+        "Live Replay upload completed"
+    );
     Ok(video)
 }
 
@@ -528,12 +608,19 @@ fn extract_remote_ids(response: &ResponseData) -> AppResult<(u64, Option<String>
     Ok((aid, bvid))
 }
 
-async fn ensure_session(ctx: &Context, upload_config: &UploadStreamer) -> AppResult<SessionRecord> {
-    let reconnect_window = env_u64("LIVE_REPLAY_RECONNECT_WINDOW_SECONDS", ctx.config().delay.max(1));
+async fn ensure_session(
+    ctx: &Context,
+    upload_config: &UploadStreamer,
+) -> AppResult<(SessionRecord, UploadStreamer)> {
+    let reconnect_window = env_u64(
+        "LIVE_REPLAY_RECONNECT_WINDOW_SECONDS",
+        ctx.config().delay.max(1),
+    );
     let recent_modifier = format!("-{reconnect_window} seconds");
     if let Some(row) = sqlx::query(
-        "SELECT id, aid, bvid, submit_state, next_part_to_upload, delete_after_success, preserve_danmaku \
-         FROM live_sessions WHERE live_streamer_id = ? AND live_title = ? \
+        "SELECT id, aid, bvid, submit_state, delete_after_success, preserve_danmaku, \
+                upload_config_json, session_key FROM live_sessions \
+         WHERE live_streamer_id = ? AND live_title = ? \
            AND (ended_at IS NULL OR ended_at >= datetime('now', ?)) \
          ORDER BY id DESC LIMIT 1",
     )
@@ -545,6 +632,28 @@ async fn ensure_session(ctx: &Context, upload_config: &UploadStreamer) -> AppRes
     .change_context(AppError::Unknown)?
     {
         let session = session_from_row(&row)?;
+        let snapshot_json: Option<String> = row
+            .try_get("upload_config_json")
+            .change_context(AppError::Unknown)?;
+        let snapshot = if let Some(json) = snapshot_json {
+            serde_json::from_str(&json).change_context(AppError::Unknown)?
+        } else {
+            let key: Option<String> = row.try_get("session_key").change_context(AppError::Unknown)?;
+            let frozen = freeze_upload_config(
+                upload_config,
+                key.as_deref().unwrap_or("legacy-session"),
+            )
+            .await?;
+            sqlx::query(
+                "UPDATE live_sessions SET upload_config_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            )
+            .bind(serde_json::to_string(&frozen).change_context(AppError::Unknown)?)
+            .bind(session.id)
+            .execute(ctx.pool())
+            .await
+            .change_context(AppError::Unknown)?;
+            frozen
+        };
         sqlx::query(
             "UPDATE live_sessions SET ended_at = NULL, status = 'recording', last_error = NULL, \
              last_activity_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -553,7 +662,7 @@ async fn ensure_session(ctx: &Context, upload_config: &UploadStreamer) -> AppRes
         .execute(ctx.pool())
         .await
         .change_context(AppError::Unknown)?;
-        return Ok(session);
+        return Ok((session, snapshot));
     }
 
     let token = format!(
@@ -562,7 +671,9 @@ async fn ensure_session(ctx: &Context, upload_config: &UploadStreamer) -> AppRes
         unix_nanos(),
         random::<u64>()
     );
-    let upload_json = serde_json::to_string(upload_config).change_context(AppError::Unknown)?;
+    let frozen_upload_config = freeze_upload_config(upload_config, &token).await?;
+    let upload_json =
+        serde_json::to_string(&frozen_upload_config).change_context(AppError::Unknown)?;
     let delete_after_success = env_bool("LIVE_REPLAY_DELETE_AFTER_SUCCESS", false);
     let preserve_danmaku = env_bool("LIVE_REPLAY_PRESERVE_DANMAKU", true);
     let result = sqlx::query(
@@ -585,13 +696,47 @@ async fn ensure_session(ctx: &Context, upload_config: &UploadStreamer) -> AppRes
     .execute(ctx.pool())
     .await
     .change_context(AppError::Unknown)?;
-    load_session(ctx.pool(), result.last_insert_rowid()).await
+    let session = load_session(ctx.pool(), result.last_insert_rowid()).await?;
+    Ok((session, frozen_upload_config))
 }
 
-async fn register_segment(ctx: &Context, session_id: i64, event: &SegmentInfo) -> AppResult<SegmentRecord> {
+async fn freeze_upload_config(
+    upload_config: &UploadStreamer,
+    session_key: &str,
+) -> AppResult<UploadStreamer> {
+    let mut frozen = upload_config.clone();
+    let source = frozen
+        .user_cookie
+        .clone()
+        .unwrap_or_else(|| "cookies.json".to_string());
+    let source_path = Path::new(&source);
+    if source_path.exists() {
+        tokio::fs::create_dir_all(CREDENTIAL_DIR)
+            .await
+            .change_context(AppError::Unknown)?;
+        let target = Path::new(CREDENTIAL_DIR).join(format!("{session_key}.json"));
+        tokio::fs::copy(source_path, &target)
+            .await
+            .change_context(AppError::Unknown)?;
+        frozen.user_cookie = Some(target.display().to_string());
+    }
+    Ok(frozen)
+}
+
+async fn register_segment(
+    ctx: &Context,
+    session_id: i64,
+    event: &SegmentInfo,
+) -> AppResult<SegmentRecord> {
     let part_number = next_part_number(ctx.pool(), session_id).await?;
     let staged = stage_completed_segment(session_id, part_number, event).await?;
-    let outbox_path = write_outbox(&staged).await?;
+    let outbox_path = match write_outbox(&staged).await {
+        Ok(path) => path,
+        Err(error) => {
+            rollback_staged_segment(&staged).await;
+            return Err(error);
+        }
+    };
 
     let mut last_error = None;
     for attempt in 0..6u64 {
@@ -606,7 +751,8 @@ async fn register_segment(ctx: &Context, session_id: i64, event: &SegmentInfo) -
             }
         }
     }
-    Err(last_error.unwrap_or_else(|| AppError::Custom("failed to persist segment".to_string()).into()))
+    Err(last_error
+        .unwrap_or_else(|| AppError::Custom("failed to persist segment".to_string()).into()))
 }
 
 async fn next_part_number(pool: &ConnectionPool, session_id: i64) -> AppResult<i64> {
@@ -630,7 +776,9 @@ async fn stage_completed_segment(
 ) -> AppResult<OutboxRecord> {
     let source = &event.prev_file_path;
     let parent = source.parent().unwrap_or_else(|| Path::new("."));
-    let queue_dir = parent.join(".live-replay-queue").join(session_id.to_string());
+    let queue_dir = parent
+        .join(".live-replay-queue")
+        .join(session_id.to_string());
     tokio::fs::create_dir_all(&queue_dir)
         .await
         .change_context(AppError::Unknown)?;
@@ -638,13 +786,20 @@ async fn stage_completed_segment(
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("segment.bin");
-    let staged_path = queue_dir.join(format!("{:06}-{}-{original_name}", part_number, unix_nanos()));
+    let staged_path = queue_dir.join(format!(
+        "{:06}-{}-{original_name}",
+        part_number,
+        unix_nanos()
+    ));
     move_file(source, &staged_path).await?;
 
     let staged_danmaku = if let Some(danmaku) = &event.danmaku_file_path {
         if danmaku.exists() {
             let path = staged_path.with_extension("xml");
-            move_file(danmaku, &path).await?;
+            if let Err(error) = move_file(danmaku, &path).await {
+                let _ = move_file(&staged_path, source).await;
+                return Err(error);
+            }
             Some(path)
         } else {
             None
@@ -674,7 +829,20 @@ async fn stage_completed_segment(
     })
 }
 
+async fn rollback_staged_segment(record: &OutboxRecord) {
+    let _ = move_file(&record.file_path, &record.original_file_path).await;
+    if let Some(staged_xml) = &record.danmaku_file_path {
+        let original_xml = record.original_file_path.with_extension("xml");
+        let _ = move_file(staged_xml, &original_xml).await;
+    }
+}
+
 async fn move_file(source: &Path, destination: &Path) -> AppResult<()> {
+    if let Some(parent) = destination.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .change_context(AppError::Unknown)?;
+    }
     match tokio::fs::rename(source, destination).await {
         Ok(()) => Ok(()),
         Err(_) => {
@@ -700,9 +868,12 @@ async fn write_outbox(record: &OutboxRecord) -> AppResult<PathBuf> {
         unix_nanos()
     ));
     let temp = path.with_extension("json.tmp");
-    tokio::fs::write(&temp, serde_json::to_vec_pretty(record).change_context(AppError::Unknown)?)
-        .await
-        .change_context(AppError::Unknown)?;
+    tokio::fs::write(
+        &temp,
+        serde_json::to_vec_pretty(record).change_context(AppError::Unknown)?,
+    )
+    .await
+    .change_context(AppError::Unknown)?;
     tokio::fs::rename(&temp, &path)
         .await
         .change_context(AppError::Unknown)?;
@@ -716,20 +887,44 @@ pub async fn recover_filesystem_outbox(pool: &ConnectionPool) -> AppResult<usize
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(error) => return Err(error).change_context(AppError::Unknown),
     };
-    while let Some(entry) = entries.next_entry().await.change_context(AppError::Unknown)? {
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .change_context(AppError::Unknown)?
+    {
         let path = entry.path();
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
             continue;
         }
-        let bytes = tokio::fs::read(&path).await.change_context(AppError::Unknown)?;
-        let record: OutboxRecord = serde_json::from_slice(&bytes).change_context(AppError::Unknown)?;
-        let source_info_id: i64 = sqlx::query_scalar(
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!(file = ?path, error = ?error, "cannot read replay outbox file");
+                continue;
+            }
+        };
+        let record: OutboxRecord = match serde_json::from_slice(&bytes) {
+            Ok(record) => record,
+            Err(error) => {
+                warn!(file = ?path, error = ?error, "quarantining malformed replay outbox file");
+                let _ = tokio::fs::rename(&path, path.with_extension("json.bad")).await;
+                continue;
+            }
+        };
+        let source_info_id: i64 = match sqlx::query_scalar(
             "SELECT source_streamer_info_id FROM live_sessions WHERE id = ?",
         )
         .bind(record.session_id)
-        .fetch_one(pool)
+        .fetch_optional(pool)
         .await
-        .change_context(AppError::Unknown)?;
+        .change_context(AppError::Unknown)?
+        {
+            Some(id) => id,
+            None => {
+                warn!(session_id = record.session_id, file = ?record.file_path, "outbox session is missing; preserving files");
+                continue;
+            }
+        };
         persist_outbox_record(pool, source_info_id, &record).await?;
         let _ = tokio::fs::remove_file(&path).await;
         wake_session(record.session_id).await;
@@ -753,7 +948,12 @@ async fn persist_outbox_record(
     .bind(record.part_number)
     .bind(record.file_path.display().to_string())
     .bind(record.original_file_path.display().to_string())
-    .bind(record.danmaku_file_path.as_ref().map(|path| path.display().to_string()))
+    .bind(
+        record
+            .danmaku_file_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+    )
     .bind(record.file_size)
     .bind(record.file_mtime_ns)
     .bind(&record.file_identity)
@@ -770,7 +970,12 @@ async fn persist_outbox_record(
     .bind(record.part_number)
     .bind(record.file_path.display().to_string())
     .bind(record.original_file_path.display().to_string())
-    .bind(record.danmaku_file_path.as_ref().map(|path| path.display().to_string()))
+    .bind(
+        record
+            .danmaku_file_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+    )
     .bind(record.file_size)
     .bind(record.file_mtime_ns)
     .bind(&record.file_identity)
@@ -791,8 +996,8 @@ async fn persist_outbox_record(
         .await
         .change_context(AppError::Unknown)?;
     sqlx::query(
-        "UPDATE live_sessions SET expected_parts = MAX(expected_parts, ?), status = 'recording', \
-         ended_at = NULL, last_activity_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        "UPDATE live_sessions SET expected_parts = MAX(expected_parts, ?), \
+         last_activity_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
     )
     .bind(record.part_number)
     .bind(record.session_id)
@@ -819,10 +1024,13 @@ async fn persist_outbox_record(
     load_segment(pool, segment_id).await
 }
 
-async fn next_ready_segment(pool: &ConnectionPool, session_id: i64) -> AppResult<Option<SegmentRecord>> {
+async fn next_ready_segment(
+    pool: &ConnectionPool,
+    session_id: i64,
+) -> AppResult<Option<SegmentRecord>> {
     let row = sqlx::query(
-        "SELECT r.id, r.session_id, r.part_number, r.file_path, r.original_file_path, \
-                r.processed_file_path, r.danmaku_file_path, r.status, r.remote_filename, r.retry_count \
+        "SELECT r.id, r.session_id, r.part_number, r.file_path, r.processed_file_path, \
+                r.danmaku_file_path, r.status, r.remote_filename, r.retry_count \
          FROM recording_segments r JOIN live_sessions s ON s.id = r.session_id \
          WHERE r.session_id = ? AND r.part_number = s.next_part_to_upload \
            AND r.status NOT IN ('deleted', 'retained', 'conflict', 'submission_uncertain') \
@@ -844,7 +1052,12 @@ async fn prepare_paths(
         return Ok(prepared_paths(segment));
     }
     let mut paths = vec![segment.file_path.clone()];
-    if segment.file_path.extension().and_then(|value| value.to_str()).is_none_or(|ext| !ext.eq_ignore_ascii_case("mp4")) {
+    if segment
+        .file_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_none_or(|ext| !ext.eq_ignore_ascii_case("mp4"))
+    {
         paths[0] = remux_to_mp4(&segment.file_path).await?;
     }
     if let Some(path) = &segment.danmaku_file_path {
@@ -855,23 +1068,23 @@ async fn prepare_paths(
         match processor {
             HookStep::Move { mv } => {
                 let target = Path::new(mv);
-                tokio::fs::create_dir_all(target).await.change_context(AppError::Unknown)?;
+                tokio::fs::create_dir_all(target)
+                    .await
+                    .change_context(AppError::Unknown)?;
                 let mut moved = Vec::with_capacity(paths.len());
                 for source in &paths {
-                    let destination = target.join(
-                        source.file_name().ok_or_else(|| AppError::Custom("invalid processor path".to_string()))?,
-                    );
+                    let destination = target.join(source.file_name().ok_or_else(|| {
+                        AppError::Custom("invalid processor path".to_string())
+                    })?);
                     move_file(source, &destination).await?;
                     moved.push(destination);
                 }
                 paths = moved;
             }
-            HookStep::Remux { .. } => {
-                // 自动 MP4 直封装已在上方完成，避免重复处理。
-            }
+            HookStep::Remux { .. } => {}
             HookStep::Run { .. } | HookStep::Remove(_) => {
                 return Err(AppError::Custom(
-                    "上传前处理器不允许 run/rm；它们无法保证路径和重试幂等，请改到上传后处理器"
+                    "上传前处理器不允许 run/rm；它们无法保证路径和重试幂等，请改到上传后手动处理"
                         .to_string(),
                 )
                 .into());
@@ -893,7 +1106,11 @@ async fn prepare_paths(
          updated_at = CURRENT_TIMESTAMP WHERE id = ?",
     )
     .bind(processed.display().to_string())
-    .bind(danmaku.as_ref().map(|path| path.display().to_string()))
+    .bind(
+        danmaku
+            .as_ref()
+            .map(|path| path.display().to_string()),
+    )
     .bind(segment.id)
     .execute(pool)
     .await
@@ -923,15 +1140,31 @@ async fn remux_to_mp4(source: &Path) -> AppResult<PathBuf> {
         command.args(["-bsf:a", "aac_adtstoasc"]);
     }
     command
-        .args(["-movflags", "+faststart", "-avoid_negative_ts", "make_zero"])
+        .args([
+            "-movflags",
+            "+faststart",
+            "-avoid_negative_ts",
+            "make_zero",
+        ])
         .arg(&destination)
         .kill_on_drop(true);
-    let status = command.status().await.change_context(AppError::Custom("failed to start ffmpeg remux".to_string()))?;
+    let status = command
+        .status()
+        .await
+        .change_context(AppError::Custom(
+            "failed to start ffmpeg remux".to_string(),
+        ))?;
     if !status.success() {
         let _ = tokio::fs::remove_file(&destination).await;
-        return Err(AppError::Custom(format!("ffmpeg remux failed for {}", source.display())).into());
+        return Err(AppError::Custom(format!(
+            "ffmpeg remux failed for {}",
+            source.display()
+        ))
+        .into());
     }
-    let metadata = tokio::fs::metadata(&destination).await.change_context(AppError::Unknown)?;
+    let metadata = tokio::fs::metadata(&destination)
+        .await
+        .change_context(AppError::Unknown)?;
     if metadata.len() == 0 {
         let _ = tokio::fs::remove_file(&destination).await;
         return Err(AppError::Custom("ffmpeg produced an empty MP4".to_string()).into());
@@ -998,7 +1231,7 @@ fn part_title(segment: &SegmentRecord) -> String {
 
 async fn load_session(pool: &ConnectionPool, id: i64) -> AppResult<SessionRecord> {
     let row = sqlx::query(
-        "SELECT id, aid, bvid, submit_state, next_part_to_upload, delete_after_success, preserve_danmaku \
+        "SELECT id, aid, bvid, submit_state, delete_after_success, preserve_danmaku \
          FROM live_sessions WHERE id = ?",
     )
     .bind(id)
@@ -1016,9 +1249,8 @@ fn session_from_row(row: &sqlx::sqlite::SqliteRow) -> AppResult<SessionRecord> {
             .change_context(AppError::Unknown)?
             .map(|value| value as u64),
         bvid: row.try_get("bvid").change_context(AppError::Unknown)?,
-        submit_state: row.try_get("submit_state").change_context(AppError::Unknown)?,
-        next_part_to_upload: row
-            .try_get("next_part_to_upload")
+        submit_state: row
+            .try_get("submit_state")
             .change_context(AppError::Unknown)?,
         delete_after_success: row
             .try_get::<i64, _>("delete_after_success")
@@ -1033,7 +1265,7 @@ fn session_from_row(row: &sqlx::sqlite::SqliteRow) -> AppResult<SessionRecord> {
 
 async fn load_segment(pool: &ConnectionPool, id: i64) -> AppResult<SegmentRecord> {
     let row = sqlx::query(
-        "SELECT id, session_id, part_number, file_path, original_file_path, processed_file_path, \
+        "SELECT id, session_id, part_number, file_path, processed_file_path, \
                 danmaku_file_path, status, remote_filename, retry_count \
          FROM recording_segments WHERE id = ?",
     )
@@ -1047,13 +1279,16 @@ async fn load_segment(pool: &ConnectionPool, id: i64) -> AppResult<SegmentRecord
 fn segment_from_row(row: &sqlx::sqlite::SqliteRow) -> AppResult<SegmentRecord> {
     Ok(SegmentRecord {
         id: row.try_get("id").change_context(AppError::Unknown)?,
-        session_id: row.try_get("session_id").change_context(AppError::Unknown)?,
-        part_number: row.try_get("part_number").change_context(AppError::Unknown)?,
-        file_path: PathBuf::from(row.try_get::<String, _>("file_path").change_context(AppError::Unknown)?),
-        original_file_path: row
-            .try_get::<Option<String>, _>("original_file_path")
-            .change_context(AppError::Unknown)?
-            .map(PathBuf::from),
+        session_id: row
+            .try_get("session_id")
+            .change_context(AppError::Unknown)?,
+        part_number: row
+            .try_get("part_number")
+            .change_context(AppError::Unknown)?,
+        file_path: PathBuf::from(
+            row.try_get::<String, _>("file_path")
+                .change_context(AppError::Unknown)?,
+        ),
         processed_file_path: row
             .try_get::<Option<String>, _>("processed_file_path")
             .change_context(AppError::Unknown)?
@@ -1066,7 +1301,9 @@ fn segment_from_row(row: &sqlx::sqlite::SqliteRow) -> AppResult<SegmentRecord> {
         remote_filename: row
             .try_get("remote_filename")
             .change_context(AppError::Unknown)?,
-        retry_count: row.try_get("retry_count").change_context(AppError::Unknown)?,
+        retry_count: row
+            .try_get("retry_count")
+            .change_context(AppError::Unknown)?,
     })
 }
 
@@ -1112,18 +1349,17 @@ async fn save_remote_ids(
 async fn mark_uploading(pool: &ConnectionPool, segment_id: i64) -> AppResult<()> {
     let mut tx = pool.begin().await.change_context(AppError::Unknown)?;
     sqlx::query(
-        "UPDATE recording_segments SET status = CASE \
-           WHEN status IN ('remote_verified','postprocessing','cleanup_pending') THEN status \
-           ELSE 'uploading' END, retry_count = retry_count + 1, last_error = NULL, \
-           next_retry_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        "UPDATE recording_segments SET status = 'uploading', last_error = NULL, next_retry_at = NULL, \
+         updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status NOT IN ('remote_verified', 'cleanup_pending')",
     )
     .bind(segment_id)
     .execute(&mut *tx)
     .await
     .change_context(AppError::Unknown)?;
     sqlx::query(
-        "UPDATE upload_jobs SET status = 'uploading', attempts = attempts + 1, locked_at = CURRENT_TIMESTAMP, \
-         last_error = NULL, next_attempt_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE segment_id = ?",
+        "UPDATE upload_jobs SET status = 'uploading', attempts = attempts + 1, \
+         locked_at = CURRENT_TIMESTAMP, last_error = NULL, next_attempt_at = NULL, \
+         updated_at = CURRENT_TIMESTAMP WHERE segment_id = ?",
     )
     .bind(segment_id)
     .execute(&mut *tx)
@@ -1133,18 +1369,26 @@ async fn mark_uploading(pool: &ConnectionPool, segment_id: i64) -> AppResult<()>
     Ok(())
 }
 
-async fn mark_submitting(pool: &ConnectionPool, session_id: i64, segment_id: i64) -> AppResult<()> {
+async fn mark_submitting(
+    pool: &ConnectionPool,
+    session_id: i64,
+    segment_id: i64,
+) -> AppResult<()> {
     let mut tx = pool.begin().await.change_context(AppError::Unknown)?;
-    sqlx::query("UPDATE live_sessions SET submit_state = 'submitting', updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-        .bind(session_id)
-        .execute(&mut *tx)
-        .await
-        .change_context(AppError::Unknown)?;
-    sqlx::query("UPDATE recording_segments SET status = 'submitting', updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-        .bind(segment_id)
-        .execute(&mut *tx)
-        .await
-        .change_context(AppError::Unknown)?;
+    sqlx::query(
+        "UPDATE live_sessions SET submit_state = 'submitting', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+    .bind(session_id)
+    .execute(&mut *tx)
+    .await
+    .change_context(AppError::Unknown)?;
+    sqlx::query(
+        "UPDATE recording_segments SET status = 'submitting', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+    .bind(segment_id)
+    .execute(&mut *tx)
+    .await
+    .change_context(AppError::Unknown)?;
     tx.commit().await.change_context(AppError::Unknown)?;
     Ok(())
 }
@@ -1155,84 +1399,126 @@ async fn mark_submission_uncertain(
     message: &str,
 ) -> AppResult<()> {
     let mut tx = pool.begin().await.change_context(AppError::Unknown)?;
-    sqlx::query("UPDATE live_sessions SET submit_state = 'uncertain', status = 'submission_uncertain', last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-        .bind(message)
-        .bind(segment.session_id)
-        .execute(&mut *tx)
-        .await
-        .change_context(AppError::Unknown)?;
-    sqlx::query("UPDATE recording_segments SET status = 'submission_uncertain', last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-        .bind(message)
-        .bind(segment.id)
-        .execute(&mut *tx)
-        .await
-        .change_context(AppError::Unknown)?;
-    sqlx::query("UPDATE upload_jobs SET status = 'submission_uncertain', last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE segment_id = ?")
-        .bind(message)
-        .bind(segment.id)
-        .execute(&mut *tx)
-        .await
-        .change_context(AppError::Unknown)?;
+    sqlx::query(
+        "UPDATE live_sessions SET submit_state = 'uncertain', status = 'submission_uncertain', \
+         last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+    .bind(message)
+    .bind(segment.session_id)
+    .execute(&mut *tx)
+    .await
+    .change_context(AppError::Unknown)?;
+    sqlx::query(
+        "UPDATE recording_segments SET status = 'submission_uncertain', last_error = ?, \
+         updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+    .bind(message)
+    .bind(segment.id)
+    .execute(&mut *tx)
+    .await
+    .change_context(AppError::Unknown)?;
+    sqlx::query(
+        "UPDATE upload_jobs SET status = 'submission_uncertain', last_error = ?, \
+         updated_at = CURRENT_TIMESTAMP WHERE segment_id = ?",
+    )
+    .bind(message)
+    .bind(segment.id)
+    .execute(&mut *tx)
+    .await
+    .change_context(AppError::Unknown)?;
     tx.commit().await.change_context(AppError::Unknown)?;
     Ok(())
 }
 
-async fn mark_conflict(pool: &ConnectionPool, segment: &SegmentRecord, message: &str) -> AppResult<()> {
+async fn mark_conflict(
+    pool: &ConnectionPool,
+    segment: &SegmentRecord,
+    message: &str,
+) -> AppResult<()> {
     let mut tx = pool.begin().await.change_context(AppError::Unknown)?;
-    sqlx::query("UPDATE recording_segments SET status = 'conflict', last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-        .bind(message)
-        .bind(segment.id)
-        .execute(&mut *tx)
-        .await
-        .change_context(AppError::Unknown)?;
-    sqlx::query("UPDATE upload_jobs SET status = 'conflict', last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE segment_id = ?")
-        .bind(message)
-        .bind(segment.id)
-        .execute(&mut *tx)
-        .await
-        .change_context(AppError::Unknown)?;
-    sqlx::query("UPDATE live_sessions SET status = 'conflict', last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-        .bind(message)
-        .bind(segment.session_id)
-        .execute(&mut *tx)
-        .await
-        .change_context(AppError::Unknown)?;
+    sqlx::query(
+        "UPDATE recording_segments SET status = 'conflict', last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+    .bind(message)
+    .bind(segment.id)
+    .execute(&mut *tx)
+    .await
+    .change_context(AppError::Unknown)?;
+    sqlx::query(
+        "UPDATE upload_jobs SET status = 'conflict', last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE segment_id = ?",
+    )
+    .bind(message)
+    .bind(segment.id)
+    .execute(&mut *tx)
+    .await
+    .change_context(AppError::Unknown)?;
+    sqlx::query(
+        "UPDATE live_sessions SET status = 'conflict', last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+    .bind(message)
+    .bind(segment.session_id)
+    .execute(&mut *tx)
+    .await
+    .change_context(AppError::Unknown)?;
     tx.commit().await.change_context(AppError::Unknown)?;
     Ok(())
 }
 
-async fn mark_remote_verified(pool: &ConnectionPool, segment: &SegmentRecord) -> AppResult<()> {
+async fn mark_remote_verified(
+    pool: &ConnectionPool,
+    segment: &SegmentRecord,
+) -> AppResult<()> {
     let mut tx = pool.begin().await.change_context(AppError::Unknown)?;
-    sqlx::query("UPDATE recording_segments SET status = 'remote_verified', cleanup_state = 'pending', verified_at = CURRENT_TIMESTAMP, last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-        .bind(segment.id)
-        .execute(&mut *tx)
-        .await
-        .change_context(AppError::Unknown)?;
-    sqlx::query("UPDATE upload_jobs SET status = 'remote_verified', last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE segment_id = ?")
-        .bind(segment.id)
-        .execute(&mut *tx)
-        .await
-        .change_context(AppError::Unknown)?;
+    sqlx::query(
+        "UPDATE recording_segments SET status = 'remote_verified', cleanup_state = 'pending', \
+         verified_at = CURRENT_TIMESTAMP, last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+    .bind(segment.id)
+    .execute(&mut *tx)
+    .await
+    .change_context(AppError::Unknown)?;
+    sqlx::query(
+        "UPDATE upload_jobs SET status = 'remote_verified', last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE segment_id = ?",
+    )
+    .bind(segment.id)
+    .execute(&mut *tx)
+    .await
+    .change_context(AppError::Unknown)?;
     tx.commit().await.change_context(AppError::Unknown)?;
     Ok(())
 }
 
-async fn mark_cleanup_state(pool: &ConnectionPool, segment_id: i64, state: &str) -> AppResult<()> {
-    sqlx::query("UPDATE recording_segments SET status = ?, cleanup_state = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-        .bind(state)
-        .bind(state)
-        .bind(segment_id)
-        .execute(pool)
-        .await
-        .change_context(AppError::Unknown)?;
+async fn mark_cleanup_state(
+    pool: &ConnectionPool,
+    segment_id: i64,
+    state: &str,
+) -> AppResult<()> {
+    sqlx::query(
+        "UPDATE recording_segments SET status = ?, cleanup_state = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+    .bind(state)
+    .bind(state)
+    .bind(segment_id)
+    .execute(pool)
+    .await
+    .change_context(AppError::Unknown)?;
     Ok(())
 }
 
-async fn mark_terminal(pool: &ConnectionPool, segment: &SegmentRecord, terminal: &str) -> AppResult<()> {
+async fn mark_terminal(
+    pool: &ConnectionPool,
+    segment: &SegmentRecord,
+    terminal: &str,
+) -> AppResult<()> {
     let mut tx = pool.begin().await.change_context(AppError::Unknown)?;
-    let timestamp_column = if terminal == "deleted" { "deleted_at" } else { "verified_at" };
+    let timestamp_column = if terminal == "deleted" {
+        "deleted_at"
+    } else {
+        "verified_at"
+    };
     let query = format!(
-        "UPDATE recording_segments SET status = ?, cleanup_state = ?, {timestamp_column} = COALESCE({timestamp_column}, CURRENT_TIMESTAMP), last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
+        "UPDATE recording_segments SET status = ?, cleanup_state = ?, {timestamp_column} = COALESCE({timestamp_column}, CURRENT_TIMESTAMP), \
+         last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
     );
     sqlx::query(&query)
         .bind(terminal)
@@ -1241,11 +1527,14 @@ async fn mark_terminal(pool: &ConnectionPool, segment: &SegmentRecord, terminal:
         .execute(&mut *tx)
         .await
         .change_context(AppError::Unknown)?;
-    sqlx::query("UPDATE upload_jobs SET status = 'complete', last_error = NULL, locked_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE segment_id = ?")
-        .bind(segment.id)
-        .execute(&mut *tx)
-        .await
-        .change_context(AppError::Unknown)?;
+    sqlx::query(
+        "UPDATE upload_jobs SET status = 'complete', last_error = NULL, locked_at = NULL, \
+         updated_at = CURRENT_TIMESTAMP WHERE segment_id = ?",
+    )
+    .bind(segment.id)
+    .execute(&mut *tx)
+    .await
+    .change_context(AppError::Unknown)?;
     sqlx::query(
         "UPDATE live_sessions SET verified_parts = MAX(verified_parts, ?), \
          next_part_to_upload = CASE WHEN next_part_to_upload = ? THEN ? + 1 ELSE next_part_to_upload END, \
@@ -1272,27 +1561,36 @@ async fn mark_retry(
 ) -> AppResult<()> {
     let modifier = format!("+{delay_seconds} seconds");
     let mut tx = pool.begin().await.change_context(AppError::Unknown)?;
-    sqlx::query("UPDATE recording_segments SET status = 'retry_wait', retry_count = ?, last_error = ?, next_retry_at = datetime('now', ?), updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-        .bind(attempt)
-        .bind(error_message)
-        .bind(&modifier)
-        .bind(segment.id)
-        .execute(&mut *tx)
-        .await
-        .change_context(AppError::Unknown)?;
-    sqlx::query("UPDATE upload_jobs SET status = 'retry_wait', last_error = ?, next_attempt_at = datetime('now', ?), locked_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE segment_id = ?")
-        .bind(error_message)
-        .bind(&modifier)
-        .bind(segment.id)
-        .execute(&mut *tx)
-        .await
-        .change_context(AppError::Unknown)?;
-    sqlx::query("UPDATE live_sessions SET status = CASE WHEN ended_at IS NULL THEN 'retrying' ELSE 'recording_complete' END, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-        .bind(error_message)
-        .bind(segment.session_id)
-        .execute(&mut *tx)
-        .await
-        .change_context(AppError::Unknown)?;
+    sqlx::query(
+        "UPDATE recording_segments SET status = 'retry_wait', retry_count = ?, last_error = ?, \
+         next_retry_at = datetime('now', ?), updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+    .bind(attempt)
+    .bind(error_message)
+    .bind(&modifier)
+    .bind(segment.id)
+    .execute(&mut *tx)
+    .await
+    .change_context(AppError::Unknown)?;
+    sqlx::query(
+        "UPDATE upload_jobs SET status = 'retry_wait', last_error = ?, next_attempt_at = datetime('now', ?), \
+         locked_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE segment_id = ?",
+    )
+    .bind(error_message)
+    .bind(&modifier)
+    .bind(segment.id)
+    .execute(&mut *tx)
+    .await
+    .change_context(AppError::Unknown)?;
+    sqlx::query(
+        "UPDATE live_sessions SET status = CASE WHEN ended_at IS NULL THEN 'retrying' ELSE 'recording_complete' END, \
+         last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+    .bind(error_message)
+    .bind(segment.session_id)
+    .execute(&mut *tx)
+    .await
+    .change_context(AppError::Unknown)?;
     tx.commit().await.change_context(AppError::Unknown)?;
     Ok(())
 }
@@ -1311,8 +1609,8 @@ async fn mark_recording_complete(pool: &ConnectionPool, session_id: i64) -> AppR
 
 async fn session_can_finish(pool: &ConnectionPool, session_id: i64) -> AppResult<bool> {
     let row = sqlx::query(
-        "SELECT status, (SELECT COUNT(*) FROM recording_segments WHERE session_id = ? AND status NOT IN ('deleted', 'retained')) AS pending \
-         FROM live_sessions WHERE id = ?",
+        "SELECT status, (SELECT COUNT(*) FROM recording_segments WHERE session_id = ? \
+         AND status NOT IN ('deleted', 'retained')) AS pending FROM live_sessions WHERE id = ?",
     )
     .bind(session_id)
     .bind(session_id)
@@ -1325,11 +1623,14 @@ async fn session_can_finish(pool: &ConnectionPool, session_id: i64) -> AppResult
 }
 
 async fn mark_session_complete(pool: &ConnectionPool, session_id: i64) -> AppResult<()> {
-    sqlx::query("UPDATE live_sessions SET status = 'complete', last_error = NULL, ended_at = COALESCE(ended_at, CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-        .bind(session_id)
-        .execute(pool)
-        .await
-        .change_context(AppError::Unknown)?;
+    sqlx::query(
+        "UPDATE live_sessions SET status = 'complete', last_error = NULL, \
+         ended_at = COALESCE(ended_at, CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+    .bind(session_id)
+    .execute(pool)
+    .await
+    .change_context(AppError::Unknown)?;
     Ok(())
 }
 
@@ -1343,7 +1644,12 @@ fn retry_delay(attempt: usize) -> u64 {
 fn env_bool(name: &str, default: bool) -> bool {
     std::env::var(name)
         .ok()
-        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(default)
 }
 

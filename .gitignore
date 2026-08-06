@@ -41,6 +41,10 @@ qrcode.png
 /*.ts
 /biliup/stream-gears/
 data/
+**/.live-replay-queue/
+*.replay.json
+*.move-part
+*.json.bad
 .next
 out
 downloads/

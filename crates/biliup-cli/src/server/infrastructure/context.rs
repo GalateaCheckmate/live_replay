@@ -22,11 +22,9 @@ const DEFAULT_DISK_WARNING_GB: u64 = 100;
 const DEFAULT_DISK_STOP_GB: u64 = 30;
 const GIB: u64 = 1024 * 1024 * 1024;
 
-/// 应用程序上下文，包含工作器和扩展信息
 #[derive(Debug, Clone)]
 pub struct Context {
     id: i64,
-    /// 工作器实例
     worker: Arc<Worker>,
     stream: LiveStream,
     streamer_info: StreamerInfo,
@@ -34,7 +32,6 @@ pub struct Context {
 }
 
 impl Context {
-    /// 创建新的上下文实例
     pub fn new(id: i64, worker: Arc<Worker>, pool: ConnectionPool, stream: LiveStream) -> Self {
         let mut streamer_info = streamer_info(&stream);
         streamer_info.id = id;
@@ -60,7 +57,7 @@ impl Context {
     }
 
     pub fn live_streamer(&self) -> &LiveStreamer {
-        &self.worker.get_streamer()
+        self.worker.get_streamer()
     }
 
     pub fn stateless_client(&self) -> &StatelessClient {
@@ -108,8 +105,6 @@ impl Context {
         &self.streamer_info
     }
 
-    /// Live Replay 默认优先写入 D 盘，避免长期录像占满系统盘。
-    /// `LIVE_REPLAY_OUTPUT_DIR` 可覆盖默认目录。
     pub fn recording_output_dir(&self) -> PathBuf {
         if let Ok(value) = std::env::var("LIVE_REPLAY_OUTPUT_DIR")
             && !value.trim().is_empty()
@@ -128,8 +123,6 @@ impl Context {
         ensure_directory(PathBuf::from("recordings"))
     }
 
-    /// 新场次开始前检查磁盘空间。空间低于停止阈值时拒绝启动新的录像；
-    /// 已完成且未验证上传的文件绝不会因此被删除。
     pub fn ensure_recording_space(&self) -> AppResult<()> {
         let directory = self.recording_output_dir();
         let Some(free_bytes) = free_space_bytes(&directory) else {
@@ -137,13 +130,14 @@ impl Context {
             return Ok(());
         };
 
-        let warning_gb = env_u64("LIVE_REPLAY_DISK_WARNING_GB", DEFAULT_DISK_WARNING_GB);
-        let stop_gb = env_u64("LIVE_REPLAY_DISK_STOP_GB", DEFAULT_DISK_STOP_GB);
+        let stop_gb = env_u64("LIVE_REPLAY_DISK_STOP_GB", DEFAULT_DISK_STOP_GB).max(1);
+        let warning_gb = env_u64("LIVE_REPLAY_DISK_WARNING_GB", DEFAULT_DISK_WARNING_GB)
+            .max(stop_gb);
         let free_gb = free_bytes as f64 / GIB as f64;
 
         if free_bytes < stop_gb.saturating_mul(GIB) {
             return Err(AppError::Custom(format!(
-                "录像目录 {} 仅剩 {:.1} GB，低于停止阈值 {} GB；不会开始新的录像",
+                "录像目录 {} 仅剩 {:.1} GB，低于停止阈值 {} GB；不会继续创建新分段",
                 directory.display(),
                 free_gb,
                 stop_gb
@@ -152,12 +146,7 @@ impl Context {
         }
 
         if free_bytes < warning_gb.saturating_mul(GIB) {
-            warn!(
-                directory = ?directory,
-                free_gb,
-                warning_gb,
-                "recording disk space is below warning threshold"
-            );
+            warn!(directory = ?directory, free_gb, warning_gb, "recording disk space is below warning threshold");
         }
         Ok(())
     }
@@ -174,15 +163,12 @@ impl Context {
             stream_info.id = self.streamer_info.id;
         }
 
-        // Live Replay 默认每60分钟生成一个完整文件。用户显式配置时仍以用户配置为准。
-        let segment_time = config
-            .segment_time
+        let segment_time = validated_segment_time(config.segment_time.as_deref())
             .or_else(|| Some(DEFAULT_SEGMENT_TIME.to_string()));
 
         DownloadConfig {
             url: stream.raw_stream_url.to_string(),
             segment_time,
-            // 使用时间分段时关闭大小分段，避免同一直播产生不可预测的小分片。
             file_size: None,
             headers: stream.stream_headers.clone(),
             recorder: self.recorder(stream_info),
@@ -190,6 +176,30 @@ impl Context {
             suffix,
         }
     }
+}
+
+/// 仅接受 HH:MM:SS，分钟和秒必须小于60，总时长至少60秒。
+/// 非法值不会传给下载器，而是回退到默认一小时。
+fn validated_segment_time(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let mut parts = value.split(':');
+    let hours = parts.next()?.parse::<u64>().ok()?;
+    let minutes = parts.next()?.parse::<u64>().ok()?;
+    let seconds = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() || minutes >= 60 || seconds >= 60 {
+        return None;
+    }
+    let total = hours
+        .saturating_mul(3600)
+        .saturating_add(minutes.saturating_mul(60))
+        .saturating_add(seconds);
+    if total < 60 {
+        return None;
+    }
+    Some(format!("{hours:02}:{minutes:02}:{seconds:02}"))
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -252,7 +262,6 @@ fn ensure_directory(path: PathBuf) -> PathBuf {
     }
 }
 
-/// 工作器结构体，管理单个主播的录制和上传任务
 #[derive(Debug)]
 pub struct Worker {
     pub downloader_status: RwLock<WorkerStatus>,
@@ -311,9 +320,7 @@ impl Worker {
                 } else {
                     None
                 };
-
                 *self.downloader_status.write().unwrap() = status;
-
                 if let Some(task) = task
                     && let Err(e) = task.stop().await
                 {
@@ -369,5 +376,19 @@ impl fmt::Debug for WorkerStatus {
             WorkerStatus::Pause => "Pause",
         };
         f.write_str(name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validated_segment_time;
+
+    #[test]
+    fn validates_segment_time() {
+        assert_eq!(validated_segment_time(Some("01:00:00")).as_deref(), Some("01:00:00"));
+        assert_eq!(validated_segment_time(Some("1:2:3")).as_deref(), Some("01:02:03"));
+        assert_eq!(validated_segment_time(Some("00:00:59")), None);
+        assert_eq!(validated_segment_time(Some("00:60:00")), None);
+        assert_eq!(validated_segment_time(Some("bad")), None);
     }
 }

@@ -40,14 +40,21 @@ CREATE TABLE IF NOT EXISTS replay_outbox
     UNIQUE(file_path)
 );
 
+-- 只要存在未完成场次或待入库 outbox，就禁止删除主播。这样即使 SQLite
+-- 短暂不可写、录像只落在文件系统 outbox 中，外键级联也不会把恢复锚点删掉。
 CREATE TRIGGER IF NOT EXISTS protect_pending_replay_streamer_delete
 BEFORE DELETE ON livestreamers
 WHEN EXISTS (
-    SELECT 1
-    FROM live_sessions s
-    JOIN recording_segments r ON r.session_id = s.id
+    SELECT 1 FROM live_sessions s
     WHERE s.live_streamer_id = OLD.id
-      AND r.status NOT IN ('deleted', 'retained')
+      AND (
+        s.status != 'complete'
+        OR EXISTS (
+            SELECT 1 FROM recording_segments r
+            WHERE r.session_id = s.id AND r.status NOT IN ('deleted', 'retained')
+        )
+        OR EXISTS (SELECT 1 FROM replay_outbox o WHERE o.session_id = s.id)
+      )
 )
 BEGIN
     SELECT RAISE(ABORT, '该主播仍有未完成的 Live Replay 上传任务，不能删除');
@@ -63,11 +70,16 @@ END;
 CREATE TRIGGER IF NOT EXISTS protect_pending_streamerinfo_delete
 BEFORE DELETE ON streamerinfo
 WHEN EXISTS (
-    SELECT 1
-    FROM live_sessions s
-    JOIN recording_segments r ON r.session_id = s.id
+    SELECT 1 FROM live_sessions s
     WHERE s.source_streamer_info_id = OLD.id
-      AND r.status NOT IN ('deleted', 'retained')
+      AND (
+        s.status != 'complete'
+        OR EXISTS (
+            SELECT 1 FROM recording_segments r
+            WHERE r.session_id = s.id AND r.status NOT IN ('deleted', 'retained')
+        )
+        OR EXISTS (SELECT 1 FROM replay_outbox o WHERE o.session_id = s.id)
+      )
 )
 BEGIN
     SELECT RAISE(ABORT, '该历史记录仍有关联的未完成上传任务');

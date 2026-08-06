@@ -33,7 +33,10 @@ fn open_dashboard_when_ready(port: u16) {
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
-        tracing::warn!(url, "Live Replay started but the dashboard did not become reachable");
+        tracing::warn!(
+            url,
+            "Live Replay started but the dashboard did not become reachable"
+        );
     });
 }
 

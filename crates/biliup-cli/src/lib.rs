@@ -148,6 +148,9 @@ async fn import_database_streamers(service_register: &ServiceRegister) -> AppRes
     let streamers = repositories::get_all_streamer(&service_register.pool).await?;
     let mut imported = 0usize;
     for live_streamer in streamers {
+        if !live_streamer.enabled {
+            continue;
+        }
         let upload_config =
             repositories::get_upload_config(&service_register.pool, live_streamer.id).await?;
 
@@ -280,6 +283,7 @@ fn to_live_streamer_insert(
 ) -> AppResult<InsertLiveStreamer> {
     Ok(InsertLiveStreamer {
         url: url.to_string(),
+        enabled: true,
         remark: remark.to_string(),
         filename_prefix: streamer.filename_prefix.clone(),
         time_range: streamer.time_range.clone(),

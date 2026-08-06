@@ -179,13 +179,19 @@ pub async fn recover_pending_sessions(
             None => match worker.get_upload_config().clone() {
                 Some(config) => config,
                 None => {
-                    warn!(session_id = session.id, "pending replay session has no upload config");
+                    warn!(
+                        session_id = session.id,
+                        "pending replay session has no upload config"
+                    );
                     continue;
                 }
             },
         };
         if upload_config.is_noop_uploader() {
-            warn!(session_id = session.id, "pending replay session snapshot uses Noop uploader");
+            warn!(
+                session_id = session.id,
+                "pending replay session snapshot uses Noop uploader"
+            );
             continue;
         }
 

@@ -52,9 +52,25 @@ interface ReplayJob {
 const statusColor = (status: string) => {
   if (['complete', 'deleted', 'verified', 'retained'].includes(status)) return 'green'
   if (['uploading', 'recording', 'uploaded_to_storage'].includes(status)) return 'blue'
-  if (['queued', 'recording_complete', 'remote_verified', 'cleanup_pending', 'postprocessing'].includes(status)) return 'cyan'
+  if (['queued', 'recording_complete', 'remote_processing', 'remote_verified', 'cleanup_pending', 'postprocessing'].includes(status)) return 'cyan'
   if (['retry_wait', 'retrying'].includes(status)) return 'orange'
   return 'red'
+}
+
+const statusLabel: Record<string, string> = {
+  queued: '等待上传',
+  uploading: '上传文件中',
+  uploaded_to_storage: '文件已上传',
+  submitting: '正在创建投稿',
+  remote_processing: 'B站转码/可播放检查中',
+  remote_verified: '已可播放',
+  cleanup_pending: '等待删除本地文件',
+  deleted: '本地文件已删除',
+  retained: '本地文件已保留',
+  retry_wait: '等待重试',
+  conflict: '需要处理冲突',
+  submission_uncertain: '投稿结果待确认',
+  complete: '已完成',
 }
 
 const formatBytes = (value: number) => {
@@ -146,7 +162,7 @@ export default function ReplayPage() {
       title: '场次状态',
       dataIndex: 'status',
       width: 150,
-      render: (value: string) => <Tag color={statusColor(value)}>{value}</Tag>,
+      render: (value: string) => <Tag color={statusColor(value)}>{statusLabel[value] ?? value}</Tag>,
     },
     {
       title: '分P进度',
@@ -192,7 +208,7 @@ export default function ReplayPage() {
       title: '状态',
       dataIndex: 'job_status',
       width: 150,
-      render: (value: string) => <Tag color={statusColor(value)}>{value}</Tag>,
+      render: (value: string) => <Tag color={statusColor(value)}>{statusLabel[value] ?? value}</Tag>,
     },
     { title: '文件大小', dataIndex: 'file_size', width: 105, render: formatBytes },
     { title: '尝试次数', dataIndex: 'attempts', width: 90 },
@@ -211,6 +227,13 @@ export default function ReplayPage() {
       dataIndex: 'next_attempt_at',
       width: 180,
       render: (value?: string) => value ? new Date(`${value}Z`).toLocaleString() : '-',
+    },
+    {
+      title: '本地文件',
+      width: 170,
+      render: (_: unknown, record: ReplayJob) => record.deleted_at
+        ? <Tag color="green">已删除 {new Date(`${record.deleted_at}Z`).toLocaleString()}</Tag>
+        : <Tag color="orange">仍保留</Tag>,
     },
     {
       title: '失败原因',

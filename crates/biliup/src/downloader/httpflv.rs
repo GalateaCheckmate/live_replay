@@ -254,14 +254,17 @@ impl Connection {
             // BytesMut::with_capacity(0).deref_mut()
             // tokio::fs::File::open("").read()
             // self.resp.chunk()
-            match timeout(Duration::from_secs(30), self.resp.chunk()).await? {
+            let chunk_result = timeout(Duration::from_secs(30), self.resp.chunk()).await;
+            if chunk_result.is_err() {
+                crate::uploader::line::report_download_pressure();
+            }
+            match chunk_result? {
                 Ok(Some(chunk)) => {
-                    // let n = chunk.len();
-                    // println!("Chunk: {:?}", chunk);
+                    crate::uploader::line::report_download_progress(chunk.len());
                     self.buffer.put(chunk);
-                    // self.buffer.put_slice(&buf[..n]);
                 }
                 _ => {
+                    crate::uploader::line::report_download_pressure();
                     return Ok(self.buffer.split().freeze());
                 }
             }

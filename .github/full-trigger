@@ -1,3 +1,2 @@
-Run final Full validation for the Windows packaging fixes.
-Triggered: 2026-08-06T22:36:00+08:00
-Purpose: verify no-argument executable startup, dashboard response, release build, and single-layer artifact contents.
+Run simplified Live Replay defaults and UI validation.
+Triggered: 2026-08-06T15:18:19Z

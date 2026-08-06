@@ -462,9 +462,9 @@ fn default_threads() -> u32 {
     3
 }
 
-/// 默认延迟：300秒
+/// 默认断流合并窗口：600秒（10分钟）
 fn default_delay() -> u64 {
-    300
+    600
 }
 
 /// 默认事件循环间隔：30秒
@@ -489,7 +489,20 @@ fn default_pool2_size() -> u32 {
 
 impl Default for Config {
     fn default() -> Self {
-        serde_json::from_value(serde_json::json!({})).expect("default config should deserialize")
+        serde_json::from_value(serde_json::json!({
+            "segment_time": "01:00:00",
+            "delay": 600,
+            "douyu_danmaku": false,
+            "huya_danmaku": false,
+            "douyin_danmaku": false,
+            "bilibili_danmaku": false,
+            "bilibili_danmaku_detail": false,
+            "bilibili_danmaku_raw": false,
+            "youtube_danmaku": false,
+            "ytb_danmaku": false,
+            "twitch_danmaku": false
+        }))
+        .expect("default config should deserialize")
     }
 }
 

@@ -95,6 +95,8 @@ export interface StudioEntity {
 export interface LiveStreamerEntity {
 	id: number;
 	url: string;
+	enabled: boolean;
+	upload_streamers_id?: number;
 	remark: string;
 	filename: string;
 	split_time?: number;

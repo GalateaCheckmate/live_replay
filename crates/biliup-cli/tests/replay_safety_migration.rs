@@ -58,9 +58,7 @@ async fn replay_migrations_and_delete_guards_work() {
         .await
         .expect_err("active replay session must block streamer deletion");
     assert!(
-        streamer_delete
-            .to_string()
-            .contains("Live Replay 上传任务"),
+        streamer_delete.to_string().contains("Live Replay 上传任务"),
         "unexpected delete error: {streamer_delete}"
     );
 

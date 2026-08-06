@@ -18,8 +18,8 @@ use struct_patch::Patch;
 use tracing::{error, info, warn};
 
 const DEFAULT_SEGMENT_TIME: &str = "01:00:00";
-const DEFAULT_DISK_WARNING_GB: u64 = 100;
-const DEFAULT_DISK_STOP_GB: u64 = 30;
+const DEFAULT_DISK_WARNING_GB: u64 = 30;
+const DEFAULT_DISK_STOP_GB: u64 = 10;
 const GIB: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
@@ -131,8 +131,8 @@ impl Context {
         };
 
         let stop_gb = env_u64("LIVE_REPLAY_DISK_STOP_GB", DEFAULT_DISK_STOP_GB).max(1);
-        let warning_gb = env_u64("LIVE_REPLAY_DISK_WARNING_GB", DEFAULT_DISK_WARNING_GB)
-            .max(stop_gb);
+        let warning_gb =
+            env_u64("LIVE_REPLAY_DISK_WARNING_GB", DEFAULT_DISK_WARNING_GB).max(stop_gb);
         let free_gb = free_bytes as f64 / GIB as f64;
 
         if free_bytes < stop_gb.saturating_mul(GIB) {
@@ -385,8 +385,14 @@ mod tests {
 
     #[test]
     fn validates_segment_time() {
-        assert_eq!(validated_segment_time(Some("01:00:00")).as_deref(), Some("01:00:00"));
-        assert_eq!(validated_segment_time(Some("1:2:3")).as_deref(), Some("01:02:03"));
+        assert_eq!(
+            validated_segment_time(Some("01:00:00")).as_deref(),
+            Some("01:00:00")
+        );
+        assert_eq!(
+            validated_segment_time(Some("1:2:3")).as_deref(),
+            Some("01:02:03")
+        );
         assert_eq!(validated_segment_time(Some("00:00:59")), None);
         assert_eq!(validated_segment_time(Some("00:60:00")), None);
         assert_eq!(validated_segment_time(Some("bad")), None);

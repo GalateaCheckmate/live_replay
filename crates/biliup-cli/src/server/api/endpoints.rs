@@ -50,9 +50,13 @@ pub async fn get_streamers_endpoint(
             .into_iter()
             .find(|worker| worker.live_streamer.id == x.id);
 
-        let status = match option.as_ref() {
-            Some(t) => format!("{:?}", *t.downloader_status.read().unwrap()),
-            None => String::new(),
+        let status = if !x.enabled {
+            "Pause".to_string()
+        } else {
+            match option.as_ref() {
+                Some(t) => format!("{:?}", *t.downloader_status.read().unwrap()),
+                None => String::new(),
+            }
         };
 
         results.push(LiveStreamerResponse {
@@ -64,6 +68,102 @@ pub async fn get_streamers_endpoint(
         });
     }
     Ok(Json(results))
+}
+
+#[derive(Deserialize)]
+pub struct SimpleStreamerRequest {
+    pub url: String,
+    pub remark: String,
+    pub user_cookie: String,
+    pub tid: Option<u16>,
+}
+
+pub async fn post_simple_streamer_endpoint(
+    State(service_register): State<ServiceRegister>,
+    State(managers): State<Arc<DownloadManager>>,
+    State(pool): State<ConnectionPool>,
+    Json(payload): Json<SimpleStreamerRequest>,
+) -> Result<Json<LiveStreamer>, Response> {
+    let url = payload.url.trim().to_string();
+    let remark = payload.remark.trim().to_string();
+    let user_cookie = payload.user_cookie.trim().to_string();
+    if url.is_empty() || remark.is_empty() || user_cookie.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "直播间、主播名称和投稿账号不能为空",
+        )
+            .into_response());
+    }
+
+    let upload = InsertUploadStreamer {
+        id: None,
+        template_name: format!("live-replay:{}:{}", remark, Utc::now().timestamp_millis()),
+        title: Some("{streamer} 直播回放 %Y-%m-%d %H-%M".to_string()),
+        tid: Some(payload.tid.unwrap_or(65)),
+        copyright: Some(2),
+        copyright_source: Some(url.clone()),
+        cover_path: None,
+        description: Some(String::new()),
+        dynamic: None,
+        dtime: None,
+        dolby: None,
+        hires: None,
+        charging_pay: None,
+        no_reprint: None,
+        uploader: Some("biliup-rs".to_string()),
+        user_cookie: Some(user_cookie),
+        tags: vec!["三角洲行动".to_string(), "游戏".to_string()],
+        credits: None,
+        up_selection_reply: None,
+        up_close_reply: None,
+        up_close_danmu: None,
+        extra_fields: None,
+        is_only_self: Some(1),
+    }
+    .insert(&pool)
+    .await
+    .change_context(AppError::Unknown)
+    .map_err(report_to_response)?;
+
+    let streamer = InsertLiveStreamer {
+        url: url.clone(),
+        enabled: true,
+        remark,
+        filename_prefix: Some("{streamer}%Y-%m-%dT%H_%M_%S".to_string()),
+        time_range: None,
+        upload_streamers_id: Some(upload.id),
+        format: None,
+        override_cfg: None,
+        preprocessor: None,
+        segment_processor: None,
+        downloaded_processor: None,
+        postprocessor: None,
+        opt_args: None,
+        excluded_keywords: None,
+    }
+    .insert(&pool)
+    .await
+    .change_context(AppError::Unknown)
+    .map_err(report_to_response)?;
+
+    let upload_config = get_upload_config(&pool, streamer.id)
+        .await
+        .map_err(report_to_response)?;
+    if managers
+        .add_room(service_register.worker(streamer.clone(), upload_config))
+        .await
+        .is_none()
+    {
+        let _ = del_streamer(&pool, streamer.id).await;
+        let _ = sqlx::query("DELETE FROM uploadstreamers WHERE id = ?")
+            .bind(upload.id)
+            .execute(&pool)
+            .await;
+        return Err((StatusCode::BAD_REQUEST, "不支持这个直播间链接").into_response());
+    }
+
+    info!(url, "created simple Live Replay streamer");
+    Ok(Json(streamer))
 }
 
 pub async fn post_streamers_endpoint(
@@ -79,16 +179,18 @@ pub async fn post_streamers_endpoint(
         .await
         .change_context(AppError::Unknown)
         .map_err(report_to_response)?;
-    let upload_config = get_upload_config(&pool, live_streamers.id)
-        .await
-        .map_err(report_to_response)?;
-    let Some(_) = managers
-        .add_room(service_register.worker(live_streamers.clone(), upload_config))
-        .await
-    else {
-        info!("not supported url: {}", url);
-        return Err((StatusCode::BAD_REQUEST, "Not supported url").into_response());
-    };
+    if live_streamers.enabled {
+        let upload_config = get_upload_config(&pool, live_streamers.id)
+            .await
+            .map_err(report_to_response)?;
+        let Some(_) = managers
+            .add_room(service_register.worker(live_streamers.clone(), upload_config))
+            .await
+        else {
+            info!("not supported url: {}", url);
+            return Err((StatusCode::BAD_REQUEST, "Not supported url").into_response());
+        };
+    }
 
     info!(url = url, "successfully inserted new live streamers");
     Ok(Json(live_streamers))
@@ -113,11 +215,13 @@ pub async fn put_streamers_endpoint(
         .await
         .map_err(report_to_response)?;
 
-    managers
-        .add_room(service_register.worker(streamer.clone(), upload_config))
-        .await
-        .ok_or(AppError::Unknown)
-        .map_err(report_to_response)?;
+    if streamer.enabled {
+        managers
+            .add_room(service_register.worker(streamer.clone(), upload_config))
+            .await
+            .ok_or(AppError::Unknown)
+            .map_err(report_to_response)?;
+    }
 
     info!(id = id, "successfully update live streamers");
     Ok(Json(streamer))
@@ -137,34 +241,60 @@ pub async fn delete_streamers_endpoint(
 
 // #[axum::debug_handler(state = ServiceRegister)]
 pub async fn pause_streamers_endpoint(
+    State(service_register): State<ServiceRegister>,
     State(managers): State<Arc<DownloadManager>>,
+    State(pool): State<ConnectionPool>,
     Path(id): Path<i64>,
 ) -> Result<Json<()>, Response> {
-    let worker = managers.get_room_by_id(id).await;
-    if let Some(w) = worker {
-        let worker_status = w.downloader_status.read().unwrap().clone();
-        match worker_status {
-            WorkerStatus::Working(_) => {
-                w.change_status(Stage::Download, WorkerStatus::Pause).await;
-                info!(url=?&w.live_streamer.url, "successfully pause live streamers");
-                managers.make_waker(id).await;
-            }
-            WorkerStatus::Pause => {
-                w.change_status(Stage::Download, WorkerStatus::Idle).await;
-                managers.wake_waker(id).await;
-                info!(url=?&w.live_streamer.url, "successfully start live streamers");
-            }
-            WorkerStatus::Pending => {
-                w.change_status(Stage::Download, WorkerStatus::Pause).await;
-                managers.make_waker(id).await;
-                info!(url=?&w.live_streamer.url, "successfully pause live streamers");
-            }
-            WorkerStatus::Idle => {
-                w.change_status(Stage::Download, WorkerStatus::Pause).await;
-                managers.make_waker(id).await;
-                info!(url=?&w.live_streamer.url, "successfully pause live streamers");
-            }
-        };
+    let enabled: Option<i64> = sqlx::query_scalar("SELECT enabled FROM livestreamers WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&pool)
+        .await
+        .change_context(AppError::Unknown)
+        .map_err(report_to_response)?;
+    let Some(enabled) = enabled else {
+        return Err((StatusCode::NOT_FOUND, "主播不存在").into_response());
+    };
+    let next_enabled = enabled == 0;
+    sqlx::query("UPDATE livestreamers SET enabled = ? WHERE id = ?")
+        .bind(next_enabled)
+        .bind(id)
+        .execute(&pool)
+        .await
+        .change_context(AppError::Unknown)
+        .map_err(report_to_response)?;
+
+    if next_enabled {
+        if let Some(worker) = managers.get_room_by_id(id).await {
+            worker
+                .change_status(Stage::Download, WorkerStatus::Idle)
+                .await;
+            managers.wake_waker(id).await;
+        } else {
+            let streamer = get_all_streamer(&pool)
+                .await
+                .map_err(report_to_response)?
+                .into_iter()
+                .find(|item| item.id == id)
+                .ok_or_else(|| (StatusCode::NOT_FOUND, "主播不存在").into_response())?;
+            let upload_config = get_upload_config(&pool, id)
+                .await
+                .map_err(report_to_response)?;
+            managers
+                .add_room(service_register.worker(streamer, upload_config))
+                .await
+                .ok_or_else(|| (StatusCode::BAD_REQUEST, "不支持这个直播间链接").into_response())?;
+        }
+        info!(id, "streamer master switch enabled");
+    } else if let Some(worker) = managers.get_room_by_id(id).await {
+        worker
+            .change_status(Stage::Download, WorkerStatus::Pause)
+            .await;
+        managers.make_waker(id).await;
+        info!(
+            id,
+            "streamer master switch disabled; current segment will be finalized"
+        );
     }
 
     Ok(Json(()))

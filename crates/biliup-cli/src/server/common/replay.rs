@@ -24,7 +24,7 @@ use tokio::process::Command;
 use tokio::sync::{Mutex, Notify, Semaphore};
 use tracing::{error, info, warn};
 
-const VERIFY_ATTEMPTS: usize = 30;
+const VERIFY_ATTEMPTS: usize = 180;
 const VERIFY_INTERVAL_SECONDS: u64 = 10;
 const RETRY_DELAYS: [u64; 5] = [60, 300, 900, 1800, 3600];
 const DEFAULT_REPLAY_TITLE: &str = "{streamer} 直播回放 %Y-%m-%d %H-%M";
@@ -365,6 +365,7 @@ async fn process_segment(
         aid
     };
 
+    mark_remote_processing(ctx.pool(), current.id).await?;
     match wait_for_remote_ready(
         &runtime.bilibili,
         aid,
@@ -477,11 +478,50 @@ async fn remote_part_state(
         .get("duration")
         .and_then(|value| value.as_u64())
         .unwrap_or(0);
-    if duration > 0 {
+    let cid = part
+        .get("cid")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    if duration == 0 || cid == 0 {
+        return Ok(RemotePartState::MatchingProcessing);
+    }
+    if remote_part_playable(bilibili, aid, cid).await? {
         Ok(RemotePartState::MatchingReady)
     } else {
         Ok(RemotePartState::MatchingProcessing)
     }
+}
+
+async fn remote_part_playable(bilibili: &BiliBili, aid: u64, cid: u64) -> AppResult<bool> {
+    let response = bilibili
+        .client
+        .get("https://api.bilibili.com/x/player/playurl")
+        .query(&[
+            ("avid", aid.to_string()),
+            ("cid", cid.to_string()),
+            ("qn", "16".to_string()),
+            ("fnval", "16".to_string()),
+        ])
+        .send()
+        .await
+        .change_context(AppError::Unknown)?;
+    if !response.status().is_success() {
+        return Ok(false);
+    }
+    let value: serde_json::Value = response.json().await.change_context(AppError::Unknown)?;
+    if value.get("code").and_then(|value| value.as_i64()) != Some(0) {
+        return Ok(false);
+    }
+    let data = value.get("data").unwrap_or(&serde_json::Value::Null);
+    let has_durl = data
+        .get("durl")
+        .and_then(|value| value.as_array())
+        .is_some_and(|items| !items.is_empty());
+    let has_dash = data
+        .pointer("/dash/video")
+        .and_then(|value| value.as_array())
+        .is_some_and(|items| !items.is_empty());
+    Ok(has_durl || has_dash)
 }
 
 async fn wait_for_remote_ready(
@@ -641,10 +681,7 @@ async fn ensure_session(
     ctx: &Context,
     upload_config: &UploadStreamer,
 ) -> AppResult<(SessionRecord, UploadStreamer)> {
-    let reconnect_window = env_u64(
-        "LIVE_REPLAY_RECONNECT_WINDOW_SECONDS",
-        ctx.config().delay.max(1),
-    );
+    let reconnect_window = env_u64("LIVE_REPLAY_RECONNECT_WINDOW_SECONDS", 600);
     let recent_modifier = format!("-{reconnect_window} seconds");
     if let Some(row) = sqlx::query(
         "SELECT id, aid, bvid, submit_state, delete_after_success, preserve_danmaku, \
@@ -704,8 +741,8 @@ async fn ensure_session(
     let frozen_upload_config = freeze_upload_config(upload_config, &token).await?;
     let upload_json =
         serde_json::to_string(&frozen_upload_config).change_context(AppError::Unknown)?;
-    let delete_after_success = env_bool("LIVE_REPLAY_DELETE_AFTER_SUCCESS", false);
-    let preserve_danmaku = env_bool("LIVE_REPLAY_PRESERVE_DANMAKU", true);
+    let delete_after_success = env_bool("LIVE_REPLAY_DELETE_AFTER_SUCCESS", true);
+    let preserve_danmaku = env_bool("LIVE_REPLAY_PRESERVE_DANMAKU", false);
     let result = sqlx::query(
         "INSERT INTO live_sessions \
          (live_streamer_id, source_streamer_info_id, streamer_name, streamer_url, live_title, \
@@ -1735,6 +1772,26 @@ async fn mark_conflict(
     )
     .bind(message)
     .bind(segment.session_id)
+    .execute(&mut *tx)
+    .await
+    .change_context(AppError::Unknown)?;
+    tx.commit().await.change_context(AppError::Unknown)?;
+    Ok(())
+}
+
+async fn mark_remote_processing(pool: &ConnectionPool, segment_id: i64) -> AppResult<()> {
+    let mut tx = pool.begin().await.change_context(AppError::Unknown)?;
+    sqlx::query(
+        "UPDATE recording_segments SET status = 'remote_processing', last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+    .bind(segment_id)
+    .execute(&mut *tx)
+    .await
+    .change_context(AppError::Unknown)?;
+    sqlx::query(
+        "UPDATE upload_jobs SET status = 'remote_processing', last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE segment_id = ?",
+    )
+    .bind(segment_id)
     .execute(&mut *tx)
     .await
     .change_context(AppError::Unknown)?;

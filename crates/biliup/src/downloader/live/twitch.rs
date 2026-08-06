@@ -151,8 +151,7 @@ impl LivePlugin for Twitch {
                 })
                 .collect();
 
-            let responses =
-                post_gql_batch(&request.client, auth_token.as_deref(), &ops).await?;
+            let responses = post_gql_batch(&request.client, auth_token.as_deref(), &ops).await?;
 
             for (index, url) in chunk.iter().enumerate() {
                 let is_live = responses
@@ -207,9 +206,8 @@ impl TwitchLive {
     async fn check_stream(&self) -> LiveResult<LiveStatus> {
         let channel_name = self.channel_name(&self.url)?;
         let gql: GqlResponse = self
-            .post_gql(
-                json!({
-                    "query": r#"
+            .post_gql(json!({
+                "query": r#"
                         query query($channel_name:String!) {
                             user(login: $channel_name){
                                 stream {
@@ -230,8 +228,8 @@ impl TwitchLive {
                             }
                         }
                     "#,
-                    "variables": { "channel_name": channel_name }
-                }))
+                "variables": { "channel_name": channel_name }
+            }))
             .await?;
 
         let user = gql
@@ -672,7 +670,10 @@ fn netscape_cookie_file_content(auth_token: &str) -> String {
 fn cookie_file_path(auth_token: &str) -> PathBuf {
     let mut hasher = DefaultHasher::new();
     auth_token.hash(&mut hasher);
-    std::env::temp_dir().join(format!("biliup-twitch-cookies-{:016x}.txt", hasher.finish()))
+    std::env::temp_dir().join(format!(
+        "biliup-twitch-cookies-{:016x}.txt",
+        hasher.finish()
+    ))
 }
 
 /// 将 auth_token 写入 Netscape cookie 文件并返回路径；内容未变化时不重写。
@@ -738,7 +739,9 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let token = "unit-test-token";
-            let path = write_cookie_file(token).await.expect("写入 cookie 文件失败");
+            let path = write_cookie_file(token)
+                .await
+                .expect("写入 cookie 文件失败");
             assert_eq!(
                 fs::read_to_string(&path).await.unwrap(),
                 netscape_cookie_file_content(token)

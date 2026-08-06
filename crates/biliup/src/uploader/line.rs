@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::ffi::OsStr;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tracing::info;
 
@@ -19,6 +19,38 @@ use crate::uploader::line::upos::Upos;
 pub mod upos;
 
 static ACTIVE_RECORDINGS: AtomicUsize = AtomicUsize::new(0);
+static DOWNLOAD_PRESSURE_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+static HEALTHY_DOWNLOAD_CHUNKS: AtomicUsize = AtomicUsize::new(0);
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// 下载流每收到一个网络块就报告一次。连续恢复后自动解除降速。
+pub fn report_download_progress(bytes: usize) {
+    if bytes == 0 {
+        return;
+    }
+    let healthy = HEALTHY_DOWNLOAD_CHUNKS.fetch_add(1, Ordering::Relaxed) + 1;
+    if healthy >= 8 {
+        DOWNLOAD_PRESSURE_UNTIL_MS.store(0, Ordering::Relaxed);
+        HEALTHY_DOWNLOAD_CHUNKS.store(8, Ordering::Relaxed);
+    }
+}
+
+/// 下载超时或断流时，立即压低全进程上传速度，把带宽优先让给直播下行。
+pub fn report_download_pressure() {
+    HEALTHY_DOWNLOAD_CHUNKS.store(0, Ordering::Relaxed);
+    DOWNLOAD_PRESSURE_UNTIL_MS.store(unix_millis().saturating_add(15_000), Ordering::Relaxed);
+}
+
+fn download_under_pressure() -> bool {
+    let until = DOWNLOAD_PRESSURE_UNTIL_MS.load(Ordering::Relaxed);
+    until != 0 && unix_millis() < until
+}
 
 pub fn recording_started() {
     ACTIVE_RECORDINGS.fetch_add(1, Ordering::Relaxed);
@@ -35,8 +67,10 @@ pub fn is_recording_active() -> bool {
 }
 
 fn configured_rate_bytes_per_second() -> Option<u64> {
-    let (key, default_mbps) = if is_recording_active() {
-        ("LIVE_REPLAY_RECORDING_UPLOAD_LIMIT_MBPS", 20.0)
+    let (key, default_mbps) = if is_recording_active() && download_under_pressure() {
+        ("LIVE_REPLAY_PRESSURE_UPLOAD_LIMIT_MBPS", 5.0)
+    } else if is_recording_active() {
+        ("LIVE_REPLAY_RECORDING_UPLOAD_LIMIT_MBPS", 100.0)
     } else {
         ("LIVE_REPLAY_UPLOAD_LIMIT_MBPS", 0.0)
     };
@@ -56,8 +90,8 @@ fn global_schedule() -> &'static Mutex<Instant> {
     SCHEDULE.get_or_init(|| Mutex::new(Instant::now()))
 }
 
-/// 所有上传文件和所有并发分片共享一个时间表，因此 20 Mbps 是进程总限速，
-/// 不会因三个并发分片膨胀成 60 Mbps。
+/// 所有上传文件和并发分片共享总带宽：录制正常时默认最高100 Mbps；
+/// 一旦直播下行出现超时，立即降到5 Mbps，连续恢复后自动升回。
 fn throttle_stream<S, B>(stream: S) -> impl Stream<Item = Result<(B, usize)>>
 where
     S: Stream<Item = Result<(B, usize)>>,

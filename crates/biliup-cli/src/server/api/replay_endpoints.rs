@@ -245,16 +245,18 @@ pub async fn bind_replay_submission(
         .await
         .change_context(AppError::Unknown)
         .map_err(report_to_response)?;
-    let row = sqlx::query(
-        "SELECT submit_state, aid, ended_at FROM live_sessions WHERE id = ?",
-    )
-    .bind(id)
-    .fetch_optional(&mut *tx)
-    .await
-    .change_context(AppError::Unknown)
-    .map_err(report_to_response)?;
+    let row = sqlx::query("SELECT submit_state, aid, ended_at FROM live_sessions WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .change_context(AppError::Unknown)
+        .map_err(report_to_response)?;
     let Some(row) = row else {
-        return Err((axum::http::StatusCode::NOT_FOUND, "Replay session not found").into_response());
+        return Err((
+            axum::http::StatusCode::NOT_FOUND,
+            "Replay session not found",
+        )
+            .into_response());
     };
     let submit_state: String = row.try_get("submit_state").map_err(sql_error)?;
     let existing_aid: Option<i64> = row.try_get("aid").map_err(sql_error)?;
@@ -327,16 +329,18 @@ pub async fn reset_replay_submission(
         .await
         .change_context(AppError::Unknown)
         .map_err(report_to_response)?;
-    let row = sqlx::query(
-        "SELECT submit_state, aid, ended_at FROM live_sessions WHERE id = ?",
-    )
-    .bind(id)
-    .fetch_optional(&mut *tx)
-    .await
-    .change_context(AppError::Unknown)
-    .map_err(report_to_response)?;
+    let row = sqlx::query("SELECT submit_state, aid, ended_at FROM live_sessions WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .change_context(AppError::Unknown)
+        .map_err(report_to_response)?;
     let Some(row) = row else {
-        return Err((axum::http::StatusCode::NOT_FOUND, "Replay session not found").into_response());
+        return Err((
+            axum::http::StatusCode::NOT_FOUND,
+            "Replay session not found",
+        )
+            .into_response());
     };
     let submit_state: String = row.try_get("submit_state").map_err(sql_error)?;
     let existing_aid: Option<i64> = row.try_get("aid").map_err(sql_error)?;

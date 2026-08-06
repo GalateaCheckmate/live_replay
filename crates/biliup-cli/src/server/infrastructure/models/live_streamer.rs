@@ -4,6 +4,10 @@ use ormlite::{Insert, Model};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+fn default_enabled() -> bool {
+    true
+}
+
 /// 直播主播模型
 /// 存储直播主播的配置信息和录制参数
 #[derive(Model, Debug, Clone, Serialize, Deserialize)]
@@ -14,6 +18,9 @@ pub struct LiveStreamer {
     pub id: i64,
     /// 直播间URL
     pub url: String,
+    /// 主开关：开启后持续监控、自动录制并自动上传
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
     /// 备注名称
     pub remark: String,
     /// 文件名前缀
@@ -55,6 +62,8 @@ pub struct LiveStreamer {
 #[ormlite(returns = "LiveStreamer")]
 pub struct InsertLiveStreamer {
     pub url: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
     pub remark: String,
     pub filename_prefix: Option<String>,
     pub time_range: Option<String>,

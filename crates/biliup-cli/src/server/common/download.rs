@@ -78,7 +78,10 @@ impl SegmentEventProcessor {
         if let Some(tx) = &self.channel
             && tx.is_closed()
         {
-            warn!(url = self.ctx.live_streamer().url, "segment channel closed, reopening");
+            warn!(
+                url = self.ctx.live_streamer().url,
+                "segment channel closed, reopening"
+            );
             self.channel = None;
         }
 
@@ -118,18 +121,18 @@ impl SegmentEventProcessor {
                         }
                     }
                 }
-                let res = tx
-                    .force_send(event)
-                    .change_context(AppError::Custom("Failed to persist segment event".to_string()))?;
+                let res = tx.force_send(event).change_context(AppError::Custom(
+                    "Failed to persist segment event".to_string(),
+                ))?;
                 if let Some(prev) = res {
                     warn!(SegmentEvent = ?prev, "replace an existing segment event");
                 }
                 self.channel = Some(tx);
             }
             Some(tx) => {
-                let res = tx
-                    .force_send(event)
-                    .change_context(AppError::Custom("Failed to persist segment event".to_string()))?;
+                let res = tx.force_send(event).change_context(AppError::Custom(
+                    "Failed to persist segment event".to_string(),
+                ))?;
                 if let Some(prev) = res {
                     warn!(SegmentEvent = ?prev, "replace an existing segment event");
                 }
@@ -142,7 +145,8 @@ impl SegmentEventProcessor {
             let ctx = self.ctx.clone();
             tokio::spawn(async move {
                 error!(error = ?space_error, url = ctx.live_streamer().url, "stopping recording after completed segment because disk is low");
-                ctx.change_status(Stage::Download, WorkerStatus::Pause).await;
+                ctx.change_status(Stage::Download, WorkerStatus::Pause)
+                    .await;
             });
         }
 
@@ -206,9 +210,14 @@ impl DownloadTask {
                 break components;
             }
             match plugin.check_stream(live_request(ctx.worker())).await {
-                Ok(LiveStatus::Live { stream: next_stream }) => {
+                Ok(LiveStatus::Live {
+                    stream: next_stream,
+                }) => {
                     stream = *next_stream;
-                    info!(url = url, "Stream is still live, preparing to retry. attempt: {}", retry_count);
+                    info!(
+                        url = url,
+                        "Stream is still live, preparing to retry. attempt: {}", retry_count
+                    );
                     retry_count = 0;
                 }
                 Ok(LiveStatus::Offline) => {
@@ -217,12 +226,18 @@ impl DownloadTask {
                 }
                 Err(e) => {
                     retry_count += 1;
-                    warn!(url = url, "Failed to check stream status: {:?}, stopping download", e);
+                    warn!(
+                        url = url,
+                        "Failed to check stream status: {:?}, stopping download", e
+                    );
                 }
             }
 
             if retry_count >= max_retries {
-                warn!(url = url, "Maximum retry attempts ({}) reached, stopping", max_retries);
+                warn!(
+                    url = url,
+                    "Maximum retry attempts ({}) reached, stopping", max_retries
+                );
                 break components;
             }
 

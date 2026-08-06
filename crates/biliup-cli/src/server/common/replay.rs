@@ -259,7 +259,14 @@ async fn process_segment(
     video.title = Some(part_title(&current));
 
     let aid = if let Some(aid) = session.aid {
-        match remote_part_state(&runtime.bilibili, aid, current.part_number as usize, &remote_filename).await? {
+        match remote_part_state(
+            &runtime.bilibili,
+            aid,
+            current.part_number as usize,
+            &remote_filename,
+        )
+        .await?
+        {
             RemotePartState::MatchingReady | RemotePartState::MatchingProcessing => aid,
             RemotePartState::Conflict(filename) => {
                 mark_conflict(
@@ -448,6 +455,9 @@ async fn remote_part_state(
         .and_then(|value| value.as_str())
         .unwrap_or_default()
         .to_string();
+    if filename.is_empty() {
+        return Ok(RemotePartState::MatchingProcessing);
+    }
     if filename != expected_filename {
         return Ok(RemotePartState::Conflict(filename));
     }
@@ -495,7 +505,6 @@ async fn resume_cleanup(
 ) -> AppResult<()> {
     let paths = prepared_paths(segment);
     if !session.delete_after_success {
-        // 只保留最终可播放的 MP4；自动直封装产生的源容器可在远端验证后安全清理。
         if let Some(processed) = &segment.processed_file_path
             && processed != &segment.file_path
         {
@@ -504,8 +513,6 @@ async fn resume_cleanup(
         return mark_terminal(ctx.pool(), segment, "retained").await;
     }
 
-    // Live Replay 的清理必须完全幂等。自定义 run/mv 后处理无法证明执行结果，
-    // 因此不自动执行，也不猜测删除；保留文件并交给用户处理。
     let unsafe_postprocessor = ctx
         .live_streamer()
         .postprocessor
@@ -635,18 +642,19 @@ async fn ensure_session(
         let snapshot_json: Option<String> = row
             .try_get("upload_config_json")
             .change_context(AppError::Unknown)?;
-        let snapshot = if let Some(json) = snapshot_json {
+        let snapshot: UploadStreamer = if let Some(json) = snapshot_json {
             serde_json::from_str(&json).change_context(AppError::Unknown)?
         } else {
-            let key: Option<String> = row.try_get("session_key").change_context(AppError::Unknown)?;
-            let frozen = freeze_upload_config(
-                upload_config,
-                key.as_deref().unwrap_or("legacy-session"),
-            )
-            .await?;
+            let key: Option<String> = row
+                .try_get("session_key")
+                .change_context(AppError::Unknown)?;
+            let legacy_key = key.unwrap_or_else(|| format!("legacy-session-{}", session.id));
+            let frozen = freeze_upload_config(upload_config, &legacy_key).await?;
             sqlx::query(
-                "UPDATE live_sessions SET upload_config_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                "UPDATE live_sessions SET session_key = COALESCE(session_key, ?), \
+                 upload_config_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             )
+            .bind(&legacy_key)
             .bind(serde_json::to_string(&frozen).change_context(AppError::Unknown)?)
             .bind(session.id)
             .execute(ctx.pool())
@@ -743,6 +751,9 @@ async fn register_segment(
         match persist_outbox_record(ctx.pool(), ctx.id(), &staged).await {
             Ok(segment) => {
                 let _ = tokio::fs::remove_file(&outbox_path).await;
+                if let Err(error) = mark_session_recording(ctx.pool(), session_id).await {
+                    warn!(error = ?error, session_id, "segment persisted but session status could not be refreshed");
+                }
                 return Ok(segment);
             }
             Err(error) => {
@@ -756,8 +767,8 @@ async fn register_segment(
 }
 
 async fn next_part_number(pool: &ConnectionPool, session_id: i64) -> AppResult<i64> {
-    sqlx::query_scalar(
-        "SELECT COALESCE(MAX(part_number), 0) + 1 FROM ( \
+    let database_max: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(part_number), 0) FROM ( \
            SELECT part_number FROM recording_segments WHERE session_id = ? \
            UNION ALL SELECT part_number FROM replay_outbox WHERE session_id = ? \
          )",
@@ -766,7 +777,36 @@ async fn next_part_number(pool: &ConnectionPool, session_id: i64) -> AppResult<i
     .bind(session_id)
     .fetch_one(pool)
     .await
-    .change_context(AppError::Unknown)
+    .change_context(AppError::Unknown)?;
+    let filesystem_max = filesystem_outbox_max_part(session_id).await;
+    Ok(database_max.max(filesystem_max).saturating_add(1))
+}
+
+async fn filesystem_outbox_max_part(session_id: i64) -> i64 {
+    let mut maximum = 0i64;
+    let Ok(mut entries) = tokio::fs::read_dir(OUTBOX_DIR).await else {
+        return maximum;
+    };
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            _ => break,
+        };
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(bytes) = tokio::fs::read(&path).await else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_slice::<OutboxRecord>(&bytes) else {
+            continue;
+        };
+        if record.session_id == session_id {
+            maximum = maximum.max(record.part_number);
+        }
+    }
+    maximum
 }
 
 async fn stage_completed_segment(
@@ -807,9 +847,17 @@ async fn stage_completed_segment(
     } else {
         None
     };
-    let metadata = tokio::fs::metadata(&staged_path)
-        .await
-        .change_context(AppError::Unknown)?;
+    let metadata = match tokio::fs::metadata(&staged_path).await {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            let _ = move_file(&staged_path, source).await;
+            if let Some(staged_xml) = &staged_danmaku {
+                let original_xml = source.with_extension("xml");
+                let _ = move_file(staged_xml, &original_xml).await;
+            }
+            return Err(error).change_context(AppError::Unknown);
+        }
+    };
     let mtime_ns = metadata
         .modified()
         .ok()
@@ -1024,6 +1072,18 @@ async fn persist_outbox_record(
     load_segment(pool, segment_id).await
 }
 
+async fn mark_session_recording(pool: &ConnectionPool, session_id: i64) -> AppResult<()> {
+    sqlx::query(
+        "UPDATE live_sessions SET status = 'recording', ended_at = NULL, \
+         last_activity_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+    .bind(session_id)
+    .execute(pool)
+    .await
+    .change_context(AppError::Unknown)?;
+    Ok(())
+}
+
 async fn next_ready_segment(
     pool: &ConnectionPool,
     session_id: i64,
@@ -1135,7 +1195,9 @@ async fn remux_to_mp4(source: &Path) -> AppResult<PathBuf> {
         .to_ascii_lowercase();
     let mut command = Command::new("ffmpeg");
     command.args(["-hide_banner", "-loglevel", "warning", "-y", "-i"]);
-    command.arg(source).args(["-map", "0", "-c", "copy"]);
+    command
+        .arg(source)
+        .args(["-map", "0:v?", "-map", "0:a?", "-c", "copy"]);
     if matches!(extension.as_str(), "ts" | "m2ts") {
         command.args(["-bsf:a", "aac_adtstoasc"]);
     }

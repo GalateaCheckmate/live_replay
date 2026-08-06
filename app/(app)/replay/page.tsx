@@ -14,10 +14,14 @@ interface ReplaySession {
   started_at: string
   ended_at?: string
   status: string
+  submit_state: string
   aid?: number
   bvid?: string
   expected_parts: number
   verified_parts: number
+  next_part_to_upload: number
+  delete_after_success: boolean
+  preserve_danmaku: boolean
   last_error?: string
   pending_parts: number
 }
@@ -30,8 +34,12 @@ interface ReplayJob {
   bvid?: string
   part_number: number
   file_path: string
+  original_file_path?: string
+  processed_file_path?: string
+  remote_filename?: string
   file_size: number
   segment_status: string
+  cleanup_state: string
   job_status: string
   attempts: number
   last_error?: string
@@ -42,9 +50,9 @@ interface ReplayJob {
 }
 
 const statusColor = (status: string) => {
-  if (['complete', 'deleted', 'verified'].includes(status)) return 'green'
-  if (['uploading', 'recording'].includes(status)) return 'blue'
-  if (['queued', 'recording_complete'].includes(status)) return 'cyan'
+  if (['complete', 'deleted', 'verified', 'retained'].includes(status)) return 'green'
+  if (['uploading', 'recording', 'uploaded_to_storage'].includes(status)) return 'blue'
+  if (['queued', 'recording_complete', 'remote_verified', 'cleanup_pending', 'postprocessing'].includes(status)) return 'cyan'
   if (['retry_wait', 'retrying'].includes(status)) return 'orange'
   return 'red'
 }
@@ -70,23 +78,65 @@ export default function ReplayPage() {
     mutate: refreshJobs,
   } = useSWR<ReplayJob[]>('/v1/replay/jobs', fetcher, { refreshInterval: 3000 })
 
+  const refreshAll = () => Promise.all([refreshJobs(), refreshSessions()])
+
   const retry = async (id: number) => {
     const response = await fetch(`${API_BASE}/v1/replay/jobs/${id}/retry`, { method: 'POST' })
     if (!response.ok) {
       Toast.error(await response.text())
       return
     }
-    Toast.success('已解除等待，任务会尽快重试')
-    await Promise.all([refreshJobs(), refreshSessions()])
+    Toast.success('已唤醒任务并立即重试')
+    await refreshAll()
+  }
+
+  const bindSubmission = async (session: ReplaySession) => {
+    const aidText = window.prompt('请输入已经存在的稿件 AID（纯数字）')
+    if (!aidText) return
+    const aid = Number(aidText.trim())
+    if (!Number.isSafeInteger(aid) || aid <= 0) {
+      Toast.error('AID 格式不正确')
+      return
+    }
+    const bvid = window.prompt('请输入 BVID；不知道可以留空')?.trim() || undefined
+    const response = await fetch(`${API_BASE}/v1/replay/sessions/${session.id}/bind-submission`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ aid, bvid }),
+    })
+    if (!response.ok) {
+      Toast.error(await response.text())
+      return
+    }
+    Toast.success('已绑定现有稿件，队列会核对远端分P后继续')
+    await refreshAll()
+  }
+
+  const resetSubmission = async (session: ReplaySession) => {
+    const confirmed = window.confirm(
+      '只有确认B站创作中心完全没有生成这场直播的稿件时才能继续。\n\n确认远端没有稿件并重新创建吗？'
+    )
+    if (!confirmed) return
+    const response = await fetch(`${API_BASE}/v1/replay/sessions/${session.id}/reset-submission`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm_no_remote_submission: true }),
+    })
+    if (!response.ok) {
+      Toast.error(await response.text())
+      return
+    }
+    Toast.success('已解除首稿保护，将重新创建投稿')
+    await refreshAll()
   }
 
   if (sessionsLoading || jobsLoading) return <Spin size="large" />
 
   const activeSessions = sessions?.filter(item => item.status !== 'complete').length ?? 0
-  const queuedJobs = jobs?.filter(item => ['queued', 'uploading', 'retry_wait'].includes(item.job_status)).length ?? 0
+  const queuedJobs = jobs?.filter(item => ['queued', 'uploading', 'retry_wait', 'remote_verified', 'cleanup_pending'].includes(item.job_status)).length ?? 0
   const failedJobs = jobs?.filter(item => item.last_error).length ?? 0
   const pendingBytes = jobs
-    ?.filter(item => !item.deleted_at)
+    ?.filter(item => !['complete'].includes(item.job_status))
     .reduce((sum, item) => sum + item.file_size, 0) ?? 0
 
   const sessionColumns = [
@@ -95,13 +145,13 @@ export default function ReplayPage() {
     {
       title: '场次状态',
       dataIndex: 'status',
-      width: 130,
+      width: 150,
       render: (value: string) => <Tag color={statusColor(value)}>{value}</Tag>,
     },
     {
       title: '分P进度',
-      width: 110,
-      render: (_: unknown, record: ReplaySession) => `${record.verified_parts}/${record.expected_parts}`,
+      width: 120,
+      render: (_: unknown, record: ReplaySession) => `${record.verified_parts}/${record.expected_parts}（下一个P${record.next_part_to_upload}）`,
     },
     {
       title: '投稿',
@@ -112,15 +162,26 @@ export default function ReplayPage() {
         : '尚未创建',
     },
     {
-      title: '开始时间',
-      dataIndex: 'started_at',
-      width: 190,
-      render: (value: string) => new Date(value).toLocaleString(),
+      title: '本地策略',
+      width: 130,
+      render: (_: unknown, record: ReplaySession) => (
+        <Text>{record.delete_after_success ? '验证后删视频' : '保留视频'} / {record.preserve_danmaku ? '保留弹幕' : '删除弹幕'}</Text>
+      ),
     },
     {
       title: '最近错误',
       dataIndex: 'last_error',
       render: (value?: string) => value ? <Text type="danger" ellipsis={{ showTooltip: true }}>{value}</Text> : '-',
+    },
+    {
+      title: '安全恢复',
+      width: 190,
+      render: (_: unknown, record: ReplaySession) => record.submit_state === 'uncertain' ? (
+        <div style={{ display: 'flex', gap: 6 }}>
+          <Button size="small" theme="solid" onClick={() => bindSubmission(record)}>绑定稿件</Button>
+          <Button size="small" type="danger" onClick={() => resetSubmission(record)}>确认无稿</Button>
+        </div>
+      ) : '-',
     },
   ]
 
@@ -130,15 +191,20 @@ export default function ReplayPage() {
     {
       title: '状态',
       dataIndex: 'job_status',
-      width: 110,
+      width: 150,
       render: (value: string) => <Tag color={statusColor(value)}>{value}</Tag>,
     },
     { title: '文件大小', dataIndex: 'file_size', width: 105, render: formatBytes },
     { title: '尝试次数', dataIndex: 'attempts', width: 90 },
     {
-      title: '本地文件',
+      title: '安全队列文件',
       dataIndex: 'file_path',
       render: (value: string) => <Text ellipsis={{ showTooltip: true }}>{value}</Text>,
+    },
+    {
+      title: '远端标识',
+      dataIndex: 'remote_filename',
+      render: (value?: string) => value ? <Text ellipsis={{ showTooltip: true }}>{value}</Text> : '-',
     },
     {
       title: '下次重试',
@@ -157,7 +223,7 @@ export default function ReplayPage() {
       render: (_: unknown, record: ReplayJob) => (
         <Button
           size="small"
-          disabled={['complete', 'verified'].includes(record.job_status)}
+          disabled={['complete', 'submission_uncertain'].includes(record.job_status)}
           onClick={() => retry(record.id)}
         >
           重试
@@ -180,22 +246,15 @@ export default function ReplayPage() {
             </>
           }
           mode="horizontal"
-          footer={
-            <Button
-              icon={<IconRefresh />}
-              onClick={() => Promise.all([refreshSessions(), refreshJobs()])}
-            >
-              刷新
-            </Button>
-          }
+          footer={<Button icon={<IconRefresh />} onClick={refreshAll}>刷新</Button>}
         />
       </Header>
       <Content style={{ padding: 16, backgroundColor: 'var(--semi-color-bg-0)' }}>
         <Row gutter={[12, 12]} style={{ marginBottom: 16 }}>
           <Col span={6}><Card><Title heading={4}>{activeSessions}</Title><Text>进行中场次</Text></Card></Col>
-          <Col span={6}><Card><Title heading={4}>{queuedJobs}</Title><Text>等待/上传/重试</Text></Card></Col>
-          <Col span={6}><Card><Title heading={4}>{failedJobs}</Title><Text>有错误记录的任务</Text></Card></Col>
-          <Col span={6}><Card><Title heading={4}>{formatBytes(pendingBytes)}</Title><Text>尚未安全删除</Text></Card></Col>
+          <Col span={6}><Card><Title heading={4}>{queuedJobs}</Title><Text>等待/上传/清理</Text></Card></Col>
+          <Col span={6}><Card><Title heading={4}>{failedJobs}</Title><Text>需要关注</Text></Card></Col>
+          <Col span={6}><Card><Title heading={4}>{formatBytes(pendingBytes)}</Title><Text>尚未完成处理</Text></Card></Col>
         </Row>
 
         <Title heading={5} style={{ marginBottom: 10 }}>直播场次</Title>

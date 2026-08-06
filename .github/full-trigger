@@ -1,3 +1,3 @@
 Run Full validation after repository became public.
-Triggered: 2026-08-06T21:11:00+08:00
-Purpose: build portable Windows package.
+Triggered: 2026-08-06T21:14:00+08:00
+Purpose: continue through Rust tests and Windows release packaging.

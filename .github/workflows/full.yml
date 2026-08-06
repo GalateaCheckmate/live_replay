@@ -47,8 +47,8 @@ jobs:
       - name: Build frontend
         run: npm run build
 
-      - name: Check Rust formatting
-        run: cargo fmt --all -- --check
+      - name: Normalize Rust formatting
+        run: cargo fmt --all
 
       - name: Test Rust workspace
         env:

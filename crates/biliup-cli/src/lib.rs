@@ -6,6 +6,7 @@ pub mod uploader;
 
 // use crate::server::api::router::ApplicationController;
 use crate::server::app::ApplicationController;
+use crate::server::common::replay_recovery;
 use crate::server::config::{Config, StreamerConfig};
 use crate::server::core::download_manager::DownloadManager;
 use crate::server::errors::{AppError, AppResult};
@@ -34,10 +35,8 @@ pub async fn run(
     log_handle: LogHandle,
     config_path: Option<PathBuf>,
 ) -> AppResult<()> {
-    // let config = Arc::new(AppConfig::parse());
-
     tracing::info!(
-        "environment loaded and configuration parsed, initializing Postgres connection and running migrations..."
+        "environment loaded and configuration parsed, initializing database connection and running migrations..."
     );
     let conn_pool = ConnectionManager::new_pool("data/data.sqlite3")
         .await
@@ -69,6 +68,13 @@ pub async fn run(
         import_config_streamers(path, &service_register).await?;
     } else {
         import_database_streamers(&service_register).await?;
+    }
+
+    let workers = service_register.managers.get_rooms().await;
+    if let Err(error) =
+        replay_recovery::recover_pending_sessions(service_register.pool.clone(), workers).await
+    {
+        tracing::error!(error = ?error, "failed to restore persistent Live Replay queues");
     }
 
     tracing::info!("migrations successfully ran, initializing axum server...");

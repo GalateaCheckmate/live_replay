@@ -12,12 +12,28 @@ use crate::server::infrastructure::context::{Context, Stage, WorkerStatus};
 use crate::server::infrastructure::models::hook_step::process;
 use async_channel::Sender;
 use biliup::downloader::live::{LivePlugin, LiveStatus, LiveStream};
+use biliup::uploader::line::{recording_finished, recording_started};
 use error_stack::ResultExt;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+
+struct RecordingActivityGuard;
+
+impl RecordingActivityGuard {
+    fn new() -> Self {
+        recording_started();
+        Self
+    }
+}
+
+impl Drop for RecordingActivityGuard {
+    fn drop(&mut self) {
+        recording_finished();
+    }
+}
 
 // Configuration and retry policy
 #[derive(Debug, Clone)]
@@ -146,6 +162,8 @@ impl DownloadTask {
         plugin: Arc<dyn LivePlugin + Send + Sync>,
         rooms_handle: Arc<Monitor>,
     ) -> AppResult<()> {
+        let _recording_activity = RecordingActivityGuard::new();
+
         // 重试配置
         let mut retry_count = 0;
         let max_retries = 3; // 最大重试次数

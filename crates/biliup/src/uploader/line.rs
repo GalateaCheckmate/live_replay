@@ -2,26 +2,24 @@ use crate::error::Result;
 use crate::uploader::{Uploader, VideoFile, VideoStream};
 use futures::{Stream, StreamExt, TryStreamExt};
 use reqwest::{Body, RequestBuilder};
-
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::ffi::OsStr;
-
-use crate::client::StatelessClient;
-use crate::error::Kind::{Custom, RateLimit};
-use crate::uploader::bilibili::{BiliBili, Video};
-use crate::uploader::line::upos::Upos;
-use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::info;
 
+use crate::client::StatelessClient;
+use crate::error::Kind::{Custom, RateLimit};
+use crate::uploader::bilibili::{BiliBili, Video};
+use crate::uploader::line::upos::Upos;
+
 pub mod upos;
 
 static ACTIVE_RECORDINGS: AtomicUsize = AtomicUsize::new(0);
 
-/// 由录制侧登记活动场次数，用于在录制期间自动切换到较低上传速率。
 pub fn recording_started() {
     ACTIVE_RECORDINGS.fetch_add(1, Ordering::Relaxed);
 }
@@ -53,41 +51,44 @@ fn configured_rate_bytes_per_second() -> Option<u64> {
     }
 }
 
-/// 对上传数据流实施跨并发分片的共享节流。
-/// 录制状态会在每个分片到达时重新读取，因此录制开始/结束后无需重启上传任务。
+fn global_schedule() -> &'static Mutex<Instant> {
+    static SCHEDULE: OnceLock<Mutex<Instant>> = OnceLock::new();
+    SCHEDULE.get_or_init(|| Mutex::new(Instant::now()))
+}
+
+/// 所有上传文件和所有并发分片共享一个时间表，因此 20 Mbps 是进程总限速，
+/// 不会因三个并发分片膨胀成 60 Mbps。
 fn throttle_stream<S, B>(stream: S) -> impl Stream<Item = Result<(B, usize)>>
 where
     S: Stream<Item = Result<(B, usize)>>,
     B: Into<Body> + Clone,
 {
-    let schedule = Arc::new(Mutex::new(Instant::now()));
-    stream.then(move |item| {
-        let schedule = schedule.clone();
-        async move {
-            let (body, len) = item?;
-            if let Some(rate) = configured_rate_bytes_per_second() {
-                let spacing = Duration::from_secs_f64(len as f64 / rate as f64);
-                let wait = {
-                    let mut next = schedule.lock().await;
-                    let now = Instant::now();
-                    if *next < now {
-                        *next = now;
-                    }
-                    let wait = (*next).saturating_duration_since(now);
-                    *next += spacing;
-                    wait
-                };
-                if !wait.is_zero() {
-                    tokio::time::sleep(wait).await;
+    stream.then(|item| async move {
+        let (body, len) = item?;
+        if let Some(rate) = configured_rate_bytes_per_second() {
+            let spacing = Duration::from_secs_f64(len as f64 / rate as f64);
+            let wait = {
+                let mut next = global_schedule().lock().await;
+                let now = Instant::now();
+                if *next < now {
+                    *next = now;
                 }
+                let wait = (*next).saturating_duration_since(now);
+                *next += spacing;
+                wait
+            };
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
             }
-            Ok((body, len))
+        } else {
+            // 解除限速后清空旧时间债务，避免空闲时仍等待先前录制限速的排期。
+            *global_schedule().lock().await = Instant::now();
         }
+        Ok((body, len))
     })
 }
 
 pub struct Parcel {
-    // line: &'a Line,
     line: Bucket,
     video_file: VideoFile,
 }
@@ -106,7 +107,6 @@ impl Parcel {
     {
         let mut video = match self.line {
             Bucket::Upos(bucket) => {
-                // let bucket: crate::uploader::upos::Bucket = self.pre_upload(client).await?;
                 let chunk_size = bucket.chunk_size;
                 let upos = Upos::from(client, bucket).await?;
                 let mut parts = Vec::new();
@@ -127,7 +127,6 @@ impl Parcel {
         if video.title.is_none()
             && let Some(filename) = self.video_file.filepath.file_stem().and_then(OsStr::to_str)
         {
-            // B站限制分P视频标题不能超过80字符，需要截断
             video.title = Some(if filename.chars().count() >= 80 {
                 Video::truncate_title(filename, 80)
             } else {
@@ -154,7 +153,6 @@ impl Probe {
             .await?
             .json()
             .await?;
-        // let client = res.ping(client);
         let mut choice_line: Line = Default::default();
         for mut line in res.lines {
             let instant = Instant::now();
@@ -180,7 +178,7 @@ impl Probe {
         } else {
             client
                 .post(url)
-                .body(vec![0; (1024. * 1024. * 10.) as usize]) // 10MB chunk
+                .body(vec![0; (1024. * 1024. * 10.) as usize])
         }
     }
 }
@@ -202,13 +200,10 @@ impl Line {
     pub async fn pre_upload(&self, bili: &BiliBili, video_file: VideoFile) -> Result<Parcel> {
         let total_size = video_file.total_size;
         let file_name = video_file.file_name.clone();
-        let profile = "ugcupos/bup"; // ugcfx/bup 需上传视频metadata和frame.zip
+        let profile = "ugcupos/bup";
         let params = json!({
-            // "probe_version": "20221109",
-            // "upcdn": "",
-            // "zone": "",
             "name": file_name,
-            "r": self.os, // upos
+            "r": self.os,
             "profile": profile,
             "ssl": 0,
             "version": "2.14.0",
@@ -229,8 +224,6 @@ impl Line {
 
         if !response.status().is_success() {
             let response_text = response.text().await?;
-
-            // 尝试解析JSON错误响应，检测限流错误（code: 601）
             if let Ok(error_json) = serde_json::from_str::<serde_json::Value>(&response_text)
                 && let Some(code) = error_json.get("code").and_then(|c| c.as_i64())
                 && code == 601
@@ -240,10 +233,8 @@ impl Line {
                     .and_then(|m| m.as_str())
                     .unwrap_or("上传过快")
                     .to_string();
-                // 直接返回限流错误，让调用方决定如何处理
                 return Err(RateLimit { code, message });
             }
-
             return Err(Custom(format!(
                 "Failed to pre_upload from {}",
                 response_text
@@ -255,9 +246,6 @@ impl Line {
                 line: Bucket::Upos(response.json().await?),
                 video_file,
             }),
-            // _ => {
-            //     panic!("unsupported")
-            // }
         }
     }
 }
@@ -271,7 +259,6 @@ impl Default for Line {
     }
 }
 
-/// B站自建DSA
 pub fn bldsa() -> Line {
     Line {
         os: Uploader::Upos,
@@ -281,7 +268,6 @@ pub fn bldsa() -> Line {
     }
 }
 
-/// B站自建DSA
 pub fn cnbldsa() -> Line {
     Line {
         os: Uploader::Upos,
@@ -291,7 +277,6 @@ pub fn cnbldsa() -> Line {
     }
 }
 
-/// B站自建DSA
 pub fn andsa() -> Line {
     Line {
         os: Uploader::Upos,
@@ -301,7 +286,6 @@ pub fn andsa() -> Line {
     }
 }
 
-/// B站自建DSA
 pub fn atdsa() -> Line {
     Line {
         os: Uploader::Upos,
@@ -311,7 +295,6 @@ pub fn atdsa() -> Line {
     }
 }
 
-/// 百度云
 pub fn bda2() -> Line {
     Line {
         os: Uploader::Upos,
@@ -321,7 +304,6 @@ pub fn bda2() -> Line {
     }
 }
 
-/// 百度云
 pub fn cnbd() -> Line {
     Line {
         os: Uploader::Upos,
@@ -331,7 +313,6 @@ pub fn cnbd() -> Line {
     }
 }
 
-/// 百度云
 pub fn anbd() -> Line {
     Line {
         os: Uploader::Upos,
@@ -341,7 +322,6 @@ pub fn anbd() -> Line {
     }
 }
 
-/// 百度云
 pub fn atbd() -> Line {
     Line {
         os: Uploader::Upos,
@@ -351,7 +331,6 @@ pub fn atbd() -> Line {
     }
 }
 
-/// 腾讯云EO
 pub fn tx() -> Line {
     Line {
         os: Uploader::Upos,
@@ -361,7 +340,6 @@ pub fn tx() -> Line {
     }
 }
 
-/// 腾讯云EO
 pub fn cntx() -> Line {
     Line {
         os: Uploader::Upos,
@@ -371,7 +349,6 @@ pub fn cntx() -> Line {
     }
 }
 
-/// 腾讯云EO
 pub fn antx() -> Line {
     Line {
         os: Uploader::Upos,
@@ -381,7 +358,6 @@ pub fn antx() -> Line {
     }
 }
 
-/// 腾讯云EO
 pub fn attx() -> Line {
     Line {
         os: Uploader::Upos,
@@ -391,7 +367,6 @@ pub fn attx() -> Line {
     }
 }
 
-/// 百度云海外（Cloudflare）
 pub fn bda() -> Line {
     Line {
         os: Uploader::Upos,
@@ -401,7 +376,6 @@ pub fn bda() -> Line {
     }
 }
 
-/// 腾讯云EO海外
 pub fn txa() -> Line {
     Line {
         os: Uploader::Upos,
@@ -411,7 +385,6 @@ pub fn txa() -> Line {
     }
 }
 
-/// 阿里云海外
 pub fn alia() -> Line {
     Line {
         os: Uploader::Upos,

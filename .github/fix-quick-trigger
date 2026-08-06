@@ -1,2 +1,0 @@
-Fix the ambiguous Insert call in the simplified streamer endpoint, remove the deprecated warning, then trigger Quick and Full.
-Triggered: 2026-08-06T23:29:00+08:00

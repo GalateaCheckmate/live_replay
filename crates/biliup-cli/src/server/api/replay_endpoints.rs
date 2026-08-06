@@ -413,7 +413,5 @@ pub async fn reset_replay_submission(
 }
 
 fn sql_error(error: sqlx::Error) -> Response {
-    report_to_response(
-        error_stack::Report::new(AppError::Unknown).attach_printable(error.to_string()),
-    )
+    report_to_response(error_stack::Report::new(AppError::Unknown).attach(error.to_string()))
 }

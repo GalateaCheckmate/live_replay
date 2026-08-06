@@ -95,32 +95,34 @@ pub async fn post_simple_streamer_endpoint(
             .into_response());
     }
 
-    let upload = InsertUploadStreamer {
-        id: None,
-        template_name: format!("live-replay:{}:{}", remark, Utc::now().timestamp_millis()),
-        title: Some("{streamer} 直播回放 %Y-%m-%d %H-%M".to_string()),
-        tid: Some(payload.tid.unwrap_or(65)),
-        copyright: Some(2),
-        copyright_source: Some(url.clone()),
-        cover_path: None,
-        description: Some(String::new()),
-        dynamic: None,
-        dtime: None,
-        dolby: None,
-        hires: None,
-        charging_pay: None,
-        no_reprint: None,
-        uploader: Some("biliup-rs".to_string()),
-        user_cookie: Some(user_cookie),
-        tags: vec!["三角洲行动".to_string(), "游戏".to_string()],
-        credits: None,
-        up_selection_reply: None,
-        up_close_reply: None,
-        up_close_danmu: None,
-        extra_fields: None,
-        is_only_self: Some(1),
-    }
-    .insert(&pool)
+    let upload = ormlite::Insert::insert(
+        InsertUploadStreamer {
+            id: None,
+            template_name: format!("live-replay:{}:{}", remark, Utc::now().timestamp_millis()),
+            title: Some("{streamer} 直播回放 %Y-%m-%d %H-%M".to_string()),
+            tid: Some(payload.tid.unwrap_or(65)),
+            copyright: Some(2),
+            copyright_source: Some(url.clone()),
+            cover_path: None,
+            description: Some(String::new()),
+            dynamic: None,
+            dtime: None,
+            dolby: None,
+            hires: None,
+            charging_pay: None,
+            no_reprint: None,
+            uploader: Some("biliup-rs".to_string()),
+            user_cookie: Some(user_cookie),
+            tags: vec!["三角洲行动".to_string(), "游戏".to_string()],
+            credits: None,
+            up_selection_reply: None,
+            up_close_reply: None,
+            up_close_danmu: None,
+            extra_fields: None,
+            is_only_self: Some(1),
+        },
+        &pool,
+    )
     .await
     .change_context(AppError::Unknown)
     .map_err(report_to_response)?;

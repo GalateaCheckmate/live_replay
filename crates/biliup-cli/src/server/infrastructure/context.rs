@@ -10,10 +10,12 @@ use crate::server::infrastructure::models::upload_streamer::UploadStreamer;
 use biliup::client::StatelessClient;
 use biliup::downloader::live::LiveStream;
 use core::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use struct_patch::Patch;
-use tracing::{error, info};
+use tracing::{error, info, warn};
+
+const DEFAULT_SEGMENT_TIME: &str = "01:00:00";
 
 /// 应用程序上下文，包含工作器和扩展信息
 #[derive(Debug, Clone)]
@@ -28,9 +30,6 @@ pub struct Context {
 
 impl Context {
     /// 创建新的上下文实例
-    ///
-    /// # 参数
-    /// * `worker` - 工作器实例的Arc引用
     pub fn new(id: i64, worker: Arc<Worker>, pool: ConnectionPool, stream: LiveStream) -> Self {
         let mut streamer_info = streamer_info(&stream);
         streamer_info.id = id;
@@ -87,7 +86,6 @@ impl Context {
     }
 
     pub fn recorder(&self, streamer_info: StreamerInfo) -> Recorder {
-        // 创建录制器
         Recorder::new(
             self.live_streamer()
                 .filename_prefix
@@ -105,9 +103,28 @@ impl Context {
         &self.streamer_info
     }
 
+    /// Live Replay 默认优先写入 D 盘，避免长期录像占满系统盘。
+    /// `LIVE_REPLAY_OUTPUT_DIR` 可覆盖默认目录。
+    pub fn recording_output_dir(&self) -> PathBuf {
+        if let Ok(value) = std::env::var("LIVE_REPLAY_OUTPUT_DIR")
+            && !value.trim().is_empty()
+        {
+            return ensure_directory(PathBuf::from(value));
+        }
+
+        #[cfg(windows)]
+        {
+            let d_drive = Path::new(r"D:\");
+            if d_drive.exists() {
+                return ensure_directory(PathBuf::from(r"D:\LiveReplay\Recordings"));
+            }
+        }
+
+        ensure_directory(PathBuf::from("recordings"))
+    }
+
     pub fn download_config(&self, stream: &LiveStream) -> DownloadConfig {
         let config = self.config();
-        // 确定文件格式后缀
         let suffix = self
             .live_streamer()
             .format
@@ -117,45 +134,46 @@ impl Context {
         if stream.url == self.stream.url {
             stream_info.id = self.streamer_info.id;
         }
+
+        // Live Replay 默认每60分钟生成一个完整文件。用户显式配置时仍以用户配置为准。
+        let segment_time = config
+            .segment_time
+            .or_else(|| Some(DEFAULT_SEGMENT_TIME.to_string()));
+
         DownloadConfig {
-            // 流URL
             url: stream.raw_stream_url.to_string(),
-            segment_time: config.segment_time,
-            file_size: config.file_size,
+            segment_time,
+            // 使用时间分段时关闭大小分段，避免同一直播产生不可预测的小分片。
+            file_size: None,
             headers: stream.stream_headers.clone(),
             recorder: self.recorder(stream_info),
-            // output_dir: PathBuf::from("./downloads")
-            output_dir: PathBuf::from("."),
+            output_dir: self.recording_output_dir(),
             suffix,
         }
+    }
+}
+
+fn ensure_directory(path: PathBuf) -> PathBuf {
+    if let Err(error) = std::fs::create_dir_all(&path) {
+        warn!(directory = ?path, error = ?error, "failed to create recording directory; using current directory");
+        PathBuf::from(".")
+    } else {
+        path
     }
 }
 
 /// 工作器结构体，管理单个主播的录制和上传任务
 #[derive(Debug)]
 pub struct Worker {
-    /// 下载器状态
     pub downloader_status: RwLock<WorkerStatus>,
-    /// 上传器状态
     pub uploader_status: RwLock<WorkerStatus>,
-    /// 直播主播信息
     pub live_streamer: LiveStreamer,
-    /// 上传配置（可选）
     pub upload_streamer: Option<UploadStreamer>,
-    /// 全局配置
     config: Arc<RwLock<Config>>,
-    /// HTTP客户端
     pub client: StatelessClient,
 }
 
 impl Worker {
-    /// 创建新的工作器实例
-    ///
-    /// # 参数
-    /// * `live_streamer` - 直播主播信息
-    /// * `upload_streamer` - 上传配置（可选）
-    /// * `config` - 全局配置的Arc引用
-    /// * `client` - HTTP客户端
     pub fn new(
         live_streamer: LiveStreamer,
         upload_streamer: Option<UploadStreamer>,
@@ -176,34 +194,22 @@ impl Worker {
         self.live_streamer.id
     }
 
-    /// 获取主播信息
-    /// 返回当前工作器关联的直播主播信息
     pub fn get_streamer(&self) -> &LiveStreamer {
         &self.live_streamer
     }
 
-    /// 获取上传配置
-    /// 返回当前工作器的上传配置（如果存在）
     pub fn get_upload_config(&self) -> &Option<UploadStreamer> {
         &self.upload_streamer
     }
 
-    /// 获取覆写配置
-    /// 返回当前的配置副本
     pub fn get_config(&self) -> Config {
         let mut cfg = self.config.read().unwrap().clone();
-
         if let Some(cfg_p) = self.live_streamer.override_cfg.clone() {
             cfg.apply(cfg_p)
         }
         cfg
     }
 
-    /// 更改工作器状态
-    ///
-    /// # 参数
-    /// * `stage` - 工作阶段（下载或上传）
-    /// * `status` - 新的工作状态
     pub async fn change_status(&self, stage: Stage, status: WorkerStatus) {
         match stage {
             Stage::Download => {
@@ -236,14 +242,12 @@ pub fn find_worker(workers: &[Arc<Worker>], id: i64) -> Option<&Arc<Worker>> {
 }
 
 impl Drop for Worker {
-    /// 工作器销毁时的清理逻辑
     fn drop(&mut self) {
         info!("Dropping worker {}", self.live_streamer.id);
     }
 }
 
 impl PartialEq for Worker {
-    /// 比较两个工作器是否相等（基于主播ID）
     fn eq(&self, other: &Self) -> bool {
         self.live_streamer.id == other.live_streamer.id
     }
@@ -251,30 +255,21 @@ impl PartialEq for Worker {
 
 impl Eq for Worker {}
 
-/// 工作阶段枚举
 #[derive(Debug)]
 pub enum Stage {
-    /// 下载阶段
     Download,
-    /// 上传阶段
     Upload,
 }
 
-/// 工作器状态枚举
 #[derive(Default, Clone)]
 pub enum WorkerStatus {
-    /// 正在工作
     Working(Arc<DownloadTask>),
-    /// 等待中
     Pending,
-    /// 空闲状态（默认）
     #[default]
     Idle,
-    /// 下载暂停中
     Pause,
 }
 
-// 简单 Debug：打印状态名，忽略内部 downloader
 impl fmt::Debug for WorkerStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {

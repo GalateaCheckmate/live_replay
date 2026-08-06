@@ -60,6 +60,40 @@ jobs:
           SQLX_OFFLINE: "true"
         run: cargo build --release --locked --bin biliup
 
+      - name: Smoke test double-click startup
+        shell: pwsh
+        run: |
+          $smokeDir = Join-Path $PWD 'dist/smoke'
+          New-Item -ItemType Directory -Force -Path $smokeDir | Out-Null
+          $exe = (Resolve-Path 'target/release/biliup.exe').Path
+          $env:LIVE_REPLAY_NO_BROWSER = '1'
+          $process = Start-Process -FilePath $exe -WorkingDirectory $smokeDir -PassThru
+          try {
+            $ready = $false
+            foreach ($attempt in 1..60) {
+              Start-Sleep -Milliseconds 500
+              if ($process.HasExited) {
+                throw "live-replay.exe exited before the dashboard started (exit code $($process.ExitCode))"
+              }
+              try {
+                $response = Invoke-WebRequest 'http://127.0.0.1:19159/' -UseBasicParsing -TimeoutSec 2
+                if ($response.StatusCode -eq 200) {
+                  $ready = $true
+                  break
+                }
+              } catch {
+                # The server is still starting.
+              }
+            }
+            if (-not $ready) {
+              throw 'live-replay.exe did not expose the dashboard on port 19159'
+            }
+          } finally {
+            if (-not $process.HasExited) {
+              Stop-Process -Id $process.Id -Force
+            }
+          }
+
       - name: Assemble portable package
         shell: pwsh
         run: |

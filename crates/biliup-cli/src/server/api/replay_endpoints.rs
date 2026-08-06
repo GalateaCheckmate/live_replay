@@ -99,8 +99,14 @@ pub async fn get_replay_sessions(
             expected_parts: row.try_get("expected_parts").map_err(sql_error)?,
             verified_parts: row.try_get("verified_parts").map_err(sql_error)?,
             next_part_to_upload: row.try_get("next_part_to_upload").map_err(sql_error)?,
-            delete_after_success: row.try_get::<i64, _>("delete_after_success").map_err(sql_error)? != 0,
-            preserve_danmaku: row.try_get::<i64, _>("preserve_danmaku").map_err(sql_error)? != 0,
+            delete_after_success: row
+                .try_get::<i64, _>("delete_after_success")
+                .map_err(sql_error)?
+                != 0,
+            preserve_danmaku: row
+                .try_get::<i64, _>("preserve_danmaku")
+                .map_err(sql_error)?
+                != 0,
             last_error: row.try_get("last_error").map_err(sql_error)?,
             pending_parts: row.try_get("pending_parts").map_err(sql_error)?,
         });
@@ -162,7 +168,11 @@ pub async fn retry_replay_job(
     State(pool): State<ConnectionPool>,
     Path(id): Path<i64>,
 ) -> Result<Json<()>, Response> {
-    let mut tx = pool.begin().await.change_context(AppError::Unknown).map_err(report_to_response)?;
+    let mut tx = pool
+        .begin()
+        .await
+        .change_context(AppError::Unknown)
+        .map_err(report_to_response)?;
     let row = sqlx::query(
         "SELECT r.id AS segment_id, r.session_id FROM upload_jobs j \
          JOIN recording_segments r ON r.id = j.segment_id WHERE j.id = ?",
@@ -198,7 +208,19 @@ pub async fn retry_replay_job(
     .await
     .change_context(AppError::Unknown)
     .map_err(report_to_response)?;
-    tx.commit().await.change_context(AppError::Unknown).map_err(report_to_response)?;
+    sqlx::query(
+        "UPDATE live_sessions SET status = CASE WHEN ended_at IS NULL THEN 'recording' ELSE 'recording_complete' END, \
+         last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'conflict'",
+    )
+    .bind(session_id)
+    .execute(&mut *tx)
+    .await
+    .change_context(AppError::Unknown)
+    .map_err(report_to_response)?;
+    tx.commit()
+        .await
+        .change_context(AppError::Unknown)
+        .map_err(report_to_response)?;
     replay::wake_session(session_id).await;
     Ok(Json(()))
 }
@@ -209,7 +231,11 @@ pub async fn bind_replay_submission(
     Path(id): Path<i64>,
     Json(payload): Json<BindSubmissionRequest>,
 ) -> Result<Json<()>, Response> {
-    let mut tx = pool.begin().await.change_context(AppError::Unknown).map_err(report_to_response)?;
+    let mut tx = pool
+        .begin()
+        .await
+        .change_context(AppError::Unknown)
+        .map_err(report_to_response)?;
     let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM live_sessions WHERE id = ?")
         .bind(id)
         .fetch_optional(&mut *tx)
@@ -241,15 +267,18 @@ pub async fn bind_replay_submission(
     .map_err(report_to_response)?;
     sqlx::query(
         "UPDATE upload_jobs SET status = 'queued', last_error = NULL, next_attempt_at = NULL, \
-         updated_at = CURRENT_TIMESTAMP WHERE segment_id IN \
-           (SELECT id FROM recording_segments WHERE session_id = ?)",
+         locked_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE status = 'submission_uncertain' \
+         AND segment_id IN (SELECT id FROM recording_segments WHERE session_id = ?)",
     )
     .bind(id)
     .execute(&mut *tx)
     .await
     .change_context(AppError::Unknown)
     .map_err(report_to_response)?;
-    tx.commit().await.change_context(AppError::Unknown).map_err(report_to_response)?;
+    tx.commit()
+        .await
+        .change_context(AppError::Unknown)
+        .map_err(report_to_response)?;
     replay::wake_session(id).await;
     Ok(Json(()))
 }
@@ -261,9 +290,17 @@ pub async fn reset_replay_submission(
     Json(payload): Json<ResetSubmissionRequest>,
 ) -> Result<Json<()>, Response> {
     if !payload.confirm_no_remote_submission {
-        return Err((axum::http::StatusCode::BAD_REQUEST, "必须确认B站端不存在该稿件").into_response());
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "必须确认B站端不存在该稿件",
+        )
+            .into_response());
     }
-    let mut tx = pool.begin().await.change_context(AppError::Unknown).map_err(report_to_response)?;
+    let mut tx = pool
+        .begin()
+        .await
+        .change_context(AppError::Unknown)
+        .map_err(report_to_response)?;
     sqlx::query(
         "UPDATE live_sessions SET aid = NULL, bvid = NULL, submit_state = 'new', \
          status = 'recording_complete', last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -284,19 +321,24 @@ pub async fn reset_replay_submission(
     .map_err(report_to_response)?;
     sqlx::query(
         "UPDATE upload_jobs SET status = 'queued', last_error = NULL, next_attempt_at = NULL, \
-         updated_at = CURRENT_TIMESTAMP WHERE segment_id IN \
-           (SELECT id FROM recording_segments WHERE session_id = ?)",
+         locked_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE status = 'submission_uncertain' \
+         AND segment_id IN (SELECT id FROM recording_segments WHERE session_id = ?)",
     )
     .bind(id)
     .execute(&mut *tx)
     .await
     .change_context(AppError::Unknown)
     .map_err(report_to_response)?;
-    tx.commit().await.change_context(AppError::Unknown).map_err(report_to_response)?;
+    tx.commit()
+        .await
+        .change_context(AppError::Unknown)
+        .map_err(report_to_response)?;
     replay::wake_session(id).await;
     Ok(Json(()))
 }
 
 fn sql_error(error: sqlx::Error) -> Response {
-    report_to_response(error_stack::Report::new(AppError::Unknown).attach_printable(error.to_string()))
+    report_to_response(
+        error_stack::Report::new(AppError::Unknown).attach_printable(error.to_string()),
+    )
 }

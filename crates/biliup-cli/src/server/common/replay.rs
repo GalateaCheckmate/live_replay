@@ -60,6 +60,8 @@ struct OutboxRecord {
     part_number: i64,
     file_path: PathBuf,
     original_file_path: PathBuf,
+    #[serde(default)]
+    original_danmaku_file_path: Option<PathBuf>,
     danmaku_file_path: Option<PathBuf>,
     file_size: i64,
     file_mtime_ns: i64,
@@ -144,7 +146,9 @@ pub async fn process_session(
                         tokio::time::sleep(Duration::from_secs(30)).await;
                         match recover_filesystem_outbox(&pool).await {
                             Ok(_) => break,
-                            Err(error) => error!(error = ?error, "delayed replay outbox recovery failed"),
+                            Err(error) => {
+                                error!(error = ?error, "delayed replay outbox recovery failed")
+                            }
                         }
                     }
                 });
@@ -196,7 +200,12 @@ async fn run_queue_worker(
             if let Err(e) = process_segment(ctx, upload_config, &segment).await {
                 let current = load_segment(ctx.pool(), segment.id).await?;
                 if matches!(current.status.as_str(), "conflict" | "submission_uncertain") {
-                    warn!(session_id, part = segment.part_number, status = current.status, "segment requires manual resolution");
+                    warn!(
+                        session_id,
+                        part = segment.part_number,
+                        status = current.status,
+                        "segment requires manual resolution"
+                    );
                     wait_or_wake(session_id, 60).await;
                     continue;
                 }
@@ -225,7 +234,10 @@ async fn process_segment(
     segment: &SegmentRecord,
 ) -> AppResult<()> {
     let session = load_session(ctx.pool(), segment.session_id).await?;
-    if matches!(segment.status.as_str(), "remote_verified" | "cleanup_pending") {
+    if matches!(
+        segment.status.as_str(),
+        "remote_verified" | "cleanup_pending"
+    ) {
         return resume_cleanup(ctx, &session, segment).await;
     }
 
@@ -521,7 +533,11 @@ async fn resume_cleanup(
         .iter()
         .any(|step| !matches!(step, HookStep::Remove(command) if command == "rm"));
     if unsafe_postprocessor {
-        warn!(session_id = segment.session_id, part = segment.part_number, "custom postprocessor is not crash-idempotent; retaining verified files");
+        warn!(
+            session_id = segment.session_id,
+            part = segment.part_number,
+            "custom postprocessor is not crash-idempotent; retaining verified files"
+        );
         return mark_terminal(ctx.pool(), segment, "retained").await;
     }
 
@@ -605,12 +621,18 @@ fn extract_remote_ids(response: &ResponseData) -> AppResult<(u64, Option<String>
     let aid = data
         .get("aid")
         .and_then(|value| value.as_u64())
-        .or_else(|| data.pointer("/archive/aid").and_then(|value| value.as_u64()))
+        .or_else(|| {
+            data.pointer("/archive/aid")
+                .and_then(|value| value.as_u64())
+        })
         .ok_or_else(|| AppError::Custom(format!("submit response has no aid: {response}")))?;
     let bvid = data
         .get("bvid")
         .and_then(|value| value.as_str())
-        .or_else(|| data.pointer("/archive/bvid").and_then(|value| value.as_str()))
+        .or_else(|| {
+            data.pointer("/archive/bvid")
+                .and_then(|value| value.as_str())
+        })
         .map(str::to_string);
     Ok((aid, bvid))
 }
@@ -742,18 +764,20 @@ async fn register_segment(
     event: &SegmentInfo,
 ) -> AppResult<SegmentRecord> {
     let part_number = next_part_number(ctx.pool(), session_id).await?;
-    let staged = stage_completed_segment(session_id, part_number, event).await?;
-    let outbox_path = match write_outbox(&staged).await {
-        Ok(path) => path,
-        Err(error) => {
-            rollback_staged_segment(&staged).await;
-            return Err(error);
-        }
-    };
+    let record = prepare_outbox_record(session_id, part_number, event).await?;
+
+    // 先持久化意图清单，再移动录像。这样任意时刻断电，恢复器都能根据清单
+    // 判断文件仍在原位置还是已经进入安全队列，不会出现“文件已移动但无清单”的窗口。
+    let outbox_path = write_outbox(&record).await?;
+    if let Err(error) = stage_completed_segment(&record).await {
+        rollback_staged_segment(&record).await;
+        let _ = tokio::fs::remove_file(&outbox_path).await;
+        return Err(error);
+    }
 
     let mut last_error = None;
     for attempt in 0..6u64 {
-        match persist_outbox_record(ctx.pool(), ctx.id(), &staged).await {
+        match persist_outbox_record(ctx.pool(), ctx.id(), &record).await {
             Ok(segment) => {
                 let _ = tokio::fs::remove_file(&outbox_path).await;
                 if let Err(error) = mark_session_recording(ctx.pool(), session_id).await {
@@ -814,19 +838,19 @@ async fn filesystem_outbox_max_part(session_id: i64) -> i64 {
     maximum
 }
 
-async fn stage_completed_segment(
+async fn prepare_outbox_record(
     session_id: i64,
     part_number: i64,
     event: &SegmentInfo,
 ) -> AppResult<OutboxRecord> {
     let source = &event.prev_file_path;
+    let metadata = tokio::fs::metadata(source)
+        .await
+        .change_context(AppError::Unknown)?;
     let parent = source.parent().unwrap_or_else(|| Path::new("."));
     let queue_dir = parent
         .join(".live-replay-queue")
         .join(session_id.to_string());
-    tokio::fs::create_dir_all(&queue_dir)
-        .await
-        .change_context(AppError::Unknown)?;
     let original_name = source
         .file_name()
         .and_then(|value| value.to_str())
@@ -836,33 +860,10 @@ async fn stage_completed_segment(
         part_number,
         unix_nanos()
     ));
-    move_file(source, &staged_path).await?;
-
-    let staged_danmaku = if let Some(danmaku) = &event.danmaku_file_path {
-        if danmaku.exists() {
-            let path = staged_path.with_extension("xml");
-            if let Err(error) = move_file(danmaku, &path).await {
-                let _ = move_file(&staged_path, source).await;
-                return Err(error);
-            }
-            Some(path)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let metadata = match tokio::fs::metadata(&staged_path).await {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            let _ = move_file(&staged_path, source).await;
-            if let Some(staged_xml) = &staged_danmaku {
-                let original_xml = source.with_extension("xml");
-                let _ = move_file(staged_xml, &original_xml).await;
-            }
-            return Err(error).change_context(AppError::Unknown);
-        }
-    };
+    let original_danmaku_file_path = event.danmaku_file_path.clone().filter(|path| path.exists());
+    let staged_danmaku = original_danmaku_file_path
+        .as_ref()
+        .map(|_| staged_path.with_extension("xml"));
     let mtime_ns = metadata
         .modified()
         .ok()
@@ -875,6 +876,7 @@ async fn stage_completed_segment(
         part_number,
         file_path: staged_path,
         original_file_path: source.clone(),
+        original_danmaku_file_path,
         danmaku_file_path: staged_danmaku,
         file_size: metadata.len() as i64,
         file_mtime_ns: mtime_ns,
@@ -882,11 +884,54 @@ async fn stage_completed_segment(
     })
 }
 
+async fn stage_completed_segment(record: &OutboxRecord) -> AppResult<()> {
+    if !record.file_path.exists() {
+        if !record.original_file_path.exists() {
+            return Err(AppError::Custom(format!(
+                "replay segment is missing from both source and queue: {}",
+                record.original_file_path.display()
+            ))
+            .into());
+        }
+        move_file(&record.original_file_path, &record.file_path).await?;
+    }
+
+    let staged_size = tokio::fs::metadata(&record.file_path)
+        .await
+        .change_context(AppError::Unknown)?
+        .len();
+    if staged_size != record.file_size as u64 {
+        return Err(AppError::Custom(format!(
+            "staged replay segment size mismatch: expected={}, actual={}, file={}",
+            record.file_size,
+            staged_size,
+            record.file_path.display()
+        ))
+        .into());
+    }
+
+    if let (Some(original), Some(staged)) = (
+        record.original_danmaku_file_path.as_ref(),
+        record.danmaku_file_path.as_ref(),
+    ) && !staged.exists()
+        && original.exists()
+    {
+        move_file(original, staged).await?;
+    }
+    Ok(())
+}
+
 async fn rollback_staged_segment(record: &OutboxRecord) {
-    let _ = move_file(&record.file_path, &record.original_file_path).await;
-    if let Some(staged_xml) = &record.danmaku_file_path {
-        let original_xml = record.original_file_path.with_extension("xml");
-        let _ = move_file(staged_xml, &original_xml).await;
+    if record.file_path.exists() && !record.original_file_path.exists() {
+        let _ = move_file(&record.file_path, &record.original_file_path).await;
+    }
+    if let (Some(staged_xml), Some(original_xml)) = (
+        record.danmaku_file_path.as_ref(),
+        record.original_danmaku_file_path.as_ref(),
+    ) && staged_xml.exists()
+        && !original_xml.exists()
+    {
+        let _ = move_file(staged_xml, original_xml).await;
     }
 }
 
@@ -936,6 +981,57 @@ async fn move_file(source: &Path, destination: &Path) -> AppResult<()> {
     }
 }
 
+async fn copy_file_atomic(source: &Path, destination: &Path) -> AppResult<()> {
+    if source == destination {
+        return Ok(());
+    }
+    if let Some(parent) = destination.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .change_context(AppError::Unknown)?;
+    }
+    let source_size = tokio::fs::metadata(source)
+        .await
+        .change_context(AppError::Unknown)?
+        .len();
+    if let Ok(metadata) = tokio::fs::metadata(destination).await {
+        if metadata.len() == source_size {
+            return Ok(());
+        }
+        return Err(AppError::Custom(format!(
+            "processor destination already exists with different size: {}",
+            destination.display()
+        ))
+        .into());
+    }
+    let temporary = destination.with_extension(format!(
+        "{}.copy-part",
+        destination
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("file")
+    ));
+    let _ = tokio::fs::remove_file(&temporary).await;
+    tokio::fs::copy(source, &temporary)
+        .await
+        .change_context(AppError::Unknown)?;
+    let copied_size = tokio::fs::metadata(&temporary)
+        .await
+        .change_context(AppError::Unknown)?
+        .len();
+    if copied_size != source_size {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(AppError::Custom(format!(
+            "processor copy size mismatch: source={source_size}, copied={copied_size}"
+        ))
+        .into());
+    }
+    tokio::fs::rename(&temporary, destination)
+        .await
+        .change_context(AppError::Unknown)?;
+    Ok(())
+}
+
 async fn write_outbox(record: &OutboxRecord) -> AppResult<PathBuf> {
     tokio::fs::create_dir_all(OUTBOX_DIR)
         .await
@@ -972,7 +1068,13 @@ pub async fn recover_filesystem_outbox(pool: &ConnectionPool) -> AppResult<usize
         .change_context(AppError::Unknown)?
     {
         let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+        let filename = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        if path.extension().and_then(|value| value.to_str()) != Some("json")
+            && !filename.ends_with(".json.tmp")
+        {
             continue;
         }
         let bytes = match tokio::fs::read(&path).await {
@@ -986,7 +1088,7 @@ pub async fn recover_filesystem_outbox(pool: &ConnectionPool) -> AppResult<usize
             Ok(record) => record,
             Err(error) => {
                 warn!(file = ?path, error = ?error, "quarantining malformed replay outbox file");
-                let _ = tokio::fs::rename(&path, path.with_extension("json.bad")).await;
+                let _ = tokio::fs::rename(&path, path.with_extension("bad")).await;
                 continue;
             }
         };
@@ -1004,6 +1106,10 @@ pub async fn recover_filesystem_outbox(pool: &ConnectionPool) -> AppResult<usize
                 continue;
             }
         };
+        if let Err(error) = stage_completed_segment(&record).await {
+            warn!(error = ?error, session_id = record.session_id, file = ?record.file_path, "replay outbox staging is incomplete; preserving manifest for retry");
+            continue;
+        }
         persist_outbox_record(pool, source_info_id, &record).await?;
         let _ = tokio::fs::remove_file(&path).await;
         wake_session(record.session_id).await;
@@ -1155,6 +1261,7 @@ async fn prepare_paths(
         paths.push(path.clone());
     }
 
+    let mut remove_after_commit = Vec::new();
     for processor in processors {
         match processor {
             HookStep::Move { mv } => {
@@ -1162,15 +1269,19 @@ async fn prepare_paths(
                 tokio::fs::create_dir_all(target)
                     .await
                     .change_context(AppError::Unknown)?;
-                let mut moved = Vec::with_capacity(paths.len());
+                let mut copied = Vec::with_capacity(paths.len());
                 for source in &paths {
-                    let destination = target.join(source.file_name().ok_or_else(|| {
-                        AppError::Custom("invalid processor path".to_string())
-                    })?);
-                    move_file(source, &destination).await?;
-                    moved.push(destination);
+                    let destination =
+                        target.join(source.file_name().ok_or_else(|| {
+                            AppError::Custom("invalid processor path".to_string())
+                        })?);
+                    copy_file_atomic(source, &destination).await?;
+                    if source != &destination {
+                        remove_after_commit.push(source.clone());
+                    }
+                    copied.push(destination);
                 }
-                paths = moved;
+                paths = copied;
             }
             HookStep::Remux { .. } => {}
             HookStep::Run { .. } | HookStep::Remove(_) => {
@@ -1192,20 +1303,37 @@ async fn prepare_paths(
         .skip(1)
         .find(|path| path.extension().and_then(|value| value.to_str()) == Some("xml"))
         .cloned();
+
+    let mut tx = pool.begin().await.change_context(AppError::Unknown)?;
     sqlx::query(
         "UPDATE recording_segments SET processed_file_path = ?, danmaku_file_path = ?, \
          updated_at = CURRENT_TIMESTAMP WHERE id = ?",
     )
     .bind(processed.display().to_string())
-    .bind(
-        danmaku
-            .as_ref()
-            .map(|path| path.display().to_string()),
-    )
+    .bind(danmaku.as_ref().map(|path| path.display().to_string()))
     .bind(segment.id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .change_context(AppError::Unknown)?;
+    if processed != segment.file_path {
+        sqlx::query("UPDATE filelist SET file = ? WHERE file = ?")
+            .bind(processed.display().to_string())
+            .bind(segment.file_path.display().to_string())
+            .execute(&mut *tx)
+            .await
+            .change_context(AppError::Unknown)?;
+    }
+    tx.commit().await.change_context(AppError::Unknown)?;
+
+    // 数据库已经指向新路径后再删旧文件。这里失败只会留下安全的重复副本，
+    // 不会让队列失去唯一可用文件。
+    for source in remove_after_commit {
+        if let Err(error) = tokio::fs::remove_file(&source).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(file = ?source, error = ?error, "failed to remove old processor source; duplicate copy retained");
+        }
+    }
     Ok(paths)
 }
 
@@ -1248,16 +1376,12 @@ async fn remux_to_mp4(source: &Path) -> AppResult<PathBuf> {
     let status = command
         .status()
         .await
-        .change_context(AppError::Custom(
-            "failed to start ffmpeg remux".to_string(),
-        ))?;
+        .change_context(AppError::Custom("failed to start ffmpeg remux".to_string()))?;
     if !status.success() {
         let _ = tokio::fs::remove_file(&temporary).await;
-        return Err(AppError::Custom(format!(
-            "ffmpeg remux failed for {}",
-            source.display()
-        ))
-        .into());
+        return Err(
+            AppError::Custom(format!("ffmpeg remux failed for {}", source.display())).into(),
+        );
     }
     let metadata = tokio::fs::metadata(&temporary)
         .await
@@ -1273,10 +1397,12 @@ async fn remux_to_mp4(source: &Path) -> AppResult<PathBuf> {
 }
 
 fn prepared_paths(segment: &SegmentRecord) -> Vec<PathBuf> {
-    let mut paths = vec![segment
-        .processed_file_path
-        .clone()
-        .unwrap_or_else(|| segment.file_path.clone())];
+    let mut paths = vec![
+        segment
+            .processed_file_path
+            .clone()
+            .unwrap_or_else(|| segment.file_path.clone()),
+    ];
     if let Some(path) = &segment.danmaku_file_path {
         paths.push(path.clone());
     }
@@ -1469,11 +1595,7 @@ async fn mark_uploading(pool: &ConnectionPool, segment_id: i64) -> AppResult<()>
     Ok(())
 }
 
-async fn mark_submitting(
-    pool: &ConnectionPool,
-    session_id: i64,
-    segment_id: i64,
-) -> AppResult<()> {
+async fn mark_submitting(pool: &ConnectionPool, session_id: i64, segment_id: i64) -> AppResult<()> {
     let mut tx = pool.begin().await.change_context(AppError::Unknown)?;
     sqlx::query(
         "UPDATE live_sessions SET submit_state = 'submitting', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -1564,10 +1686,7 @@ async fn mark_conflict(
     Ok(())
 }
 
-async fn mark_remote_verified(
-    pool: &ConnectionPool,
-    segment: &SegmentRecord,
-) -> AppResult<()> {
+async fn mark_remote_verified(pool: &ConnectionPool, segment: &SegmentRecord) -> AppResult<()> {
     let mut tx = pool.begin().await.change_context(AppError::Unknown)?;
     sqlx::query(
         "UPDATE recording_segments SET status = 'remote_verified', cleanup_state = 'pending', \
@@ -1588,11 +1707,7 @@ async fn mark_remote_verified(
     Ok(())
 }
 
-async fn mark_cleanup_state(
-    pool: &ConnectionPool,
-    segment_id: i64,
-    state: &str,
-) -> AppResult<()> {
+async fn mark_cleanup_state(pool: &ConnectionPool, segment_id: i64, state: &str) -> AppResult<()> {
     sqlx::query(
         "UPDATE recording_segments SET status = ?, cleanup_state = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
     )
@@ -1635,6 +1750,18 @@ async fn mark_terminal(
     .execute(&mut *tx)
     .await
     .change_context(AppError::Unknown)?;
+    if terminal == "deleted" {
+        let processed = segment
+            .processed_file_path
+            .as_ref()
+            .unwrap_or(&segment.file_path);
+        sqlx::query("DELETE FROM filelist WHERE file = ? OR file = ?")
+            .bind(segment.file_path.display().to_string())
+            .bind(processed.display().to_string())
+            .execute(&mut *tx)
+            .await
+            .change_context(AppError::Unknown)?;
+    }
     sqlx::query(
         "UPDATE live_sessions SET verified_parts = MAX(verified_parts, ?), \
          next_part_to_upload = CASE WHEN next_part_to_upload = ? THEN ? + 1 ELSE next_part_to_upload END, \
@@ -1660,11 +1787,26 @@ async fn mark_retry(
     error_message: &str,
 ) -> AppResult<()> {
     let modifier = format!("+{delay_seconds} seconds");
+    let cleanup_retry = matches!(
+        segment.status.as_str(),
+        "remote_verified" | "cleanup_pending"
+    );
+    let segment_status = if cleanup_retry {
+        "cleanup_pending"
+    } else {
+        "retry_wait"
+    };
+    let job_status = if cleanup_retry {
+        "remote_verified"
+    } else {
+        "retry_wait"
+    };
     let mut tx = pool.begin().await.change_context(AppError::Unknown)?;
     sqlx::query(
-        "UPDATE recording_segments SET status = 'retry_wait', retry_count = ?, last_error = ?, \
+        "UPDATE recording_segments SET status = ?, retry_count = ?, last_error = ?, \
          next_retry_at = datetime('now', ?), updated_at = CURRENT_TIMESTAMP WHERE id = ?",
     )
+    .bind(segment_status)
     .bind(attempt)
     .bind(error_message)
     .bind(&modifier)
@@ -1673,9 +1815,10 @@ async fn mark_retry(
     .await
     .change_context(AppError::Unknown)?;
     sqlx::query(
-        "UPDATE upload_jobs SET status = 'retry_wait', last_error = ?, next_attempt_at = datetime('now', ?), \
+        "UPDATE upload_jobs SET status = ?, last_error = ?, next_attempt_at = datetime('now', ?), \
          locked_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE segment_id = ?",
     )
+    .bind(job_status)
     .bind(error_message)
     .bind(&modifier)
     .bind(segment.id)

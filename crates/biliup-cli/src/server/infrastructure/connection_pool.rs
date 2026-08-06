@@ -1,21 +1,31 @@
 use crate::server::errors::{AppError, AppResult};
+use chrono::Utc;
 use error_stack::ResultExt;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Pool, Sqlite};
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::info;
 
-/// SQLite连接池类型别名
 pub type ConnectionPool = Pool<Sqlite>;
 
-/// 连接管理器
-/// 负责管理SQLite连接池的创建和配置
+static STARTUP_CUTOFF: OnceLock<String> = OnceLock::new();
+
+/// 本进程开始连接数据库的时间。恢复器只把这个时间之前的活动场次视为崩溃遗留。
+pub fn startup_cutoff() -> &'static str {
+    STARTUP_CUTOFF
+        .get_or_init(|| Utc::now().to_rfc3339())
+        .as_str()
+}
+
 pub struct ConnectionManager;
 
 impl ConnectionManager {
     pub async fn new_pool(path: &str) -> AppResult<ConnectionPool> {
+        let _ = startup_cutoff();
+
         if let Some(parent) = Path::new(path).parent() {
             std::fs::create_dir_all(parent)
                 .change_context(AppError::Unknown)
@@ -31,7 +41,6 @@ impl ConnectionManager {
             .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(Duration::from_secs(30));
 
-        // WAL 允许录制分段登记与 Web 查询并发；busy_timeout 避免短暂写锁导致分段丢失。
         let pool = SqlitePoolOptions::new()
             .max_connections(4)
             .acquire_timeout(Duration::from_secs(30))

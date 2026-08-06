@@ -1,6 +1,6 @@
 use crate::error::Result;
 use crate::uploader::{Uploader, VideoFile, VideoStream};
-use futures::{Stream, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use reqwest::{Body, RequestBuilder};
 
 use serde::{Deserialize, Serialize};
@@ -11,10 +11,80 @@ use crate::client::StatelessClient;
 use crate::error::Kind::{Custom, RateLimit};
 use crate::uploader::bilibili::{BiliBili, Video};
 use crate::uploader::line::upos::Upos;
-use std::time::Instant;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 use tracing::info;
 
 pub mod upos;
+
+static ACTIVE_RECORDINGS: AtomicUsize = AtomicUsize::new(0);
+
+/// 由录制侧登记活动场次数，用于在录制期间自动切换到较低上传速率。
+pub fn recording_started() {
+    ACTIVE_RECORDINGS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn recording_finished() {
+    let _ = ACTIVE_RECORDINGS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_sub(1))
+    });
+}
+
+pub fn is_recording_active() -> bool {
+    ACTIVE_RECORDINGS.load(Ordering::Relaxed) > 0
+}
+
+fn configured_rate_bytes_per_second() -> Option<u64> {
+    let (key, default_mbps) = if is_recording_active() {
+        ("LIVE_REPLAY_RECORDING_UPLOAD_LIMIT_MBPS", 20.0)
+    } else {
+        ("LIVE_REPLAY_UPLOAD_LIMIT_MBPS", 0.0)
+    };
+    let mbps = std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .unwrap_or(default_mbps);
+    if !mbps.is_finite() || mbps <= 0.0 {
+        None
+    } else {
+        Some((mbps * 1_000_000.0 / 8.0).max(1.0) as u64)
+    }
+}
+
+/// 对上传数据流实施跨并发分片的共享节流。
+/// 录制状态会在每个分片到达时重新读取，因此录制开始/结束后无需重启上传任务。
+fn throttle_stream<S, B>(stream: S) -> impl Stream<Item = Result<(B, usize)>>
+where
+    S: Stream<Item = Result<(B, usize)>>,
+    B: Into<Body> + Clone,
+{
+    let schedule = Arc::new(Mutex::new(Instant::now()));
+    stream.then(move |item| {
+        let schedule = schedule.clone();
+        async move {
+            let (body, len) = item?;
+            if let Some(rate) = configured_rate_bytes_per_second() {
+                let spacing = Duration::from_secs_f64(len as f64 / rate as f64);
+                let wait = {
+                    let mut next = schedule.lock().await;
+                    let now = Instant::now();
+                    if *next < now {
+                        *next = now;
+                    }
+                    let wait = (*next).saturating_duration_since(now);
+                    *next += spacing;
+                    wait
+                };
+                if !wait.is_zero() {
+                    tokio::time::sleep(wait).await;
+                }
+            }
+            Ok((body, len))
+        }
+    })
+}
 
 pub struct Parcel {
     // line: &'a Line,
@@ -40,12 +110,10 @@ impl Parcel {
                 let chunk_size = bucket.chunk_size;
                 let upos = Upos::from(client, bucket).await?;
                 let mut parts = Vec::new();
+                let source = progress(self.video_file.get_stream(chunk_size)?);
+                let source = throttle_stream(source);
                 let stream = upos
-                    .upload_stream(
-                        progress(self.video_file.get_stream(chunk_size)?),
-                        self.video_file.total_size,
-                        limit,
-                    )
+                    .upload_stream(source, self.video_file.total_size, limit)
                     .await?;
                 tokio::pin!(stream);
                 while let Some((part, _size)) = stream.try_next().await? {
@@ -65,7 +133,7 @@ impl Parcel {
             } else {
                 filename.to_string()
             });
-        };
+        }
         Ok(video)
     }
 }

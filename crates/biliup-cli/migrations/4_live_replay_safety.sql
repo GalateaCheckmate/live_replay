@@ -17,6 +17,35 @@ ALTER TABLE recording_segments ADD COLUMN file_mtime_ns INTEGER;
 ALTER TABLE recording_segments ADD COLUMN remote_filename TEXT;
 ALTER TABLE recording_segments ADD COLUMN cleanup_state TEXT NOT NULL DEFAULT 'pending';
 
+-- 兼容前一版 Live Replay 状态。旧 verified 已经通过远端检查，但没有保存
+-- remote_filename，不能再安全地自动核对或删除，因此升级后明确保留本地文件。
+UPDATE recording_segments
+SET status = 'retained', cleanup_state = 'retained', last_error = NULL
+WHERE status = 'verified';
+
+UPDATE upload_jobs
+SET status = 'complete', last_error = NULL, locked_at = NULL, updated_at = CURRENT_TIMESTAMP
+WHERE segment_id IN (
+    SELECT id FROM recording_segments WHERE status IN ('deleted', 'retained')
+);
+
+-- 从第一个非终态分P继续；没有待处理分P时指向 expected_parts + 1。
+UPDATE live_sessions
+SET next_part_to_upload = COALESCE(
+        (SELECT MIN(r.part_number)
+         FROM recording_segments r
+         WHERE r.session_id = live_sessions.id
+           AND r.status NOT IN ('deleted', 'retained')),
+        expected_parts + 1
+    ),
+    verified_parts = COALESCE(
+        (SELECT MAX(r.part_number)
+         FROM recording_segments r
+         WHERE r.session_id = live_sessions.id
+           AND r.status IN ('deleted', 'retained')),
+        verified_parts
+    );
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_live_sessions_session_key
     ON live_sessions(session_key) WHERE session_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_live_sessions_pending_part

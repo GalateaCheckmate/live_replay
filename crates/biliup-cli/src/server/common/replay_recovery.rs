@@ -33,23 +33,41 @@ pub async fn recover_pending_sessions(
         info!(outbox_count, "restored filesystem replay outbox records");
     }
 
-    // 上传文件到存储节点后、提交或清理中断，都可以按持久状态继续。
-    // 首稿处于 submitting 且没有 AID 时结果无法安全判定，转为人工处理，绝不自动重投。
     let mut tx = pool.begin().await.change_context(AppError::Unknown)?;
+
+    // 进程退出时的活动录像已不可能仍在录制。将它们关闭为可恢复状态，
+    // 否则所有分段处理完后 session_can_finish 会永久等待 recording 结束。
     sqlx::query(
-        "UPDATE recording_segments SET status = 'queued', next_retry_at = NULL, updated_at = CURRENT_TIMESTAMP \
-         WHERE status = 'uploading'",
+        "UPDATE live_sessions SET ended_at = COALESCE(ended_at, CURRENT_TIMESTAMP), \
+         status = CASE \
+           WHEN status IN ('submission_uncertain', 'conflict') THEN status \
+           WHEN expected_parts = verified_parts THEN 'complete' \
+           ELSE 'recording_complete' \
+         END, updated_at = CURRENT_TIMESTAMP \
+         WHERE ended_at IS NULL",
+    )
+    .execute(&mut *tx)
+    .await
+    .change_context(AppError::Unknown)?;
+
+    // 上传动作中断时可以安全重试；远端 filename 核对会避免重复追加。
+    sqlx::query(
+        "UPDATE recording_segments SET status = CASE \
+           WHEN remote_filename IS NOT NULL THEN 'uploaded_to_storage' ELSE 'queued' END, \
+         next_retry_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE status = 'uploading'",
     )
     .execute(&mut *tx)
     .await
     .change_context(AppError::Unknown)?;
     sqlx::query(
-        "UPDATE upload_jobs SET status = 'queued', next_attempt_at = NULL, locked_at = NULL, updated_at = CURRENT_TIMESTAMP \
-         WHERE status = 'uploading'",
+        "UPDATE upload_jobs SET status = 'queued', next_attempt_at = NULL, locked_at = NULL, \
+         updated_at = CURRENT_TIMESTAMP WHERE status = 'uploading'",
     )
     .execute(&mut *tx)
     .await
     .change_context(AppError::Unknown)?;
+
+    // 首稿请求发出后没有保存到 AID 的窗口无法自动判定。宁可暂停，也绝不重复投稿。
     sqlx::query(
         "UPDATE recording_segments SET status = 'submission_uncertain', \
          last_error = COALESCE(last_error, '首个投稿在程序退出时处于提交中；已暂停自动重投') \
@@ -129,14 +147,26 @@ pub async fn recover_pending_sessions(
             continue;
         };
 
-        let upload_config = session
-            .upload_config_json
-            .as_deref()
-            .and_then(|json| serde_json::from_str::<UploadStreamer>(json).ok())
-            .or_else(|| worker.get_upload_config().clone());
-        let Some(upload_config) = upload_config else {
-            warn!(session_id = session.id, "pending replay session has no upload config snapshot");
-            continue;
+        // 有快照时必须严格使用快照。快照损坏不能退回当前模板，否则可能换账号续传。
+        let upload_config = match session.upload_config_json.as_deref() {
+            Some(json) => match serde_json::from_str::<UploadStreamer>(json) {
+                Ok(config) => config,
+                Err(error) => {
+                    warn!(
+                        error = ?error,
+                        session_id = session.id,
+                        "upload snapshot is invalid; queue is paused to prevent account mismatch"
+                    );
+                    continue;
+                }
+            },
+            None => match worker.get_upload_config().clone() {
+                Some(config) => config,
+                None => {
+                    warn!(session_id = session.id, "pending replay session has no upload config");
+                    continue;
+                }
+            },
         };
         if upload_config.is_noop_uploader() {
             warn!(session_id = session.id, "pending replay session snapshot uses Noop uploader");

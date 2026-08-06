@@ -77,7 +77,7 @@ async fn main() -> AppResult<()> {
 
     let user_cookie = expand_path(cli.user_cookie);
 
-    if launched_without_args {
+    if launched_without_args && std::env::var_os("LIVE_REPLAY_NO_BROWSER").is_none() {
         open_dashboard_when_ready(19159);
     }
 

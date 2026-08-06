@@ -3,6 +3,7 @@ use crate::server::common::util::Recorder;
 use crate::server::config::Config;
 use crate::server::core::downloader::DownloadConfig;
 use crate::server::core::live::streamer_info;
+use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
 use crate::server::infrastructure::models::StreamerInfo;
 use crate::server::infrastructure::models::live_streamer::LiveStreamer;
@@ -11,11 +12,15 @@ use biliup::client::StatelessClient;
 use biliup::downloader::live::LiveStream;
 use core::fmt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, RwLock};
 use struct_patch::Patch;
 use tracing::{error, info, warn};
 
 const DEFAULT_SEGMENT_TIME: &str = "01:00:00";
+const DEFAULT_DISK_WARNING_GB: u64 = 100;
+const DEFAULT_DISK_STOP_GB: u64 = 30;
+const GIB: u64 = 1024 * 1024 * 1024;
 
 /// 应用程序上下文，包含工作器和扩展信息
 #[derive(Debug, Clone)]
@@ -123,6 +128,40 @@ impl Context {
         ensure_directory(PathBuf::from("recordings"))
     }
 
+    /// 新场次开始前检查磁盘空间。空间低于停止阈值时拒绝启动新的录像；
+    /// 已完成且未验证上传的文件绝不会因此被删除。
+    pub fn ensure_recording_space(&self) -> AppResult<()> {
+        let directory = self.recording_output_dir();
+        let Some(free_bytes) = free_space_bytes(&directory) else {
+            warn!(directory = ?directory, "unable to read free disk space; recording is allowed");
+            return Ok(());
+        };
+
+        let warning_gb = env_u64("LIVE_REPLAY_DISK_WARNING_GB", DEFAULT_DISK_WARNING_GB);
+        let stop_gb = env_u64("LIVE_REPLAY_DISK_STOP_GB", DEFAULT_DISK_STOP_GB);
+        let free_gb = free_bytes as f64 / GIB as f64;
+
+        if free_bytes < stop_gb.saturating_mul(GIB) {
+            return Err(AppError::Custom(format!(
+                "录像目录 {} 仅剩 {:.1} GB，低于停止阈值 {} GB；不会开始新的录像",
+                directory.display(),
+                free_gb,
+                stop_gb
+            ))
+            .into());
+        }
+
+        if free_bytes < warning_gb.saturating_mul(GIB) {
+            warn!(
+                directory = ?directory,
+                free_gb,
+                warning_gb,
+                "recording disk space is below warning threshold"
+            );
+        }
+        Ok(())
+    }
+
     pub fn download_config(&self, stream: &LiveStream) -> DownloadConfig {
         let config = self.config();
         let suffix = self
@@ -150,6 +189,57 @@ impl Context {
             output_dir: self.recording_output_dir(),
             suffix,
         }
+    }
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn free_space_bytes(path: &Path) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        let path_text = path.to_string_lossy();
+        let drive = path_text
+            .chars()
+            .next()
+            .filter(|_| path_text.chars().nth(1) == Some(':'))?;
+        let script = format!(
+            "$d = Get-PSDrive -Name '{}'; if ($d) {{ [Console]::Write($d.Free) }}",
+            drive
+        );
+        let output = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        return String::from_utf8(output.stdout)
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok();
+    }
+
+    #[cfg(not(windows))]
+    {
+        let output = Command::new("df").arg("-Pk").arg(path).output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8(output.stdout).ok()?;
+        let available_kib = text
+            .lines()
+            .last()?
+            .split_whitespace()
+            .nth(3)?
+            .parse::<u64>()
+            .ok()?;
+        Some(available_kib.saturating_mul(1024))
     }
 }
 

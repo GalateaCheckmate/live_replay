@@ -35,7 +35,6 @@ impl Drop for RecordingActivityGuard {
     }
 }
 
-// Configuration and retry policy
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
     pub max_attempts: u32,
@@ -53,7 +52,6 @@ impl RetryPolicy {
     }
 }
 
-/// 分段事件处理器
 pub struct SegmentEventProcessor {
     channel: Option<Sender<SegmentInfo>>,
     uploader: Sender<UploaderMessage>,
@@ -62,7 +60,6 @@ pub struct SegmentEventProcessor {
 }
 
 impl SegmentEventProcessor {
-    /// 创建处理器
     pub fn new(uploader: Sender<UploaderMessage>, ctx: Context) -> Self {
         Self {
             channel: None,
@@ -75,27 +72,19 @@ impl SegmentEventProcessor {
         }
     }
 
-    /// 处理分段事件
     pub fn process(&mut self, event: SegmentInfo) -> AppResult<()> {
-        // 只有下载器已关闭并通过文件验证的完整分段，才允许进入上传队列。
         self.file_validator.validate(&event.prev_file_path)?;
 
         if let Some(tx) = &self.channel
             && tx.is_closed()
         {
-            warn!(
-                url = self.ctx.live_streamer().url,
-                "segment channel closed, reopening"
-            );
+            warn!(url = self.ctx.live_streamer().url, "segment channel closed, reopening");
             self.channel = None;
         }
 
         match &self.channel {
             None => {
-                // 无界通道只负责快速登记分段。上传重试在独立数据库队列中执行，
-                // 网络或账号故障不会反向阻塞录制线程。
                 let (tx, rx) = async_channel::unbounded();
-
                 match self.ctx.upload_config().clone() {
                     Some(config) if !config.is_noop_uploader() => {
                         let ctx = self.ctx.clone();
@@ -104,7 +93,6 @@ impl SegmentEventProcessor {
                         });
                     }
                     _ => {
-                        // Noop 或无上传配置继续沿用原版后处理链路。
                         let res = self
                             .uploader
                             .force_send(UploaderMessage::SegmentEvent(rx, self.ctx.clone()))
@@ -116,7 +104,6 @@ impl SegmentEventProcessor {
                         }
                     }
                 }
-
                 let res = tx
                     .force_send(event)
                     .change_context(AppError::Custom("Failed to persist segment event".to_string()))?;
@@ -135,11 +122,20 @@ impl SegmentEventProcessor {
             }
         }
 
+        // 每个完整分段结束后重新检查空间。低于停止阈值时先保住刚完成的文件，
+        // 然后优雅停止当前下载器，不再继续无限创建新分段。
+        if let Err(space_error) = self.ctx.ensure_recording_space() {
+            let ctx = self.ctx.clone();
+            tokio::spawn(async move {
+                error!(error = ?space_error, url = ctx.live_streamer().url, "stopping recording after completed segment because disk is low");
+                ctx.change_status(Stage::Download, WorkerStatus::Pause).await;
+            });
+        }
+
         Ok(())
     }
 }
 
-/// 下载任务
 pub struct DownloadTask {
     token: CancellationToken,
     done_notify: Notify,
@@ -163,12 +159,10 @@ impl DownloadTask {
         rooms_handle: Arc<Monitor>,
     ) -> AppResult<()> {
         let _recording_activity = RecordingActivityGuard::new();
-
-        // 重试配置
         let mut retry_count = 0;
-        let max_retries = 3; // 最大重试次数
-        let base_delay = Duration::from_secs(2); // 基础延迟时间（2秒）
-        let max_delay = Duration::from_secs(ctx.config().delay); // 最大延迟时间
+        let max_retries = 3;
+        let base_delay = Duration::from_secs(2);
+        let max_delay = Duration::from_secs(ctx.config().delay.max(1));
         let url = ctx.live_streamer().url.clone();
         let mut stream = ctx.live_stream().clone();
         let filename_prefix = ctx
@@ -181,7 +175,6 @@ impl DownloadTask {
             filename_prefix.as_deref(),
             &stream.name,
         );
-        // 启动弹幕客户端
         if let Some(ref client) = danmaku_client {
             info!("Starting danmaku client for stream: {}", url);
             client.download().await?;
@@ -192,23 +185,16 @@ impl DownloadTask {
             let components = self
                 .download(&mut processor, ctx.clone(), danmaku_client.clone(), &stream)
                 .await;
-
             info!("initialize_components completed: {url}");
 
             if self.token.is_cancelled() {
                 info!(url = url, "task is cancelled");
                 break components;
             }
-            // 检查流状态
             match plugin.check_stream(live_request(ctx.worker())).await {
-                Ok(LiveStatus::Live {
-                    stream: next_stream,
-                }) => {
+                Ok(LiveStatus::Live { stream: next_stream }) => {
                     stream = *next_stream;
-                    info!(
-                        url = url,
-                        "Stream is still live, preparing to retry. attempt: {}", retry_count
-                    );
+                    info!(url = url, "Stream is still live, preparing to retry. attempt: {}", retry_count);
                     retry_count = 0;
                 }
                 Ok(LiveStatus::Offline) => {
@@ -217,35 +203,21 @@ impl DownloadTask {
                 }
                 Err(e) => {
                     retry_count += 1;
-                    warn!(
-                        url = url,
-                        "Failed to check stream status: {:?}, stopping download", e
-                    );
+                    warn!(url = url, "Failed to check stream status: {:?}, stopping download", e);
                 }
             }
 
             if retry_count >= max_retries {
-                warn!(
-                    url = url,
-                    "Maximum retry attempts ({}) reached, stopping", max_retries
-                );
+                warn!(url = url, "Maximum retry attempts ({}) reached, stopping", max_retries);
                 break components;
             }
-
-            info!(
-                url = url,
-                "preparing to retry. Attempt: {}/{}",
-                retry_count + 1,
-                max_retries
-            );
 
             let delay = if retry_count != 0 {
                 base_delay * 2_u32.pow(retry_count)
             } else {
                 Duration::ZERO
-            };
-            let delay = delay.min(max_delay);
-
+            }
+            .min(max_delay);
             info!("Retrying download in {:?}...", delay);
             tokio::time::sleep(delay).await;
         };
@@ -268,24 +240,19 @@ impl DownloadTask {
         stream: &LiveStream,
     ) -> AppResult<DownloadStatus> {
         let streamer = ctx.live_streamer();
-
-        let hook = |event| {
-            match event {
-                SegmentEvent::Start { .. } => {
-                    warn!("Ignoring unexpected segment start event");
+        let hook = |event| match event {
+            SegmentEvent::Start { .. } => warn!("Ignoring unexpected segment start event"),
+            SegmentEvent::Segment(mut event) => {
+                if let Some(ref client) = danmaku_client {
+                    let danmaku_file_path = event.prev_file_path.with_extension("xml");
+                    match client.rolling(&danmaku_file_path.display().to_string()) {
+                        Ok(true) => event.danmaku_file_path = Some(danmaku_file_path),
+                        Ok(false) => {}
+                        Err(e) => error!("Danmaku rolling error: {}", e),
+                    }
                 }
-                SegmentEvent::Segment(mut event) => {
-                    if let Some(ref client) = danmaku_client {
-                        let danmaku_file_path = event.prev_file_path.with_extension("xml");
-                        match client.rolling(&danmaku_file_path.display().to_string()) {
-                            Ok(true) => event.danmaku_file_path = Some(danmaku_file_path),
-                            Ok(false) => {}
-                            Err(e) => error!("Danmaku rolling error: {}", e),
-                        }
-                    }
-                    if let Err(e) = processor.process(event) {
-                        error!("Failed to process segment event: {}", e);
-                    }
+                if let Err(e) = processor.process(event) {
+                    error!("Failed to process segment event: {}", e);
                 }
             }
         };
@@ -298,13 +265,11 @@ impl DownloadTask {
             suffix = download_config.suffix,
             "开始下载，已解析流直链"
         );
-
         let result = self
             .downloader
             .download(Box::new(hook), download_config)
             .await
             .change_context(AppError::Custom("Failed to download segment".into()))?;
-
         info!(url=streamer.url,result=?result, "finished downloading");
         Ok(result)
     }
@@ -317,10 +282,6 @@ impl DownloadTask {
     }
 }
 
-/// 启动完整下载流程。
-///
-/// 只能由 `Monitor` 在取得下载池许可后调用；调用方必须把许可移动到同一个任务中，
-/// 并持有到本函数返回，保证 `pool1_size` 是下载并发的唯一限制。
 pub async fn start_download_workflow(
     downloader: Arc<dyn LivePlugin + Send + Sync>,
     ctx: Context,
@@ -328,11 +289,7 @@ pub async fn start_download_workflow(
     rooms_handle: Arc<Monitor>,
 ) {
     if let Err(error) = ctx.ensure_recording_space() {
-        error!(
-            error = ?error,
-            url = ctx.live_streamer().url,
-            "recording skipped by disk-space protection"
-        );
+        error!(error = ?error, url = ctx.live_streamer().url, "recording skipped by disk-space protection");
         rooms_handle.wake_waker(ctx.worker_id()).await;
         return;
     }
@@ -366,11 +323,8 @@ pub async fn start_download_workflow(
     });
 
     process(&[], &ctx.live_streamer().preprocessor).await;
-
     let _ = task.execute(&ctx, sender, downloader, rooms_handle).await;
-
     process(&[], &ctx.live_streamer().downloaded_processor).await;
-
     info!(
         "Download workflow completed {} => {:?}",
         ctx.live_streamer().url,

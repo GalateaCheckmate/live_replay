@@ -1,0 +1,74 @@
+name: Full
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-replay-full
+  cancel-in-progress: true
+
+jobs:
+  full-build:
+    name: Windows full build
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: live-replay-windows
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Check Rust formatting
+        run: cargo fmt --all --check
+
+      - name: Test Rust workspace
+        env:
+          SQLX_OFFLINE: "true"
+        run: cargo test --workspace --locked
+
+      - name: Build Windows release
+        env:
+          SQLX_OFFLINE: "true"
+        run: cargo build --release --locked --bin biliup
+
+      - name: Assemble portable package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/live-replay | Out-Null
+          Copy-Item target/release/biliup.exe dist/live-replay/live-replay.exe
+          Copy-Item LICENSE dist/live-replay/LICENSE
+          Copy-Item README.md dist/live-replay/README.md
+          Copy-Item public/config.toml dist/live-replay/config.example.toml
+          Compress-Archive -Path dist/live-replay/* -DestinationPath dist/live-replay-windows.zip -Force
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-replay-windows
+          path: dist/live-replay-windows.zip
+          if-no-files-found: error
+          retention-days: 14

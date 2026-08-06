@@ -89,7 +89,21 @@ impl SegmentEventProcessor {
                     Some(config) if !config.is_noop_uploader() => {
                         let ctx = self.ctx.clone();
                         tokio::spawn(async move {
-                            replay::process_session(rx, ctx, config).await;
+                            // process_session 在建立数据库场次或冻结 Cookie 失败时会返回。
+                            // 保留 Receiver 并重试，未消费的 SegmentInfo 会继续留在无界通道中，
+                            // 不会因为上传初始化的瞬时失败而丢掉完整录像分段。
+                            loop {
+                                replay::process_session(rx.clone(), ctx.clone(), config.clone())
+                                    .await;
+                                if rx.is_closed() && rx.is_empty() {
+                                    break;
+                                }
+                                warn!(
+                                    url = ctx.live_streamer().url,
+                                    "replay session stopped before draining segment queue; retrying initialization"
+                                );
+                                tokio::time::sleep(Duration::from_secs(30)).await;
+                            }
                         });
                     }
                     _ => {

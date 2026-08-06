@@ -6,7 +6,7 @@ use biliup::downloader::live::{DownloaderHint, LiveStream};
 use chrono::{DateTime, Utc};
 use error_stack::ResultExt;
 use sqlx::Row;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -20,6 +20,13 @@ struct PendingSession {
     live_title: String,
     started_at: String,
     ended_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionSnapshot {
+    id: i64,
+    ended_at: Option<String>,
+    status: String,
 }
 
 /// 服务启动时恢复未完成的上传队列。
@@ -118,16 +125,16 @@ pub async fn recover_pending_sessions(
             continue;
         }
 
-        // `ensure_session` 根据主播选择最近场次。逐个临时隔离待恢复场次，
-        // 让每个场次都能启动独立工作器；启动后工作器只持有 session_id，
-        // 因此恢复原始时间字段不会影响上传。
+        // 快照该主播的所有场次，包括已经完成但时间很近的场次。
+        // 恢复某个待续传场次时，临时把其余全部隔离，避免 ensure_session 误选到
+        // 一个更新、更近但已完成的 BV。
+        let snapshots = load_session_snapshots(&pool, streamer_id).await?;
+        let pending_ids: HashSet<i64> = sessions.iter().map(|session| session.id).collect();
+
         for session in &sessions {
             sqlx::query(
                 "UPDATE live_sessions SET ended_at = datetime('now', '-2 days') \
-                 WHERE live_streamer_id = ? AND id != ? \
-                   AND EXISTS (SELECT 1 FROM recording_segments r \
-                               WHERE r.session_id = live_sessions.id \
-                                 AND r.status NOT IN ('verified', 'deleted'))",
+                 WHERE live_streamer_id = ? AND id != ?",
             )
             .bind(streamer_id)
             .bind(session.id)
@@ -172,23 +179,38 @@ pub async fn recover_pending_sessions(
             recovered += 1;
         }
 
-        for session in &sessions {
-            if let Some(ended_at) = &session.ended_at {
-                sqlx::query(
-                    "UPDATE live_sessions SET ended_at = ?, status = 'recording_complete', \
-                     updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                )
-                .bind(ended_at)
-                .bind(session.id)
-                .execute(&pool)
-                .await
-                .change_context(AppError::Unknown)?;
+        // 非待恢复场次精确还原原状态；待恢复场次只恢复 ended_at，保留工作器刚写入的
+        // queued/retrying/complete 状态，避免把实时上传结果覆盖回旧状态。
+        for snapshot in snapshots {
+            if pending_ids.contains(&snapshot.id) {
+                if let Some(ended_at) = snapshot.ended_at {
+                    sqlx::query(
+                        "UPDATE live_sessions SET ended_at = ?, updated_at = CURRENT_TIMESTAMP \
+                         WHERE id = ? AND status != 'complete'",
+                    )
+                    .bind(ended_at)
+                    .bind(snapshot.id)
+                    .execute(&pool)
+                    .await
+                    .change_context(AppError::Unknown)?;
+                } else {
+                    sqlx::query(
+                        "UPDATE live_sessions SET ended_at = COALESCE(ended_at, CURRENT_TIMESTAMP), \
+                         updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status != 'complete'",
+                    )
+                    .bind(snapshot.id)
+                    .execute(&pool)
+                    .await
+                    .change_context(AppError::Unknown)?;
+                }
             } else {
                 sqlx::query(
-                    "UPDATE live_sessions SET ended_at = CURRENT_TIMESTAMP, \
-                     status = 'recording_complete', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    "UPDATE live_sessions SET ended_at = ?, status = ?, \
+                     updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 )
-                .bind(session.id)
+                .bind(snapshot.ended_at)
+                .bind(snapshot.status)
+                .bind(snapshot.id)
                 .execute(&pool)
                 .await
                 .change_context(AppError::Unknown)?;
@@ -200,4 +222,28 @@ pub async fn recover_pending_sessions(
         info!(recovered, "restored persistent Live Replay upload sessions");
     }
     Ok(recovered)
+}
+
+async fn load_session_snapshots(
+    pool: &ConnectionPool,
+    streamer_id: i64,
+) -> AppResult<Vec<SessionSnapshot>> {
+    let rows = sqlx::query(
+        "SELECT id, ended_at, status FROM live_sessions \
+         WHERE live_streamer_id = ? ORDER BY id",
+    )
+    .bind(streamer_id)
+    .fetch_all(pool)
+    .await
+    .change_context(AppError::Unknown)?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(SessionSnapshot {
+                id: row.try_get("id").change_context(AppError::Unknown)?,
+                ended_at: row.try_get("ended_at").change_context(AppError::Unknown)?,
+                status: row.try_get("status").change_context(AppError::Unknown)?,
+            })
+        })
+        .collect()
 }

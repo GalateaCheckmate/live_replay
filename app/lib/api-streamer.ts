@@ -41,22 +41,33 @@ export async function put<T>(url: string, { arg }: { arg: T }) {
 async function handleResponse(res: Response) {
 	// 如果未登录，统一跳转
 	if (res.status === 401) {
-		// 可选：清理本地状态/缓存
-		// localStorage.removeItem('token') 等
-
-		// 跳转登录（带回跳）
 		const returnTo = encodeURIComponent(window.location.pathname + window.location.search);
 		window.location.href = `/login?next=${returnTo}`;
-		// 抛错让 SWR 知道失败（别返回 json）
 		throw new Error('Unauthorized');
 	}
 
 	if (!res.ok) {
-		// 尽量返回服务端错误信息
 		const text = await res.text().catch(() => '');
 		throw new Error(text || `HTTP ${res.status}`);
 	}
 	return res;
+}
+
+export type ReplayUserState = 'waiting' | 'recording' | 'uploading' | 'error';
+
+/**
+ * Live Replay 自己的稳定主播状态。
+ * 新 UI 不再读取 Working / Pending / upload_status 等旧任务枚举。
+ */
+export interface ReplayStreamerState {
+	id: number;
+	name: string;
+	url: string;
+	enabled: boolean;
+	user_state: ReplayUserState;
+	pending_upload_parts: number;
+	active_session_id?: number;
+	active_session_started_at?: string;
 }
 
 type Credit = {
@@ -77,7 +88,6 @@ export interface StudioEntity {
 	dynamic: string;
 	tags: string[];
 	dtime: number;
-	// interactive: number;
 	mission_id?: number;
 	dolby: number;
 	hires: number;

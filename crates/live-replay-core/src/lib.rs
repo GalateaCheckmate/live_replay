@@ -1,3 +1,4 @@
+pub mod recording;
 pub mod youtube;
 
 use biliup::downloader::live::{
@@ -79,9 +80,6 @@ pub async fn probe_stream(
         .find(|plugin| plugin.matches(url))
         .ok_or_else(|| format!("暂不支持这个直播地址: {url}"))?;
 
-    // Probe requests must never be allowed to pin the Tauri invoke forever. Individual HTTP
-    // requests have a short timeout and the complete platform resolver also has a hard deadline.
-    // The recorder uses a separate client below and therefore is not affected by this timeout.
     let client = reqwest::Client::builder()
         .user_agent(
             "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/150 Mobile Safari/537.36",
@@ -95,8 +93,6 @@ pub async fn probe_stream(
     live_credentials.bilibili_cookie = credentials.bilibili_cookie;
     live_credentials.douyin_cookie = credentials.douyin_cookie;
 
-    // Keep the existing platform defaults. Android records the chosen source as one continuous
-    // file, then performs a single lossless container finalize to MP4 after the livestream ends.
     let request = LiveRequest {
         client,
         url: url.to_string(),
@@ -133,12 +129,8 @@ pub async fn probe_stream(
     }
 }
 
-/// Records one livestream into exactly one source-container file.
-///
-/// There is intentionally no segment timer, size limit, Part/分P concept or upload-time slicing.
-/// The `.part` file remains the sole active recording until EOF/user stop, then it is atomically
-/// renamed to a whole-session file. Android subsequently losslessly remuxes this file to the one
-/// required MP4.
+/// Legacy one-file recorder kept for the frozen YouTube path while Android migrates to the
+/// session/segment recorder in `recording`. Do not add new segmentation behavior here.
 pub async fn record_direct_stream(
     stream: ResolvedStream,
     output_dir: impl AsRef<Path>,

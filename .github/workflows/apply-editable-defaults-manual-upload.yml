@@ -1,0 +1,69 @@
+name: Apply editable defaults and manual upload fix
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/editable-defaults-trigger
+
+permissions:
+  contents: write
+
+concurrency:
+  group: live-replay-editable-defaults-fix
+  cancel-in-progress: true
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Apply fixes
+        run: python tools/apply_editable_defaults_manual_upload.py
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Format Rust
+        run: cargo fmt --all
+
+      - name: Compile workspace
+        env:
+          SQLX_OFFLINE: "true"
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Remove one-shot files
+        shell: bash
+        run: |
+          rm -f tools/apply_editable_defaults_manual_upload.py
+          rm -f .github/workflows/apply-editable-defaults-manual-upload.yml
+          rm -f .github/editable-defaults-trigger
+
+      - name: Commit fixes
+        shell: bash
+        run: |
+          git config user.name "GalateaCheckmate"
+          git config user.email "jasonli4165@gmail.com"
+          git add -A
+          git commit -m "fix: make streamer defaults editable and surface manual upload errors"
+          git push origin HEAD:main

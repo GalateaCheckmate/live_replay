@@ -20,6 +20,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+/// Live Replay 以文件大小作为统一的录制分段标准。
+/// 使用十进制 15 GB，给后续封装和平台侧限制留出余量。
+pub const LIVE_REPLAY_SEGMENT_BYTES: u64 = 15_000_000_000;
+const DOWNLOAD_FAILURE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// 下载器配置
 /// 包含下载过程中需要的各种参数和设置
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -51,6 +56,11 @@ impl DownloadConfig {
     /// 返回完整的输出文件路径
     fn generate_output_filename(&self, suffix: &str) -> PathBuf {
         self.output_dir.join(self.recorder.generate_path(suffix))
+    }
+
+    fn apply_live_replay_segment_policy(&mut self) {
+        self.segment_time = None;
+        self.file_size = Some(LIVE_REPLAY_SEGMENT_BYTES);
     }
 }
 
@@ -96,21 +106,40 @@ impl DownloaderRuntime {
                 DownloaderType::FfmpegExternal,
             )),
             _ => Self::StreamGears(StreamGears::new(None)),
-            // ...
         }
     }
 
     pub async fn download<'a>(
         &self,
         callback: Box<dyn FnMut(SegmentEvent) + Send + Sync + 'a>,
-        download_config: DownloadConfig,
+        mut download_config: DownloadConfig,
     ) -> AppResult<DownloadStatus> {
-        match self {
+        // 所有 Live Replay 录制引擎都从这里拿到同一套分段策略，避免某个引擎
+        // 继续沿用旧的按时长分段配置。
+        download_config.apply_live_replay_segment_policy();
+
+        let started = tokio::time::Instant::now();
+        let result = match self {
             Self::Ffmpeg(d) => d.download(callback, download_config).await,
             Self::StreamGears(d) => d.download(callback, download_config).await,
             DownloaderRuntime::StreamLink(d) => d.download(callback, download_config).await,
             Self::YtDlp(d) => d.download(callback, download_config).await,
+        };
+
+        // 正常的外部分段需要立刻开始下一段，不能人为等待。只有流结束或失败时
+        // 才设置最小冷却时间，避免源站异常时反复创建进程、占满 CPU 和日志。
+        let needs_cooldown = matches!(
+            &result,
+            Err(_) | Ok(DownloadStatus::StreamEnded) | Ok(DownloadStatus::Error(_))
+        );
+        if needs_cooldown {
+            let elapsed = started.elapsed();
+            if elapsed < DOWNLOAD_FAILURE_COOLDOWN {
+                tokio::time::sleep(DOWNLOAD_FAILURE_COOLDOWN - elapsed).await;
+            }
         }
+
+        result
     }
 
     pub async fn stop(&self) -> AppResult<()> {
@@ -131,10 +160,6 @@ pub struct SegmentInfo {
     pub next_file_path: Option<PathBuf>,
     /// 分段序号
     pub segment_index: usize,
-    // /// 分段开始时间戳
-    // start_time: std::time::SystemTime,
-    // /// 分段结束时间戳
-    // end_time: std::time::SystemTime,
 }
 
 impl SegmentInfo {
@@ -179,17 +204,12 @@ pub enum DownloadStatus {
 }
 
 #[async_trait]
-// 弹幕客户端 (需要根据实际情况实现)
 pub trait DanmakuClient {
     /// Starts danmaku recording and manages lifecycle
     async fn download(&self) -> AppResult<()>;
 
     async fn stop(&self) -> AppResult<()>;
-    /// 滚动保存（用于弹幕等）
-    ///
-    /// # 参数
-    /// * `file_name` - 文件名
-    ///
+
     /// 返回 true 表示本次滚动保存产生了可交给后处理的弹幕文件。
     fn rolling(&self, _file_name: &str) -> Result<bool, Box<dyn std::error::Error>> {
         Ok(false)
@@ -253,12 +273,6 @@ impl DanmakuClient for RustDanmakuClient {
 }
 
 /// 解析时长字符串 "HH:MM:SS" 为秒数
-///
-/// # 参数
-/// * `duration` - 时长字符串，格式为"HH:MM:SS"
-///
-/// # 返回
-/// 返回总秒数
 fn parse_duration(duration: &str) -> u64 {
     let parts: Vec<&str> = duration.split(':').collect();
     if parts.len() == 3 {
@@ -271,38 +285,19 @@ fn parse_duration(duration: &str) -> u64 {
     }
 }
 
-// 使用示例
-// #[tokio::main]
-// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//     let config = DownloadConfig {
-//         format: "mp4".to_string(),
-//         segment_time: Some("01:00:00".to_string()),
-//         file_size: Some(2 * 1024 * 1024 * 1024), // 2GB
-//         headers: HashMap::from([("User-Agent".to_string(), "Mozilla/5.0".to_string())]),
-//         extra_args: vec![],
-//         downloader_type: DownloaderType::FfmpegInternal,
-//         filename_prefix: "stream".to_string(),
-//     };
-//
-//     // 分段回调
-//     let segment_callback = Arc::new(|event: SegmentEvent| {
-//         println!("New segment: {:?}", event.file_path);
-//         // 这里可以触发上传等后续处理
-//     });
-//
-//     let downloader = FfmpegDownloader::new(
-//         "http://example.com/stream.m3u8".to_string(),
-//         config,
-//         PathBuf::from("./downloads"),
-//         Some(segment_callback),
-//     );
-//
-//     // 检查流
-//     // if downloader.check_stream().await? {
-//     //     // 开始下载
-//     //     let status = downloader.download().await?;
-//     //     println!("Download completed with status: {:?}", status);
-//     // }
-//
-//     Ok(())
-// }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_replay_uses_15gb_size_segments() {
+        let mut config = DownloadConfig::default();
+        config.segment_time = Some("01:00:00".to_string());
+        config.file_size = Some(1024);
+
+        config.apply_live_replay_segment_policy();
+
+        assert_eq!(config.segment_time, None);
+        assert_eq!(config.file_size, Some(15_000_000_000));
+    }
+}

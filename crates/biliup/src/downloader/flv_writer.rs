@@ -9,16 +9,11 @@ use serde::Serialize;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
-use tracing::info;
+use tracing::{info, warn};
 
 const FLV_HEADER: [u8; 9] = [
-    0x46, // 'F'
-    0x4c, //'L'
-    0x56, //'V'
-    0x01, //version
-    0x05, //00000101  audio tag  and video tag
-    0x00, 0x00, 0x00, 0x09, //flv header size
-]; // 9
+    0x46, 0x4c, 0x56, 0x01, 0x05, 0x00, 0x00, 0x00, 0x09,
+];
 
 pub struct FlvFile<'a> {
     pub buf_writer: BufWriter<File>,
@@ -27,7 +22,6 @@ pub struct FlvFile<'a> {
 
 impl<'a> FlvFile<'a> {
     pub fn new(mut file: LifecycleFile<'a>) -> std::io::Result<Self> {
-        // let file_name = util::format_filename(file_name);
         let path = file.create()?;
         Ok(Self {
             buf_writer: Self::create(path)?,
@@ -35,11 +29,19 @@ impl<'a> FlvFile<'a> {
         })
     }
 
+    /// Finalize the current FLV before exposing it to LifecycleFile's completion hook.
+    /// This makes a rotation event a durable-file boundary rather than merely a pathname change.
     pub fn create_new(&mut self) -> std::io::Result<()> {
+        self.sync_current()?;
         self.file.rename();
         let path = self.file.create()?;
         self.buf_writer = Self::create(path)?;
         Ok(())
+    }
+
+    fn sync_current(&mut self) -> std::io::Result<()> {
+        self.buf_writer.flush()?;
+        self.buf_writer.get_ref().sync_all()
     }
 
     fn create<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<BufWriter<File>> {
@@ -73,8 +75,7 @@ impl<'a> FlvFile<'a> {
 
     pub fn write_tag_header(&mut self, tag_header: &TagHeader) -> std::io::Result<()> {
         self.buf_writer.write_u8(tag_header.tag_type as u8)?;
-        self.buf_writer
-            .write_u24::<BigEndian>(tag_header.data_size)?;
+        self.buf_writer.write_u24::<BigEndian>(tag_header.data_size)?;
         self.buf_writer
             .write_u24::<BigEndian>(tag_header.timestamp & 0xffffff)?;
         let timestamp_ext = ((tag_header.timestamp >> 24) & 0xff) as u8;
@@ -92,6 +93,10 @@ impl<'a> FlvFile<'a> {
 
 impl Drop for FlvFile<'_> {
     fn drop(&mut self) {
+        if let Err(error) = self.sync_current() {
+            warn!("failed to sync FLV before final rename: {error}");
+            return;
+        }
         self.file.rename()
     }
 }
@@ -102,10 +107,7 @@ pub struct FlvTag<'a> {
     pub data: TagDataHeader<'a>,
 }
 
-pub fn to_json<T: ?Sized + Serialize>(mut writer: impl Write, t: &T) -> std::io::Result<usize> {
-    serde_json::to_writer(&mut writer, t)?;
-    writer.write("\n".as_ref())
-}
+impl FlvTag<'_> {}
 
 #[derive(Debug, PartialEq, Serialize)]
 pub enum TagDataHeader<'a> {
@@ -123,4 +125,9 @@ pub enum TagDataHeader<'a> {
         composition_time: Option<i32>,
     },
     Script(ScriptData<'a>),
+}
+
+pub fn to_json<T: ?Sized + Serialize>(mut writer: impl Write, t: &T) -> std::io::Result<usize> {
+    serde_json::to_writer(&mut writer, t)?;
+    writer.write("\n".as_ref())
 }

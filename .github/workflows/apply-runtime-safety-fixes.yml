@@ -1,0 +1,55 @@
+name: Apply runtime safety fixes
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/runtime-safety-trigger
+
+permissions:
+  contents: write
+
+concurrency:
+  group: live-replay-runtime-safety-fix
+  cancel-in-progress: true
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Apply fixes
+        run: python tools/apply_runtime_safety_fixes.py
+
+      - name: Format Rust
+        run: cargo fmt --all
+
+      - name: Compile workspace
+        run: cargo check --workspace --all-targets
+
+      - name: Remove one-shot files
+        shell: bash
+        run: |
+          rm -f tools/apply_runtime_safety_fixes.py
+          rm -f .github/workflows/apply-runtime-safety-fixes.yml
+          rm -f .github/runtime-safety-trigger
+
+      - name: Commit fixes
+        shell: bash
+        run: |
+          git config user.name "GalateaCheckmate"
+          git config user.email "jasonli4165@gmail.com"
+          git add -A
+          git commit -m "fix: complete Live Replay runtime safety flow"
+          git push origin HEAD:main

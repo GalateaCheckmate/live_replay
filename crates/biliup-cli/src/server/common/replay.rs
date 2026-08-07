@@ -414,8 +414,29 @@ fn parse_positive_duration(value: &str) -> Option<f64> {
     (duration.is_finite() && duration > 0.0).then_some(duration)
 }
 
+fn ffprobe_program() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(directory) = exe.parent()
+    {
+        let bundled = directory.join(if cfg!(windows) {
+            "ffprobe.exe"
+        } else {
+            "ffprobe"
+        });
+        if bundled.exists() {
+            return bundled;
+        }
+    }
+    PathBuf::from(if cfg!(windows) {
+        "ffprobe.exe"
+    } else {
+        "ffprobe"
+    })
+}
+
 async fn validate_media_file(path: &Path) -> AppResult<()> {
-    let output = Command::new("ffprobe")
+    let probe = ffprobe_program();
+    let output = Command::new(&probe)
         .args([
             "-v",
             "error",
@@ -428,9 +449,10 @@ async fn validate_media_file(path: &Path) -> AppResult<()> {
         .kill_on_drop(true)
         .output()
         .await
-        .change_context(AppError::Custom(
-            "无法启动 ffprobe；录像已保留并等待重试".to_string(),
-        ))?;
+        .change_context(AppError::Custom(format!(
+            "无法启动 ffprobe（{}）；录像已保留并等待重试",
+            probe.display()
+        )))?;
     if !output.status.success() {
         return Err(
             AppError::Custom(format!("录像文件无法正常解析，已保留：{}", path.display())).into(),

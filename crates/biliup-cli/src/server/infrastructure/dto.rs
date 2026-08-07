@@ -13,4 +13,8 @@ pub struct LiveStreamerResponse {
     pub status: String,
     /// 上传状态
     pub upload_status: String,
+    /// 当前连续录制时长（秒），只有正在录制时存在
+    pub recording_elapsed_seconds: Option<u64>,
+    /// 当前这场录制仍占用的本地空间（含当前文件与安全队列）
+    pub recording_bytes: Option<u64>,
 }

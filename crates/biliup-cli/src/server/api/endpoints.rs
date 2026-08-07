@@ -65,12 +65,26 @@ pub async fn get_streamers_endpoint(
             }
         };
 
+        let is_recording = status == "Working";
+        let recording_elapsed_seconds = option
+            .as_ref()
+            .filter(|_| is_recording)
+            .and_then(|worker| worker.recording_elapsed_seconds());
+        let recording_bytes = option
+            .as_ref()
+            .filter(|_| is_recording)
+            .and_then(|worker| worker.recording_local_bytes());
+        let upload_status = option
+            .as_ref()
+            .map(|worker| format!("{:?}", *worker.uploader_status.read().unwrap()))
+            .unwrap_or_default();
+
         results.push(LiveStreamerResponse {
             status,
             inner: x,
-            upload_status: option
-                .map(|t| format!("{:?}", *t.uploader_status.read().unwrap()))
-                .unwrap_or_default(),
+            upload_status,
+            recording_elapsed_seconds,
+            recording_bytes,
         });
     }
     Ok(Json(results))
@@ -396,6 +410,38 @@ pub async fn pause_streamers_endpoint(
     }
 
     Ok(Json(()))
+}
+
+pub async fn upload_now_streamer_endpoint(
+    State(managers): State<Arc<DownloadManager>>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, Response> {
+    let worker = managers
+        .get_room_by_id(id)
+        .await
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "主播不存在").into_response())?;
+    let is_working = {
+        let status = worker.downloader_status.read().unwrap();
+        matches!(&*status, WorkerStatus::Working(_))
+    };
+    if !is_working {
+        return Err((StatusCode::CONFLICT, "当前主播没有正在录制的分段").into_response());
+    }
+
+    info!(
+        id,
+        "manual test upload requested; finalizing current segment"
+    );
+    // 从 Working 切到 Idle 会调用 DownloadTask::stop() 并等待当前文件安全封段。
+    // 下载流程结束时会自动把完整分段交给 Live Replay 安全上传队列并重新放回监控队列。
+    worker
+        .change_status(Stage::Download, WorkerStatus::Idle)
+        .await;
+    managers.wake_waker(id).await;
+
+    Ok(Json(json!({
+        "message": "当前录像已安全封段并进入自动上传队列；主播仍保持开启，会继续录制"
+    })))
 }
 
 pub async fn get_configuration(

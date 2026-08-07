@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, RwLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use struct_patch::Patch;
 use tracing::{error, info, warn};
 
@@ -324,6 +324,45 @@ fn ensure_directory(path: PathBuf) -> PathBuf {
     }
 }
 
+fn sum_current_recording_bytes(root: &Path, prefix: &str, started: SystemTime) -> u64 {
+    let cutoff = started
+        .checked_sub(Duration::from_secs(5))
+        .unwrap_or(started);
+    let mut total = 0u64;
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+
+    while let Some((directory, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.is_dir() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if (depth == 0 && name == ".live-replay-queue") || (depth > 0 && depth < 4) {
+                    stack.push((path, depth + 1));
+                }
+                continue;
+            }
+
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.contains(prefix) {
+                continue;
+            }
+            if metadata.modified().is_ok_and(|modified| modified < cutoff) {
+                continue;
+            }
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    total
+}
+
 #[derive(Debug)]
 pub struct Worker {
     pub downloader_status: RwLock<WorkerStatus>,
@@ -332,6 +371,8 @@ pub struct Worker {
     pub upload_streamer: Option<UploadStreamer>,
     config: Arc<RwLock<Config>>,
     pub client: StatelessClient,
+    recording_started_at: RwLock<Option<SystemTime>>,
+    recording_filename_prefix: RwLock<Option<String>>,
 }
 
 impl Worker {
@@ -348,6 +389,8 @@ impl Worker {
             upload_streamer,
             config,
             client,
+            recording_started_at: RwLock::new(None),
+            recording_filename_prefix: RwLock::new(None),
         }
     }
 
@@ -357,6 +400,42 @@ impl Worker {
 
     pub fn get_streamer(&self) -> &LiveStreamer {
         &self.live_streamer
+    }
+
+    pub fn mark_recording_started(&self, filename_template: String) {
+        let prefix = filename_template
+            .split('%')
+            .next()
+            .unwrap_or(&filename_template)
+            .to_string();
+        *self.recording_started_at.write().unwrap() = Some(SystemTime::now());
+        *self.recording_filename_prefix.write().unwrap() = Some(prefix);
+    }
+
+    pub fn mark_recording_finished(&self) {
+        *self.recording_started_at.write().unwrap() = None;
+        *self.recording_filename_prefix.write().unwrap() = None;
+    }
+
+    pub fn recording_elapsed_seconds(&self) -> Option<u64> {
+        let started = *self.recording_started_at.read().unwrap();
+        started.and_then(|value| value.elapsed().ok().map(|elapsed| elapsed.as_secs()))
+    }
+
+    pub fn recording_local_bytes(&self) -> Option<u64> {
+        let started = *self.recording_started_at.read().unwrap();
+        let prefix = self.recording_filename_prefix.read().unwrap().clone();
+        let (Some(started), Some(prefix)) = (started, prefix) else {
+            return None;
+        };
+        if prefix.is_empty() {
+            return Some(0);
+        }
+        Some(sum_current_recording_bytes(
+            &default_recording_output_dir(),
+            &prefix,
+            started,
+        ))
     }
 
     pub fn get_upload_config(&self) -> &Option<UploadStreamer> {

@@ -19,23 +19,71 @@ import {
 } from '@douyinfe/semi-icons'
 import { List, ButtonGroup } from '@douyinfe/semi-ui'
 import React, { useState } from 'react'
+import { useSWRConfig } from 'swr'
 import useStreamers from '../../lib/use-streamers'
 import TemplateModal from '../../ui/TemplateModal'
 import OverrideModal from '../../ui/OverrideModal'
-import { LiveStreamerEntity, put, requestDelete, sendRequest } from '../../lib/api-streamer'
+import { API_BASE, LiveStreamerEntity, put, requestDelete, sendRequest } from '../../lib/api-streamer'
 import useSWRMutation from 'swr/mutation'
 import {PauseButton} from "@/app/ui/StreamerActions/PauseButton";
+
+const formatDuration = (seconds?: number) => {
+  const value = Math.max(0, Math.floor(seconds ?? 0))
+  const h = Math.floor(value / 3600)
+  const m = Math.floor((value % 3600) / 60)
+  const s = value % 60
+  return [h, m, s].map(item => String(item).padStart(2, '0')).join(':')
+}
+
+const formatBytes = (bytes?: number) => {
+  const value = Math.max(0, bytes ?? 0)
+  if (value < 1024) return `${value} B`
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let current = value / 1024
+  let index = 0
+  while (current >= 1024 && index < units.length - 1) {
+    current /= 1024
+    index += 1
+  }
+  return `${current.toFixed(index >= 2 ? 2 : 1)} ${units[index]}`
+}
 
 export default function Home() {
   const { Header, Content } = Layout
   const { Text } = Typography
   const { streamers, isLoading } = useStreamers()
+  const { mutate } = useSWRConfig()
+  const [forcingUpload, setForcingUpload] = useState<Set<number>>(new Set())
   const { trigger: deleteStreamers } = useSWRMutation('/v1/streamers', requestDelete)
   const { trigger: updateStreamers } = useSWRMutation('/v1/streamers', put)
   const { trigger } = useSWRMutation('/v1/streamers', sendRequest)
 
   const onConfirm = async (id: number) => {
     await deleteStreamers(id)
+  }
+
+  const uploadNow = async (id: number) => {
+    setForcingUpload(previous => new Set(previous).add(id))
+    try {
+      const response = await fetch(`${API_BASE}/v1/streamers/${id}/upload-now`, { method: 'POST' })
+      const payload = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(payload?.message ?? payload?.error ?? '立即上传失败')
+      Notification.success({
+        title: '已开始立即上传',
+        content: payload?.message ?? '当前分段已封存并进入自动上传队列。',
+      })
+      await mutate('/v1/streamers')
+      await mutate('/v1/replay/sessions')
+      await mutate('/v1/replay/jobs')
+    } catch (error: any) {
+      Notification.error({ title: '立即上传失败', content: error?.message ?? String(error), duration: 0 })
+    } finally {
+      setForcingUpload(previous => {
+        const next = new Set(previous)
+        next.delete(id)
+        return next
+      })
+    }
   }
   const handleEntityPostprocessor = (values: any) => {
     if (values?.postprocessor) {
@@ -99,6 +147,8 @@ export default function Home() {
     delete values.status
     delete values.statusTag
     delete values.upload_status
+    delete values.recording_elapsed_seconds
+    delete values.recording_bytes
     if (values?.postprocessor) {
       values.postprocessor = values.postprocessor.map(
         ({ cmd, value }: { cmd: string; value: string }) => (cmd === 'rm' ? 'rm' : { [cmd]: value })
@@ -241,6 +291,22 @@ export default function Home() {
                   <Text style={{ width: '101%' }} ellipsis={{ showTooltip: true }} type="tertiary">
                     {item.url}
                   </Text>
+
+                  {item.status === 'Working' && (
+                    <div style={{ marginTop: 14, display: 'flex', gap: 16, alignItems: 'center', flexWrap: 'wrap' }}>
+                      <Text strong>已录制 {formatDuration(item.recording_elapsed_seconds)}</Text>
+                      <Text>本地占用 {formatBytes(item.recording_bytes)}</Text>
+                      <Button
+                        size="small"
+                        theme="solid"
+                        icon={<IconUpload />}
+                        loading={forcingUpload.has(item.id)}
+                        onClick={() => uploadNow(item.id)}
+                      >
+                        立即上传（测试）
+                      </Button>
+                    </div>
+                  )}
 
                   <div
                     style={{

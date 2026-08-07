@@ -335,6 +335,10 @@ pub async fn start_download_workflow(
         ctx.config().downloader,
         ctx.live_stream(),
     )));
+    let recording_template = ctx
+        .recorder(ctx.streamer_info().clone())
+        .filename_template();
+    ctx.worker().mark_recording_started(recording_template);
     ctx.change_status(Stage::Download, WorkerStatus::Working(task.clone()))
         .await;
 
@@ -361,6 +365,7 @@ pub async fn start_download_workflow(
 
     process(&[], &ctx.live_streamer().preprocessor).await;
     let _ = task.execute(&ctx, sender, downloader, rooms_handle).await;
+    ctx.worker().mark_recording_finished();
     process(&[], &ctx.live_streamer().downloaded_processor).await;
     info!(
         "Download workflow completed {} => {:?}",

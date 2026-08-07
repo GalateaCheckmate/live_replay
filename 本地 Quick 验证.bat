@@ -3,25 +3,24 @@ setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul
 cd /d "%~dp0"
 
-title Live Replay - 本地 Quick 验证
+title Live Replay - Local Quick
 
 echo ============================================================
-echo [Live Replay] 本地 Quick 验证
-echo [Live Replay] 增量依赖 + 前端构建 + Rust Workspace 编译检查
+echo [Live Replay] Local Quick Validation
+echo [Mode] Incremental frontend + Rust workspace check
 echo ============================================================
 echo.
 
-rem 自动加载 Visual Studio C++ 编译环境（如果已安装）
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 set "VSROOT="
 if exist "%VSWHERE%" (
     for /f "usebackq tokens=*" %%I in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSROOT=%%I"
 )
 if defined VSROOT if exist "%VSROOT%\Common7\Tools\VsDevCmd.bat" (
-    echo [环境] Visual Studio C++: %VSROOT%
+    echo [ENV] Visual Studio C++: %VSROOT%
     call "%VSROOT%\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64 >nul
 ) else (
-    echo [提醒] 未自动加载 Visual Studio C++ 环境；如果 Cargo 报 linker/cl 错误，请检查 VS C++ 工作负载。
+    echo [WARN] Visual Studio C++ environment was not loaded automatically.
 )
 
 where node >nul 2>nul || goto :node_missing
@@ -31,42 +30,42 @@ where cargo >nul 2>nul || goto :cargo_missing
 where powershell >nul 2>nul || goto :powershell_missing
 
 echo.
-echo [环境] Node:
+echo [ENV] Node:
 node --version
-echo [环境] npm:
+echo [ENV] npm:
 call npm.cmd --version
-echo [环境] Rust:
+echo [ENV] Rust:
 rustc --version
-echo [环境] Cargo:
+echo [ENV] Cargo:
 cargo --version
 echo.
 
 for /f %%N in ('node -p "process.versions.node.split('.')[0]"') do set "NODE_MAJOR=%%N"
 if "%NODE_MAJOR%"=="20" goto :node_version_ok
-echo [提醒] GitHub Quick 当前使用 Node.js 20；本机是 Node.js %NODE_MAJOR%。
-echo [提醒] 当前先继续验证；只有遇到前端兼容问题时才需要切换 Node.js 20。
+echo [WARN] GitHub Quick uses Node.js 20. Local Node.js major is %NODE_MAJOR%.
+echo [WARN] Validation will continue. Switch to Node.js 20 only if compatibility issues remain.
 echo.
 :node_version_ok
 
-echo [1/3] 检查前端依赖缓存...
+echo [1/3] Checking frontend dependency cache...
 call :ensure_frontend_dependencies
 if errorlevel 1 goto :failed
 
 echo.
-echo [2/3] 编译 Next.js 前端...
+echo [2/3] Building Next.js frontend...
 call npm.cmd run build
 if errorlevel 1 goto :failed
 
 echo.
-echo [3/3] 增量检查 Rust Workspace...
+echo [3/3] Incremental Rust workspace check...
 set "SQLX_OFFLINE=true"
 cargo check --workspace --all-targets --locked
 if errorlevel 1 goto :failed
 
 echo.
 echo ============================================================
-echo [成功] Live Replay 本地 Quick 验证全部通过。
-echo [缓存] node_modules 和 Cargo target 都会保留供下次增量验证。
+echo [PASS] Live Replay Local Quick passed.
+echo [CACHE] node_modules and Cargo target are kept for next run.
 echo ============================================================
 echo.
 pause
@@ -74,14 +73,14 @@ exit /b 0
 
 :ensure_frontend_dependencies
 if not exist "package-lock.json" (
-    echo [失败] 没有找到 package-lock.json。
+    echo [FAIL] package-lock.json was not found.
     exit /b 1
 )
 
 set "LOCK_HASH="
 for /f %%H in ('powershell -NoProfile -NonInteractive -Command "(Get-FileHash -Algorithm SHA256 'package-lock.json').Hash"') do set "LOCK_HASH=%%H"
 if not defined LOCK_HASH (
-    echo [失败] 无法计算 package-lock.json 哈希。
+    echo [FAIL] Could not calculate package-lock.json hash.
     exit /b 1
 )
 
@@ -90,62 +89,79 @@ set "LOCK_CACHE=node_modules\.live-replay-package-lock.sha256"
 if not exist "node_modules\" goto :deps_clean_install
 
 if not exist "!LOCK_CACHE!" (
-    echo [依赖] 已有 node_modules，首次建立本地依赖缓存标记...
+    echo [DEPS] Existing node_modules found. Creating cache marker...
     call npm.cmd ls --depth=0 --silent >nul 2>nul
     if errorlevel 1 goto :deps_sync
     >"!LOCK_CACHE!" echo !LOCK_HASH!
-    echo [依赖] 当前依赖可用，本次不重新下载。
-    exit /b 0
+    echo [DEPS] Existing dependency tree accepted.
+    goto :deps_peer_check
 )
 
 set "CACHED_HASH="
 set /p "CACHED_HASH="<"!LOCK_CACHE!"
 if /I "!CACHED_HASH!"=="!LOCK_HASH!" (
-    echo [依赖] package-lock.json 未变化，跳过 npm 安装。
-    exit /b 0
+    echo [DEPS] package-lock.json unchanged. Skipping npm install.
+    goto :deps_peer_check
 )
 
-echo [依赖] package-lock.json 已变化，只同步新增/变化的依赖。
+echo [DEPS] package-lock.json changed. Syncing dependencies using local cache first...
 goto :deps_sync
 
 :deps_clean_install
-echo [依赖] 首次运行，执行 npm ci...
+echo [DEPS] First run. Running npm ci...
 call npm.cmd ci
 if errorlevel 1 exit /b 1
 >"!LOCK_CACHE!" echo !LOCK_HASH!
-exit /b 0
+goto :deps_peer_check
 
 :deps_sync
 call npm.cmd install --prefer-offline --no-audit --no-fund
 if errorlevel 1 exit /b 1
 for /f %%H in ('powershell -NoProfile -NonInteractive -Command "(Get-FileHash -Algorithm SHA256 'package-lock.json').Hash"') do set "LOCK_HASH=%%H"
 >"!LOCK_CACHE!" echo !LOCK_HASH!
+goto :deps_peer_check
+
+:deps_peer_check
+if exist "node_modules\react-draggable\package.json" (
+    echo [DEPS] react-draggable peer dependency is present.
+    exit /b 0
+)
+
+echo [DEPS] npm did not install react-draggable peer dependency. Repairing once...
+call npm.cmd install --no-save --package-lock=false --prefer-offline --no-audit --no-fund react-draggable@4.7.0
+if errorlevel 1 exit /b 1
+if not exist "node_modules\react-draggable\package.json" (
+    echo [FAIL] react-draggable is still missing after repair.
+    exit /b 1
+)
+echo [DEPS] react-draggable repaired successfully.
 exit /b 0
 
 :node_missing
-echo [失败] 未找到 Node.js。请先安装 Node.js。
+echo [FAIL] Node.js was not found.
 goto :failed
 
 :npm_missing
-echo [失败] 未找到 npm.cmd。请检查 Node.js 安装。
+echo [FAIL] npm.cmd was not found.
 goto :failed
 
 :rust_missing
-echo [失败] 未找到 rustc。请先安装 Rust stable。
+echo [FAIL] rustc was not found.
 goto :failed
 
 :cargo_missing
-echo [失败] 未找到 cargo。请先安装 Rust stable。
+echo [FAIL] cargo was not found.
 goto :failed
 
 :powershell_missing
-echo [失败] 未找到 PowerShell，无法检查依赖缓存。
+echo [FAIL] PowerShell was not found.
 goto :failed
 
 :failed
 echo.
 echo ============================================================
-echo [失败] Quick 验证未通过。请把上方第一个报错位置截图或复制给我。
+echo [FAIL] Local Quick validation failed.
+echo Please send the first error shown above.
 echo ============================================================
 echo.
 pause

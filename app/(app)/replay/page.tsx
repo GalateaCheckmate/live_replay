@@ -82,7 +82,7 @@ export default function ReplayPage() {
       Toast.error(await response.text())
       return
     }
-    Toast.success('已重新加入上传队列')
+    Toast.success('已安排重新处理')
     await refresh()
   }
 
@@ -104,13 +104,13 @@ export default function ReplayPage() {
       Toast.error(await response.text())
       return
     }
-    Toast.success('已绑定稿件，后续分P会继续按顺序处理')
+    Toast.success('稿件已绑定，后续分P将继续处理')
     await refresh()
   }
 
   const resetSubmission = async (session: ReplaySessionSummary) => {
     const confirmed = window.confirm(
-      '只有确认B站创作中心完全没有生成这场直播的稿件时才能继续。\n\n确认远端没有稿件并重新创建吗？'
+      '只有确认 B 站创作中心没有生成这场直播的稿件时，才能重新创建投稿。\n\n确认远端没有稿件并继续吗？'
     )
     if (!confirmed) return
     const response = await fetch(`${API_BASE}/v1/replay/sessions/${session.id}/reset-submission`, {
@@ -154,7 +154,7 @@ export default function ReplayPage() {
       width: 180,
       render: (_: unknown, record: ReplaySessionSummary) => record.bvid
         ? <a href={`https://www.bilibili.com/video/${record.bvid}`} target="_blank" rel="noreferrer">{record.bvid}</a>
-        : <Text type="tertiary">等待首个分P</Text>,
+        : <Text type="tertiary">尚未创建</Text>,
     },
     {
       title: '说明',
@@ -162,9 +162,9 @@ export default function ReplayPage() {
         if (record.user_state === 'error') {
           return <Text type="danger" ellipsis={{ showTooltip: true }}>{record.last_error || '投稿结果需要人工确认'}</Text>
         }
-        if (record.completed) return <Text type="tertiary">本场直播已经处理完成。</Text>
-        if (record.user_state === 'recording') return <Text>直播仍在进行；已封段的视频会在后台排队上传。</Text>
-        return <Text>还有 {record.pending_parts} 个分段待上传、远端确认或本地清理。</Text>
+        if (record.completed) return <Text type="tertiary">本场直播处理完成。</Text>
+        if (record.user_state === 'recording') return <Text>直播仍在进行，已完成的录像分段会自动投稿。</Text>
+        return <Text>还有 {record.pending_parts} 个录像分段正在处理。</Text>
       },
     },
     {
@@ -190,7 +190,7 @@ export default function ReplayPage() {
       ),
     },
     { title: '文件大小', dataIndex: 'file_size', width: 110, render: formatBytes },
-    { title: '尝试次数', dataIndex: 'attempts', width: 90 },
+    { title: '处理次数', dataIndex: 'attempts', width: 90 },
     {
       title: '下次处理',
       dataIndex: 'next_attempt_at',
@@ -201,7 +201,7 @@ export default function ReplayPage() {
       title: '说明',
       render: (_: unknown, record: ReplaySegmentSummary) => record.last_error
         ? <Text type={record.user_state === 'error' ? 'danger' : 'tertiary'} ellipsis={{ showTooltip: true }}>{record.last_error}</Text>
-        : <Text type="tertiary">后台自动处理</Text>,
+        : <Text type="tertiary">自动处理</Text>,
     },
     {
       title: '操作',
@@ -233,7 +233,7 @@ export default function ReplayPage() {
         <Row gutter={[12, 12]} style={{ marginBottom: 16 }}>
           <Col span={8}><Card><Title heading={4}>{activeSessions.length}</Title><Text>正在处理的直播场次</Text></Card></Col>
           <Col span={8}><Card><Title heading={4}>{errorSessions}</Title><Text>需要人工处理</Text></Card></Col>
-          <Col span={8}><Card><Title heading={4}>{formatBytes(pendingBytes)}</Title><Text>尚未处理完成的本地录像</Text></Card></Col>
+          <Col span={8}><Card><Title heading={4}>{formatBytes(pendingBytes)}</Title><Text>待处理本地录像</Text></Card></Col>
         </Row>
 
         <Title heading={5} style={{ marginBottom: 10 }}>直播场次</Title>
@@ -246,8 +246,8 @@ export default function ReplayPage() {
           style={{ marginBottom: 24 }}
         />
 
-        <Title heading={5} style={{ marginBottom: 4 }}>当前分段</Title>
-        <Text type="tertiary">只显示尚未完成的分段；上传、B站可播放确认和本地清理都由后台队列负责。</Text>
+        <Title heading={5} style={{ marginBottom: 4 }}>待处理分段</Title>
+        <Text type="tertiary">显示尚未完成的录像分段，完成后会自动从这里移除。</Text>
         <Table<ReplaySegmentSummary>
           size="small"
           rowKey="job_id"

@@ -48,13 +48,9 @@ const ReplaySettings: React.FC = () => {
 
   const save = async (values: any) => {
     try {
-      const payload = {
-        ...entity,
-        ...values,
-        // Live Replay 使用固定的安全分段策略。保留字段仅用于兼容旧配置格式。
-        file_size: 15_000_000_000,
-        segment_time: null,
-      }
+      const payload = { ...entity, ...values }
+      if (payload.file_size === '') payload.file_size = null
+      if (payload.segment_time === '') payload.segment_time = null
       await trigger(payload)
       Toast.success('设置已保存')
       await Promise.all([refreshConfig(), refreshDisk()])
@@ -158,9 +154,6 @@ const ReplaySettings: React.FC = () => {
 
           <Form initValues={entity} getFormApi={api => (formRef.current = api)} onSubmit={save}>
             <Card title="录制" style={{ marginBottom: 16 }}>
-              <Typography.Paragraph type="tertiary" style={{ marginBottom: 16 }}>
-                录像文件达到约 15 GB 时会自动分段。每场直播仍作为一个完整场次处理。
-              </Typography.Paragraph>
               <Form.Select
                 field="downloader"
                 label="录制引擎"
@@ -170,6 +163,16 @@ const ReplaySettings: React.FC = () => {
                 ]}
                 placeholder="Stream Gears（推荐）"
                 style={{ width: '100%' }}
+              />
+              <Form.Input
+                field="segment_time"
+                label="默认分段时长"
+                placeholder="01:00:00"
+                extraText="格式：时:分:秒。主播单独设置的分段时长会覆盖这里。"
+                rules={[
+                  { pattern: /^[^：]*$/, message: '请使用英文冒号' },
+                  { pattern: /^$|^[0-9]{2,4}:[0-5][0-9]:[0-5][0-9]$/, message: '格式应为 01:00:00' },
+                ]}
               />
               <Form.Input
                 field="filename_prefix"

@@ -325,6 +325,59 @@ pub async fn start_download_workflow(
     sender: Sender<UploaderMessage>,
     rooms_handle: Arc<Monitor>,
 ) {
+    // `check_stream` 是异步网络请求。请求发出后用户可能已经关闭主播，或保存设置
+    // 让 Monitor 用新的 Worker 替换旧 Worker。真正启动录制前必须重新核对一次，
+    // 否则旧请求晚到时会用旧配置“偷跑”出第二条录制任务。
+    let Some(current_worker) = rooms_handle.get_worker(ctx.worker_id()).await else {
+        info!(
+            url = ctx.live_streamer().url,
+            "discarding stale live result because worker was removed"
+        );
+        return;
+    };
+    if !Arc::ptr_eq(&current_worker, ctx.worker()) {
+        info!(
+            url = ctx.live_streamer().url,
+            "discarding stale live result because worker configuration was replaced"
+        );
+        return;
+    }
+    if matches!(
+        &*current_worker.downloader_status.read().unwrap(),
+        WorkerStatus::Pause
+    ) {
+        info!(
+            url = ctx.live_streamer().url,
+            "recording skipped because streamer was disabled during live check"
+        );
+        return;
+    }
+    let enabled = match sqlx::query_scalar::<_, i64>(
+        "SELECT enabled FROM livestreamers WHERE id = ?",
+    )
+    .bind(ctx.worker_id())
+    .fetch_optional(ctx.pool())
+    .await
+    {
+        Ok(Some(value)) => value != 0,
+        Ok(None) => false,
+        Err(error) => {
+            error!(
+                error = ?error,
+                url = ctx.live_streamer().url,
+                "failed to re-check streamer enabled state before recording"
+            );
+            false
+        }
+    };
+    if !enabled {
+        info!(
+            url = ctx.live_streamer().url,
+            "recording skipped because streamer is disabled"
+        );
+        return;
+    }
+
     if let Err(error) = ctx.ensure_recording_space() {
         error!(error = ?error, url = ctx.live_streamer().url, "recording skipped by disk-space protection");
         rooms_handle.wake_waker(ctx.worker_id()).await;

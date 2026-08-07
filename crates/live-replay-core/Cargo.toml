@@ -1,0 +1,14 @@
+[package]
+name = "live-replay-core"
+version.workspace = true
+edition = "2024"
+description = "Cross-platform Live Replay recording core"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+biliup = { path = "../biliup" }
+serde = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true, features = ["charset", "http2", "brotli", "gzip", "json", "stream"] }
+tokio = { workspace = true, features = ["fs", "io-util", "sync", "time"] }

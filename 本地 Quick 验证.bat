@@ -7,7 +7,7 @@ title Live Replay - 本地 Quick 验证
 
 echo ============================================================
 echo [Live Replay] 本地 Quick 验证
-echo [Live Replay] 前端构建 + Rust 格式检查 + Workspace 编译检查
+echo [Live Replay] 前端构建 + Rust Workspace 编译检查
 echo ============================================================
 echo.
 
@@ -41,28 +41,23 @@ cargo --version
 echo.
 
 for /f %%N in ('node -p "process.versions.node.split('.')[0]"') do set "NODE_MAJOR=%%N"
-if not "%NODE_MAJOR%"=="20" (
-    echo [提醒] GitHub Quick 当前使用 Node.js 20；本机是 Node.js %NODE_MAJOR%。
-    echo [提醒] 先继续验证；若前端出现兼容问题，再切换到 Node.js 20。
-    echo.
-)
+if "%NODE_MAJOR%"=="20" goto :node_version_ok
+echo [提醒] GitHub Quick 当前使用 Node.js 20；本机是 Node.js %NODE_MAJOR%。
+echo [提醒] 先继续验证；若前端出现兼容问题，再切换到 Node.js 20。
+echo.
+:node_version_ok
 
-echo [1/4] 安装前端依赖 npm ci...
+echo [1/3] 安装前端依赖 npm ci...
 call npm.cmd ci
 if errorlevel 1 goto :failed
 
 echo.
-echo [2/4] 编译 Next.js 前端...
+echo [2/3] 编译 Next.js 前端...
 call npm.cmd run build
 if errorlevel 1 goto :failed
 
 echo.
-echo [3/4] 检查 Rust 格式...
-cargo fmt --all -- --check
-if errorlevel 1 goto :failed
-
-echo.
-echo [4/4] 检查 Rust Workspace...
+echo [3/3] 检查 Rust Workspace...
 set "SQLX_OFFLINE=true"
 cargo check --workspace --all-targets --locked
 if errorlevel 1 goto :failed

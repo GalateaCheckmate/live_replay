@@ -100,7 +100,6 @@ export default function StreamerSettingsPage() {
       copyright_source: editing.copyright_source || editing.url,
       description: editing.description,
       is_only_self: editing.is_only_self,
-      segment_minutes: editing.segment_minutes,
       delete_after_success: editing.delete_after_success,
     })
   }, [editing, formApi])
@@ -108,8 +107,8 @@ export default function StreamerSettingsPage() {
   const openEdit = async (streamer: ReplayStreamerState) => {
     if (streamer.user_state === 'recording') {
       Notification.warning({
-        title: '正在录制',
-        content: '为避免中途重启录制 Worker，请在本场直播结束后修改主播设置。',
+        title: '当前正在录制',
+        content: '请在本场直播结束后再修改主播设置。',
       })
       return
     }
@@ -142,7 +141,8 @@ export default function StreamerSettingsPage() {
       copyright_source: String(values.copyright_source ?? '').trim(),
       description: String(values.description ?? '').trim(),
       is_only_self: Number(values.is_only_self),
-      segment_minutes: Number(values.segment_minutes),
+      // 保留后端兼容字段；实际录制统一按约 15 GB 自动分段。
+      segment_minutes: 60,
       delete_after_success: values.delete_after_success !== false,
     }
 
@@ -155,8 +155,8 @@ export default function StreamerSettingsPage() {
       })
       if (!response.ok) throw new Error(await response.text())
       Notification.success({
-        title: '已保存',
-        content: '新设置用于之后的新场次；当前待上传场次继续使用创建时冻结的投稿配置。',
+        title: '设置已保存',
+        content: '新设置将从下一场直播开始生效。',
       })
       setEditing(null)
       formApi?.reset()
@@ -179,7 +179,7 @@ export default function StreamerSettingsPage() {
       if (!response.ok) throw new Error(await response.text())
       await refreshStreamers()
     } catch (error: any) {
-      Notification.error({ title: '切换失败', content: error?.message ?? String(error) })
+      Notification.error({ title: '操作失败', content: error?.message ?? String(error) })
     } finally {
       setSwitching(previous => {
         const next = new Set(previous)
@@ -193,12 +193,12 @@ export default function StreamerSettingsPage() {
     try {
       const response = await fetch(`${API_BASE}/v1/replay/streamers/${id}`, { method: 'DELETE' })
       if (!response.ok) throw new Error(await response.text())
-      Notification.success({ title: '已删除主播' })
+      Notification.success({ title: '主播已删除' })
       await refreshStreamers()
     } catch (error: any) {
       Notification.error({
-        title: '暂时不能删除',
-        content: error?.message ?? '仍有未完成的录制或上传任务，请处理完成后再删除。',
+        title: '无法删除主播',
+        content: error?.message ?? '仍有未完成的录制或投稿任务，请处理完成后再删除。',
         duration: 0,
       })
     }
@@ -212,7 +212,7 @@ export default function StreamerSettingsPage() {
         <div style={{ minHeight: 64, padding: '0 24px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
             <IconVideoListStroked size="large" />
-            <div><Title heading={4}>主播设置</Title><Text type="tertiary">只保留录制与投稿真正需要的选项</Text></div>
+            <div><Title heading={4}>主播设置</Title><Text type="tertiary">管理主播的录制与投稿设置</Text></div>
           </div>
           <Button icon={<IconRefresh />} onClick={() => refreshStreamers()}>刷新</Button>
         </div>
@@ -242,12 +242,12 @@ export default function StreamerSettingsPage() {
                   {streamer.user_state === 'recording' && (
                     <Text>已录制 {formatDuration(streamer.recording_elapsed_seconds)} · {formatBytes(streamer.recording_bytes)}</Text>
                   )}
-                  {streamer.pending_upload_parts > 0 && <Text>待处理分段：{streamer.pending_upload_parts}</Text>}
+                  {streamer.pending_upload_parts > 0 && <Text>正在处理：{streamer.pending_upload_parts} 个录像分段</Text>}
                   <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
                     <Button icon={<IconEdit2Stroked />} size="small" onClick={() => openEdit(streamer)}>编辑</Button>
                     <Popconfirm
                       title="删除这个主播？"
-                      content="有未完成场次时系统会拒绝删除。"
+                      content="删除后将停止监控。未完成的录制或投稿任务需要先处理完成。"
                       onConfirm={() => remove(streamer.id)}
                     >
                       <Button icon={<IconDeleteStroked />} size="small" type="danger" theme="borderless">删除</Button>
@@ -308,12 +308,11 @@ export default function StreamerSettingsPage() {
             optionList={[{ label: '转载', value: 2 }, { label: '自制', value: 1 }]}
             style={{ width: '100%' }}
           />
-          <Form.Input field="copyright_source" label="转载来源" />
-          <Form.TextArea field="description" label="简介" autosize={{ minRows: 2, maxRows: 5 }} />
-          <Form.InputNumber field="segment_minutes" label="单段时长（分钟）" min={1} max={1440} style={{ width: '100%' }} />
-          <Form.Switch field="delete_after_success" label="B站确认可播放后删除本地录像" />
+          <Form.Input field="copyright_source" label="转载来源" placeholder="转载时填写；默认使用直播间链接" />
+          <Form.TextArea field="description" label="简介" placeholder="可选" autosize={{ minRows: 2, maxRows: 5 }} />
+          <Form.Switch field="delete_after_success" label="投稿确认可播放后自动删除本地录像" />
           <Card style={{ marginTop: 12 }}>
-            <Text type="tertiary">直播间地址暂不允许在编辑中修改，避免正在监控时切换来源造成场次混淆。</Text>
+            <Text type="tertiary">直播间链接创建后不可修改。如需更换直播间，请添加新的主播。</Text>
           </Card>
         </Form>
       </Modal>

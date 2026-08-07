@@ -33,9 +33,9 @@ interface DiskStatus {
 const ReplaySettings: React.FC = () => {
   const { Header, Content } = Layout
   const { Title, Text } = Typography
-  const { data: entity, error, isLoading, mutate: refreshConfig } = useSWR('/v1/configuration', fetcher)
-  const { data: disk, mutate: refreshDisk } = useSWR<DiskStatus>('/v1/disk-status', fetcher, { refreshInterval: 10000 })
-  const { trigger } = useSWRMutation('/v1/configuration', put)
+  const { data: entity, error, isLoading, mutate: refreshConfig } = useSWR('/v1/replay/settings', fetcher)
+  const { data: disk, mutate: refreshDisk } = useSWR<DiskStatus>('/v1/replay/storage', fetcher, { refreshInterval: 10000 })
+  const { trigger } = useSWRMutation('/v1/replay/settings', put)
   const formRef = useRef<FormApi>()
 
   if (isLoading) return <Spin size="large" />

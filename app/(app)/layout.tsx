@@ -41,8 +41,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
     }, [width])
 
     // 主导航只保留 Live Replay 自己的概念。
-    // 旧 biliup 任务平台、投稿模板、Job、实时内部状态页继续保留路由用于兼容/排障，
-    // 但不再作为普通用户工作流的一部分暴露在侧栏里。
+    // 旧投稿模板、Job 与 raw 任务状态页已经移除；日志页仅保留为隐藏排障入口。
     const items = useMemo(
         () => [
             {
@@ -57,7 +56,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
             },
             {
                 itemKey: 'history',
-                text: '录制历史',
+                text: '本地录像',
                 icon: navIcon('#5ac262ff', <IconHistory size="small" />),
             },
             {

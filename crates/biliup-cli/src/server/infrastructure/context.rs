@@ -13,6 +13,7 @@ use biliup::downloader::live::LiveStream;
 use core::fmt;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
 use std::process::Command;
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -274,27 +275,34 @@ fn env_u64(name: &str, default: u64) -> u64 {
 fn free_space_bytes(path: &Path) -> Option<u64> {
     #[cfg(windows)]
     {
-        let path_text = path.to_string_lossy();
-        let drive = path_text
-            .chars()
-            .next()
-            .filter(|_| path_text.chars().nth(1) == Some(':'))?;
-        let script = format!(
-            "$d = Get-PSDrive -Name '{}'; if ($d) {{ [Console]::Write($d.Free) }}",
-            drive
-        );
-        let output = Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
+        use std::os::windows::ffi::OsStrExt;
+
+        #[link(name = "Kernel32")]
+        unsafe extern "system" {
+            fn GetDiskFreeSpaceExW(
+                directory_name: *const u16,
+                free_bytes_available: *mut u64,
+                total_number_of_bytes: *mut u64,
+                total_number_of_free_bytes: *mut u64,
+            ) -> i32;
         }
-        return String::from_utf8(output.stdout)
-            .ok()?
-            .trim()
-            .parse::<u64>()
-            .ok();
+
+        let query_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let wide: Vec<u16> = query_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut available = 0u64;
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut available,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        return (ok != 0).then_some(available);
     }
 
     #[cfg(not(windows))]

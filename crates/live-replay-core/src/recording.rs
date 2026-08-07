@@ -140,15 +140,33 @@ impl SegmentEmitterState {
             self.segment_started.format("%H:%M"),
             ended.format("%H:%M")
         );
-        let mut source_path = self.output_dir.join(format!("{local_stem}.{extension}"));
-        let mut final_mp4_path = self.output_dir.join(format!("{local_stem}.mp4"));
 
-        // A 15 GB segment cannot realistically complete twice within the same minute, but never
-        // overwrite if wall-clock jumps or a restored session collides with an existing file.
-        if source_path.exists() || (extension != "mp4" && final_mp4_path.exists()) {
-            let collision_stem = format!("{local_stem}｜P{index}");
-            source_path = self.output_dir.join(format!("{collision_stem}.{extension}"));
-            final_mp4_path = self.output_dir.join(format!("{collision_stem}.mp4"));
+        // Keep the source container crash-discoverable until MP4 remux + persistent queue handoff
+        // finish. The user-facing MP4 name remains clean; only this intermediate file carries the
+        // session/P identity so startup recovery can reconstruct it even if the process dies in the
+        // narrow window before the async journal callback runs.
+        let source_path = self.output_dir.join(format!(
+            ".lr-{}-P{}-source.{}",
+            self.live_session_id, index, extension
+        ));
+        if source_path.exists() {
+            self.errors.push(format!(
+                "发现同 session/P 的恢复源文件，拒绝覆盖: {}",
+                source_path.display()
+            ));
+            return;
+        }
+
+        let mut final_mp4_path = self.output_dir.join(format!("{local_stem}.mp4"));
+        if final_mp4_path.exists() {
+            final_mp4_path = self.output_dir.join(format!("{local_stem}｜P{index}.mp4"));
+            if final_mp4_path.exists() {
+                self.errors.push(format!(
+                    "最终 MP4 文件名冲突，拒绝覆盖: {}",
+                    final_mp4_path.display()
+                ));
+                return;
+            }
         }
 
         if let Err(error) = std::fs::rename(&raw_path, &source_path) {

@@ -22,6 +22,8 @@ mod mobile_bilibili_worker;
 #[cfg(mobile)]
 mod mobile_monitor;
 #[cfg(mobile)]
+mod mobile_recording_journal;
+#[cfg(mobile)]
 mod mobile_recordings;
 #[cfg(mobile)]
 mod mobile_youtube;

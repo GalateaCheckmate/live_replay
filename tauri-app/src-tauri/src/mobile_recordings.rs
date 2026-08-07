@@ -1,5 +1,7 @@
 use live_replay_core::recording::{RecordingPlan, RecordingSegment, record_live_session};
-use live_replay_core::{CoreCredentials, ProbeResult, StopFlag, new_stop_flag, probe_stream, request_stop};
+use live_replay_core::{
+    CoreCredentials, ProbeResult, ResolvedStream, StopFlag, new_stop_flag, probe_stream, request_stop,
+};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -131,11 +133,48 @@ pub async fn mobile_start_recording_multi(
     .await
 }
 
+/// Legacy/manual start entry: perform at most one platform probe, then pass the exact resolved
+/// media stream into the recorder. Monitor/UI live-check paths should call
+/// `start_recording_resolved` instead so their already-resolved stream is never thrown away.
 pub async fn start_recording(
     app: tauri::AppHandle,
     url: String,
     display_name: String,
     credentials: CoreCredentials,
+) -> Result<MultiRecordingStatus, String> {
+    let url = url.trim().to_string();
+    if url.is_empty() {
+        return Err("直播间地址为空。".to_string());
+    }
+    if is_recording(&url)? {
+        return status(&app);
+    }
+
+    let resolved = match probe_stream(&url, &display_name, credentials.clone()).await? {
+        ProbeResult::Offline => return Err("主播当前未开播。".to_string()),
+        ProbeResult::Live { stream } => stream,
+    };
+    start_recording_resolved(app, url, display_name, credentials, resolved).await
+}
+
+/// Start from a stream that has already been resolved by a successful live check. There is no
+/// platform probe on this path before the first media connection/file write.
+pub async fn start_recording_resolved(
+    app: tauri::AppHandle,
+    url: String,
+    display_name: String,
+    credentials: CoreCredentials,
+    resolved: ResolvedStream,
+) -> Result<MultiRecordingStatus, String> {
+    start_recording_inner(app, url, display_name, credentials, resolved).await
+}
+
+async fn start_recording_inner(
+    app: tauri::AppHandle,
+    url: String,
+    display_name: String,
+    credentials: CoreCredentials,
+    initial_stream: ResolvedStream,
 ) -> Result<MultiRecordingStatus, String> {
     let url = url.trim().to_string();
     if url.is_empty() {
@@ -155,18 +194,6 @@ pub async fn start_recording(
             "可用存储空间不足 10GB（当前约 {:.1}GB），拒绝启动新的录像；已有录像不会被强制中断。",
             free as f64 / 1024.0 / 1024.0 / 1024.0
         ));
-    }
-
-    // Keep monitor semantics precise: an offline target must stay "waiting", not become a fake
-    // active recording session. record_live_session will re-probe again inside the long-lived task
-    // so refreshed stream URLs are used after reconnects.
-    match probe_stream(&url, &display_name, credentials.clone()).await? {
-        ProbeResult::Offline => return Err("主播当前未开播。".to_string()),
-        ProbeResult::Live { .. } => {}
-    }
-
-    if is_recording(&url)? {
-        return status(&app);
     }
 
     let prepared = super::mobile_recording_journal::prepare_session(&app, &url, &display_name).await?;
@@ -283,6 +310,7 @@ pub async fn start_recording(
             credentials,
             output_dir,
         );
+        plan.initial_stream = Some(initial_stream);
         plan.live_session_id = Some(prepared.live_session_id.clone());
         plan.session_started_at = Some(prepared.session_started_at);
         plan.next_segment_index = prepared.next_segment_index;

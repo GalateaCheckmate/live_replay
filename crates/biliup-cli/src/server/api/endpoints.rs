@@ -5,7 +5,7 @@ use crate::server::core::download_manager::DownloadManager;
 use crate::server::errors::{AppError, report_to_response};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
 use crate::server::infrastructure::context::{
-    RecordingDiskStatus, Stage, WorkerStatus, recording_disk_status,
+    RecordingDiskStatus, Stage, WorkerStatus, default_recording_output_dir, recording_disk_status,
 };
 use crate::server::infrastructure::dto::LiveStreamerResponse;
 use crate::server::infrastructure::models::live_streamer::{InsertLiveStreamer, LiveStreamer};
@@ -41,6 +41,13 @@ use tracing_subscriber::EnvFilter;
 
 pub async fn get_disk_status_endpoint() -> Json<RecordingDiskStatus> {
     Json(recording_disk_status())
+}
+
+pub async fn refresh_streamers_endpoint(
+    State(managers): State<Arc<DownloadManager>>,
+) -> Json<serde_json::Value> {
+    let checked = managers.refresh_all_now().await;
+    Json(json!({ "checked": checked }))
 }
 
 pub async fn get_streamers_endpoint(
@@ -241,7 +248,8 @@ pub async fn post_simple_streamer_endpoint(
         url: url.clone(),
         enabled: true,
         remark,
-        filename_prefix: Some("{streamer}%Y-%m-%dT%H_%M_%S".to_string()),
+        // 新主播不再写死文件名模板；没有单独覆盖时真正继承全局 filename_prefix。
+        filename_prefix: None,
         time_range: None,
         upload_streamers_id: Some(upload.id),
         format: None,
@@ -344,10 +352,11 @@ pub async fn delete_streamers_endpoint(
     State(pool): State<ConnectionPool>,
     Path(id): Path<i64>,
 ) -> Result<Json<LiveStreamer>, Response> {
-    managers.del_room(id).await;
-
+    // 先让数据库的安全触发器判断是否允许删除。只有数据库删除成功后才移除 Worker，
+    // 避免“删除失败但主播已经停止监控”的半完成状态。
     let live_streamers = del_streamer(&pool, id).await.map_err(report_to_response)?;
-    info!(workers=?live_streamers, "successfully inserted new live streamers");
+    managers.del_room(id).await;
+    info!(id, "successfully deleted live streamer");
     Ok(Json(live_streamers))
 }
 
@@ -749,45 +758,66 @@ pub async fn login_by_qrcode(
 }
 
 pub async fn get_videos() -> Result<Json<Vec<serde_json::Value>>, Response> {
-    let media_extensions = [".mp4", ".flv", ".3gp", ".webm", ".mkv", ".ts"];
-    let blacklist = ["next-env.d.ts"];
-
+    let media_extensions = ["mp4", "flv", "3gp", "webm", "mkv", "ts"];
+    let root = default_recording_output_dir();
+    let mut directories = vec![root.clone()];
     let mut file_list = Vec::new();
     let mut index = 1;
 
-    // **use tokio::fs::read_dir**
-    if let Ok(mut entries) = fs::read_dir(".").await {
+    // 本地录像页以真正的录制目录为根，同时覆盖 Live Replay 安全队列中的已封段文件。
+    while let Some(directory) = directories.pop() {
+        let Ok(mut entries) = fs::read_dir(&directory).await else {
+            continue;
+        };
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
-            let file_name = entry.file_name().to_string_lossy().into_owned();
-
-            if blacklist.contains(&file_name.as_str()) {
+            let Ok(metadata) = entry.metadata().await else {
+                continue;
+            };
+            if metadata.is_dir() {
+                directories.push(path);
                 continue;
             }
 
-            if let Some(ext) = path.extension().and_then(|e| e.to_str())
-                && media_extensions
-                    .iter()
-                    .any(|allowed| ext == allowed.trim_start_matches('.'))
-                && let Ok(metadata) = entry.metadata().await
+            let Some(ext) = path.extension().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if !media_extensions
+                .iter()
+                .any(|allowed| ext.eq_ignore_ascii_case(allowed))
             {
-                let mtime = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-
-                file_list.push(serde_json::json!({
-                    "key": index,
-                    "name": file_name,
-                    "updateTime": mtime,
-                    "size": metadata.len(),
-                }));
-                index += 1;
+                continue;
             }
+
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            let relative_path = path
+                .strip_prefix(&root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let mtime = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0);
+
+            file_list.push(serde_json::json!({
+                "key": index,
+                "name": file_name,
+                "path": relative_path,
+                "updateTime": mtime,
+                "size": metadata.len(),
+            }));
+            index += 1;
         }
     }
+
+    file_list.sort_by(|a, b| {
+        b.get("updateTime")
+            .and_then(serde_json::Value::as_u64)
+            .cmp(&a.get("updateTime").and_then(serde_json::Value::as_u64))
+    });
     Ok(Json(file_list))
 }
 
@@ -812,7 +842,7 @@ pub async fn get_status(
     Ok(Json(serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "rooms": sw,
-        "download_semaphore": managers.download_semaphore,
+        "download_semaphore": config.read().unwrap().pool1_size,
         "update_semaphore": managers.u_kills.len(),
         "config": config,
     })))

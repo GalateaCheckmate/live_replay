@@ -6,7 +6,7 @@ use m3u8_rs::Playlist;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::time::Duration;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
 use url::Url;
 
@@ -47,7 +47,7 @@ pub async fn download(
                         .filter(|v| !v.is_i_frame)
                         .max_by_key(|v| v.bandwidth)
                 })
-                .unwrap_or(&pl.variants[0]);
+                .ok_or_else(|| Error::Custom("HLS master playlist 没有可用视频变体。".to_string()))?;
             info!(
                 "Selected variant: bandwidth={}, resolution={:?}, video={:?}",
                 best.bandwidth, best.resolution, best.video
@@ -63,8 +63,6 @@ pub async fn download(
             match m3u8_rs::parse_media_playlist(&bs) {
                 Ok((_, pl)) => pl,
                 Err(e) => {
-                    let mut file = File::create("test.fmp4")?;
-                    file.write_all(&bs)?;
                     return Err(Error::Custom(format!(
                         "Unable to parse media playlist content: {e}"
                     )));
@@ -81,9 +79,13 @@ pub async fn download(
     let mut previous_last_segment = 0;
     loop {
         if pl.segments.is_empty() {
-            info!("Segments array is empty - stream finished");
-            break;
+            if pl.end_list {
+                info!("HLS playlist ended with no remaining segments");
+                break;
+            }
+            sleep(Duration::from_secs(1)).await;
         }
+
         let mut seq = pl.media_sequence;
         for segment in &pl.segments {
             if seq > previous_last_segment {
@@ -113,6 +115,21 @@ pub async fn download(
             }
             seq += 1;
         }
+
+        if pl.end_list {
+            info!("HLS #EXT-X-ENDLIST reached");
+            break;
+        }
+
+        // Poll at roughly half of the latest segment duration instead of hammering the playlist in
+        // a tight loop. Clamp the interval so very short/long segment durations remain practical.
+        let poll_ms = pl
+            .segments
+            .last()
+            .map(|segment| ((segment.duration as f64 * 500.0).clamp(500.0, 5_000.0)) as u64)
+            .unwrap_or(1_000);
+        sleep(Duration::from_millis(poll_ms)).await;
+
         let resp = client
             .retryable(media_url.as_str())
             .await
@@ -125,9 +142,9 @@ pub async fn download(
             error
         })?;
         pressure.report_progress(bs.len());
-        if let Ok((_, playlist)) = m3u8_rs::parse_media_playlist(&bs) {
-            pl = playlist;
-        }
+        pl = m3u8_rs::parse_media_playlist(&bs)
+            .map(|(_, playlist)| playlist)
+            .map_err(|error| Error::Custom(format!("Unable to refresh HLS playlist: {error}")))?;
     }
     info!("Done...");
     Ok(())

@@ -68,8 +68,10 @@ pub(crate) async fn parse_flv(
         let flv_tag = match flv_tag_data {
             TagData::Audio(audio_data) => {
                 let packet_type = if audio_data.sound_format == SoundFormat::AAC {
-                    let (_, packet_header) = aac_audio_packet_header(audio_data.sound_data)
-                        .expect("Error in parsing aac audio packet header.");
+                    let (_, packet_header) = map_parse_err(
+                        aac_audio_packet_header(audio_data.sound_data),
+                        "aac audio packet header",
+                    )?;
                     if packet_header.packet_type == AACPacketType::SequenceHeader {
                         if aac_sequence_header.is_some() {
                             warn!("Unexpected aac sequence header tag. {tag_header:?}");
@@ -95,8 +97,10 @@ pub(crate) async fn parse_flv(
             }
             TagData::Video(video_data) => {
                 let (packet_type, composition_time) = if CodecId::H264 == video_data.codec_id {
-                    let (_, avc_video_header) = avc_video_packet_header(video_data.video_data)
-                        .expect("Error in parsing avc video packet header.");
+                    let (_, avc_video_header) = map_parse_err(
+                        avc_video_packet_header(video_data.video_data),
+                        "avc video packet header",
+                    )?;
                     if avc_video_header.packet_type == AVCPacketType::SequenceHeader {
                         if let Some((_, binary_data, _)) = &h264_sequence_header {
                             warn!("Unexpected h264 sequence header tag. {tag_header:?}");
@@ -113,6 +117,8 @@ pub(crate) async fn parse_flv(
                         Some(avc_video_header.composition_time),
                     )
                 } else {
+                    // Do not assume every FLV is H.264. Other codecs are retained verbatim; they
+                    // simply do not have an AVC packet header to decode here.
                     (None, None)
                 };
 
@@ -127,7 +133,7 @@ pub(crate) async fn parse_flv(
                 }
             }
             TagData::Script => {
-                let (_, tag_data) = script_data(i).expect("Error in parsing script tag.");
+                let (_, parsed_script) = map_parse_err(script_data(i), "script tag")?;
                 if on_meta_data.is_some() {
                     warn!("Unexpected script tag. {tag_header:?}");
                 }
@@ -135,7 +141,7 @@ pub(crate) async fn parse_flv(
 
                 FlvTag {
                     header: tag_header,
-                    data: TagDataHeader::Script(tag_data),
+                    data: TagDataHeader::Script(parsed_script),
                 }
             }
         };
@@ -170,28 +176,19 @@ pub(crate) async fn parse_flv(
                     segment.set_start_time(Duration::from_millis(timestamp));
                     segment.set_size_position(9 + 4);
 
-                    let (meta_header, meta_bytes, previous_meta_tag_size) =
-                        on_meta_data.as_ref().expect("on_meta_data does not exist");
-                    flv_tags_cache.push((
-                        *meta_header,
-                        meta_bytes.clone(),
-                        previous_meta_tag_size.clone(),
-                    ));
-                    let aac_sequence_header = aac_sequence_header
-                        .as_ref()
-                        .expect("aac_sequence_header does not exist");
-                    flv_tags_cache.push((
-                        aac_sequence_header.0,
-                        aac_sequence_header.1.clone(),
-                        aac_sequence_header.2.clone(),
-                    ));
+                    // Metadata/audio/video sequence headers are optional in real-world FLV. Older
+                    // code panicked here when a stream had no AAC audio, no metadata, or a non-H264
+                    // codec. Seed the next segment with whatever safe headers are actually known.
+                    if let Some((header, data, previous_size)) = on_meta_data.as_ref() {
+                        flv_tags_cache.push((*header, data.clone(), previous_size.clone()));
+                    }
+                    if let Some((header, data, previous_size)) = aac_sequence_header.as_ref() {
+                        flv_tags_cache.push((*header, data.clone(), previous_size.clone()));
+                    }
                     if !create_new {
-                        flv_tags_cache.push(
-                            h264_sequence_header
-                                .as_ref()
-                                .expect("h264_sequence_header does not exist")
-                                .clone(),
-                        );
+                        if let Some(header) = h264_sequence_header.as_ref() {
+                            flv_tags_cache.push(header.clone());
+                        }
                     }
                     info!("{} splitting.{segment:?}", out.file.file_name);
                     out.create_new()?;

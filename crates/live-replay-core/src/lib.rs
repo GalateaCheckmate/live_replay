@@ -1,3 +1,5 @@
+pub mod youtube;
+
 use biliup::downloader::live::{
     LiveCredentials, LiveOptions, LiveRequest, LiveStatus, builtin_plugins, media_ext_from_url,
 };

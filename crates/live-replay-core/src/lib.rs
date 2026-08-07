@@ -17,6 +17,10 @@ use std::sync::{
 use std::time::Duration;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+use tokio::time::timeout;
+
+const PROBE_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
+const PROBE_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CoreCredentials {
@@ -75,11 +79,15 @@ pub async fn probe_stream(
         .find(|plugin| plugin.matches(url))
         .ok_or_else(|| format!("暂不支持这个直播地址: {url}"))?;
 
+    // Probe requests must never be allowed to pin the Tauri invoke forever. Individual HTTP
+    // requests have a short timeout and the complete platform resolver also has a hard deadline.
+    // The recorder uses a separate client below and therefore is not affected by this timeout.
     let client = reqwest::Client::builder()
         .user_agent(
             "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/150 Mobile Safari/537.36",
         )
-        .connect_timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(PROBE_REQUEST_TIMEOUT)
         .build()
         .map_err(|error| format!("创建网络客户端失败: {error}"))?;
 
@@ -101,11 +109,15 @@ pub async fn probe_stream(
         credentials: live_credentials,
     };
 
-    match plugin
-        .check_stream(request)
+    let status = timeout(PROBE_TOTAL_TIMEOUT, plugin.check_stream(request))
         .await
-        .map_err(|error| format!("直播检测失败: {error}"))?
-    {
+        .map_err(|_| {
+            "直播检测超时（30 秒）。可能是当前网络、模拟器网络或平台接口暂时无响应；按钮已恢复，可稍后重试。"
+                .to_string()
+        })?
+        .map_err(|error| format!("直播检测失败: {error}"))?;
+
+    match status {
         LiveStatus::Offline => Ok(ProbeResult::Offline),
         LiveStatus::Live { stream } => Ok(ProbeResult::Live {
             stream: ResolvedStream {

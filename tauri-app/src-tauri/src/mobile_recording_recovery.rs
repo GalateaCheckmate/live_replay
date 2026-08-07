@@ -55,7 +55,11 @@ async fn recover_pending_segments(app: &tauri::AppHandle) -> Result<(), String> 
             ));
         }
     }
-    if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 async fn recover_discoverable_sources(app: &tauri::AppHandle) -> Result<(), String> {
@@ -93,8 +97,6 @@ async fn recover_discoverable_sources(app: &tauri::AppHandle) -> Result<(), Stri
             .find(|session| session.live_session_id == session_id)
             .cloned()
         else {
-            // Never guess ownership of a file whose journal is missing. Keeping it is safer than
-            // uploading or deleting it under the wrong manuscript.
             errors.push(format!(
                 "发现无法归属的恢复源文件，已保留: {}",
                 source_path.display()
@@ -103,7 +105,9 @@ async fn recover_discoverable_sources(app: &tauri::AppHandle) -> Result<(), Stri
         };
         match segment_from_recovered_source(&session, index, &extension, &source_path).await {
             Ok(segment) => {
-                if let Err(error) = register_completed_segment(app, &session.room_url, &segment).await {
+                if let Err(error) =
+                    register_completed_segment(app, &session.room_url, &segment).await
+                {
                     errors.push(format!("恢复 P{index} 写 journal 失败: {error}"));
                     continue;
                 }
@@ -114,37 +118,51 @@ async fn recover_discoverable_sources(app: &tauri::AppHandle) -> Result<(), Stri
             Err(error) => errors.push(error),
         }
     }
-    if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 async fn recover_raw_files(app: &tauri::AppHandle) -> Result<(), String> {
     let dir = recordings_dir(app)?;
+    fs::create_dir_all(&dir)
+        .await
+        .map_err(|error| format!("创建录像恢复目录失败: {error}"))?;
     let mut entries = fs::read_dir(&dir)
         .await
         .map_err(|error| format!("扫描未完成 raw 录像失败: {error}"))?;
     let sessions = snapshot(app).await?.sessions;
-    let mut raws: Vec<(String, PathBuf)> = Vec::new();
+    let mut raws: Vec<(String, String, PathBuf)> = Vec::new();
     while let Some(entry) = entries
         .next_entry()
         .await
         .map_err(|error| format!("读取未完成 raw 录像失败: {error}"))?
     {
         let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(extension) = raw_source_extension(&name) else {
+            continue;
+        };
         for session in &sessions {
             let prefix = format!(".lr-{}-raw-", session.live_session_id);
             if name.starts_with(&prefix) {
-                raws.push((session.live_session_id.clone(), entry.path()));
+                raws.push((
+                    session.live_session_id.clone(),
+                    extension.to_string(),
+                    entry.path(),
+                ));
                 break;
             }
         }
     }
     raws.sort_by(|a, b| {
         a.0.cmp(&b.0)
-            .then_with(|| modified_seconds_sync(&a.1).cmp(&modified_seconds_sync(&b.1)))
+            .then_with(|| modified_seconds_sync(&a.2).cmp(&modified_seconds_sync(&b.2)))
     });
 
     let mut errors = Vec::new();
-    for (session_id, raw_path) in raws {
+    for (session_id, extension, raw_path) in raws {
         let store = snapshot(app).await?;
         let Some(session) = store
             .sessions
@@ -155,15 +173,6 @@ async fn recover_raw_files(app: &tauri::AppHandle) -> Result<(), String> {
             continue;
         };
         let index = session.next_segment_index.max(1);
-        let extension = raw_path
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if !matches!(extension.as_str(), "flv" | "ts") {
-            errors.push(format!("未知 raw 录像格式，已保留: {}", raw_path.display()));
-            continue;
-        }
         let metadata = match fs::metadata(&raw_path).await {
             Ok(metadata) => metadata,
             Err(error) => {
@@ -177,7 +186,8 @@ async fn recover_raw_files(app: &tauri::AppHandle) -> Result<(), String> {
             continue;
         }
 
-        // fsync the crash-surviving raw file before assigning it a durable P identity.
+        // A process kill leaves LifecycleFile at *.flv.part / *.ts.part. At startup no writer can
+        // still own it, so fsync it first and then assign the durable session/P source identity.
         match fs::OpenOptions::new().read(true).open(&raw_path).await {
             Ok(file) => {
                 if let Err(error) = file.sync_all().await {
@@ -206,10 +216,13 @@ async fn recover_raw_files(app: &tauri::AppHandle) -> Result<(), String> {
             errors.push(format!("提交 raw 恢复文件失败: {error}"));
             continue;
         }
+        sync_parent_dir(&source_path);
 
         match segment_from_recovered_source(&session, index, &extension, &source_path).await {
             Ok(segment) => {
-                if let Err(error) = register_completed_segment(app, &session.room_url, &segment).await {
+                if let Err(error) =
+                    register_completed_segment(app, &session.room_url, &segment).await
+                {
                     errors.push(format!("恢复 raw P{index} 写 journal 失败: {error}"));
                     continue;
                 }
@@ -221,7 +234,22 @@ async fn recover_raw_files(app: &tauri::AppHandle) -> Result<(), String> {
         }
     }
 
-    if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn raw_source_extension(name: &str) -> Option<&'static str> {
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".flv.part") || lower.ends_with(".flv") {
+        Some("flv")
+    } else if lower.ends_with(".ts.part") || lower.ends_with(".ts") {
+        Some("ts")
+    } else {
+        None
+    }
 }
 
 async fn segment_from_recovered_source(
@@ -312,7 +340,9 @@ async fn close_stale_sessions(app: &tauri::AppHandle) -> Result<(), String> {
         if now.saturating_sub(session.last_heartbeat_at) <= grace {
             continue;
         }
-        let end = session.last_heartbeat_at.max(session.current_segment_started_at);
+        let end = session
+            .last_heartbeat_at
+            .max(session.current_segment_started_at);
         if let Err(error) = super::mobile_bilibili::mark_session_recording_complete(
             app,
             &session.live_session_id,
@@ -320,14 +350,24 @@ async fn close_stale_sessions(app: &tauri::AppHandle) -> Result<(), String> {
         )
         .await
         {
-            errors.push(format!("关闭过期 session {} 失败: {error}", session.live_session_id));
+            errors.push(format!(
+                "关闭过期 session {} 失败: {error}",
+                session.live_session_id
+            ));
             continue;
         }
         if let Err(error) = finish_session(app, &session.room_url).await {
-            errors.push(format!("清理过期 journal {} 失败: {error}", session.live_session_id));
+            errors.push(format!(
+                "清理过期 journal {} 失败: {error}",
+                session.live_session_id
+            ));
         }
     }
-    if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 fn parse_source_name(name: &str) -> Option<(String, u32, String)> {
@@ -354,6 +394,14 @@ fn modified_seconds_sync(path: &Path) -> i64 {
         .and_then(|metadata| metadata.modified().ok())
         .and_then(system_time_seconds)
         .unwrap_or(0)
+}
+
+fn sync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(directory) = std::fs::File::open(parent) {
+            let _ = directory.sync_all();
+        }
+    }
 }
 
 fn safe_file_component(input: &str) -> String {

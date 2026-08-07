@@ -100,6 +100,7 @@ export default function StreamerSettingsPage() {
       copyright_source: editing.copyright_source || editing.url,
       description: editing.description,
       is_only_self: editing.is_only_self,
+      segment_minutes: editing.segment_minutes,
       delete_after_success: editing.delete_after_success,
     })
   }, [editing, formApi])
@@ -141,8 +142,7 @@ export default function StreamerSettingsPage() {
       copyright_source: String(values.copyright_source ?? '').trim(),
       description: String(values.description ?? '').trim(),
       is_only_self: Number(values.is_only_self),
-      // 保留后端兼容字段；实际录制统一按约 15 GB 自动分段。
-      segment_minutes: 60,
+      segment_minutes: Number(values.segment_minutes),
       delete_after_success: values.delete_after_success !== false,
     }
 
@@ -310,6 +310,7 @@ export default function StreamerSettingsPage() {
           />
           <Form.Input field="copyright_source" label="转载来源" placeholder="转载时填写；默认使用直播间链接" />
           <Form.TextArea field="description" label="简介" placeholder="可选" autosize={{ minRows: 2, maxRows: 5 }} />
+          <Form.InputNumber field="segment_minutes" label="单段时长（分钟）" min={1} max={1440} style={{ width: '100%' }} />
           <Form.Switch field="delete_after_success" label="投稿确认可播放后自动删除本地录像" />
           <Card style={{ marginTop: 12 }}>
             <Text type="tertiary">直播间链接创建后不可修改。如需更换直播间，请添加新的主播。</Text>

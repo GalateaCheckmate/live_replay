@@ -174,6 +174,13 @@ async fn mobile_probe_stream(
 ) -> Result<ProbeResult, String> {
     let url = url.trim().to_string();
     let display_name = name.unwrap_or_default();
+    let bilibili_cookie = if bilibili_cookie.is_some() {
+        bilibili_cookie
+    } else if url.to_ascii_lowercase().contains("bilibili.com") {
+        mobile_bilibili_auth::cached_recording_cookie(&app).await
+    } else {
+        None
+    };
     let credentials = CoreCredentials {
         bilibili_cookie,
         douyin_cookie,

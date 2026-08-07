@@ -1,5 +1,6 @@
 name: Apply bundled FFmpeg fix
 
+# One-shot source updater. Remove after the source patch lands.
 on:
   push:
     branches:

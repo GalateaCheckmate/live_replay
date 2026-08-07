@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tauri::Manager;
+#[cfg(target_os = "android")]
+use tauri_plugin_live_replay_android::LiveReplayAndroidExt;
 use tokio::fs;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
@@ -148,6 +150,26 @@ where
     Ok(result)
 }
 
+async fn sync_background_active(app: &tauri::AppHandle) -> Result<(), String> {
+    let active = {
+        let _guard = gate().lock().await;
+        read_store(&store_path(app)?)
+            .await?
+            .targets
+            .iter()
+            .any(|target| target.enabled)
+    };
+    #[cfg(target_os = "android")]
+    {
+        app.live_replay_android().set_background_active(active)?;
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = active;
+    }
+    Ok(())
+}
+
 fn validate_url(url: &str) -> Result<(), String> {
     let lower = url.to_ascii_lowercase();
     if !(lower.contains("bilibili.com") || lower.contains("douyin.com")) {
@@ -203,6 +225,7 @@ pub async fn mobile_monitor_add(
     })
     .await?;
 
+    sync_background_active(&app).await?;
     monitor_target_once(&app, &target).await?;
     mobile_monitor_status(app).await
 }
@@ -212,7 +235,7 @@ pub async fn mobile_monitor_remove(
     app: tauri::AppHandle,
     target_id: String,
 ) -> Result<MonitorStore, String> {
-    mutate_store(&app, |store| {
+    let store = mutate_store(&app, |store| {
         let before = store.targets.len();
         store.targets.retain(|target| target.id != target_id);
         if store.targets.len() == before {
@@ -220,7 +243,9 @@ pub async fn mobile_monitor_remove(
         }
         Ok(store.clone())
     })
-    .await
+    .await?;
+    sync_background_active(&app).await?;
+    Ok(store)
 }
 
 #[tauri::command]
@@ -243,6 +268,7 @@ pub async fn mobile_monitor_set_enabled(
     })
     .await?;
 
+    sync_background_active(&app).await?;
     if enabled {
         monitor_target_once(&app, &target).await?;
     }
@@ -387,6 +413,9 @@ async fn monitor_tick(app: &tauri::AppHandle) -> Result<(), String> {
 
 pub fn start_monitor_worker(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
+        if let Err(error) = sync_background_active(&app).await {
+            eprintln!("[monitor] foreground-service state sync failed: {error}");
+        }
         loop {
             if let Err(error) = monitor_tick(&app).await {
                 eprintln!("[monitor] worker error: {error}");

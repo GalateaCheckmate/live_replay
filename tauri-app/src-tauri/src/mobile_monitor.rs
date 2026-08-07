@@ -1,4 +1,4 @@
-use live_replay_core::{CoreCredentials, ProbeResult, prime_resolved_stream, probe_stream};
+use live_replay_core::{CoreCredentials, ProbeResult, probe_stream};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -138,8 +138,8 @@ pub async fn mobile_monitor_add(
     })
     .await?;
 
-    // Do not wait for the 20-second background loop. Adding a live target is an explicit user
-    // action, so run exactly one probe now and start recording immediately when it is live.
+    // Adding a target is explicit user intent: do one detection immediately instead of waiting
+    // for the periodic monitor interval.
     monitor_target_once(&app, &target).await?;
     mobile_monitor_status(app).await
 }
@@ -220,15 +220,14 @@ async fn monitor_target_once(app: &tauri::AppHandle, target: &MonitorTarget) -> 
             update_target_state(app, &target.id, "等待开播", None).await
         }
         Ok(ProbeResult::Live { stream }) => {
-            // start_recording currently crosses two probe call-sites (its guard and the recorder
-            // startup). Prime both with this exact ResolvedStream so neither call hits the platform
-            // again. The cache expires quickly and is consumed, so reconnects still resolve fresh.
-            prime_resolved_stream(&target.url, stream, 2);
-            match super::mobile_recordings::start_recording(
+            // This is the only platform probe before recording starts. Pass the exact resolved
+            // stream directly to the recorder; do not discard it and probe again.
+            match super::mobile_recordings::start_recording_resolved(
                 app.clone(),
                 target.url.clone(),
                 target.name.clone(),
                 credentials,
+                stream,
             )
             .await
             {
@@ -251,7 +250,7 @@ async fn monitor_tick(app: &tauri::AppHandle) -> Result<(), String> {
 
 pub fn start_monitor_worker(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
-        // First pass runs immediately. The 20-second interval only applies after a completed pass.
+        // First pass is immediate; 20 seconds only separates subsequent checks.
         loop {
             if let Err(error) = monitor_tick(&app).await {
                 eprintln!("[monitor] worker error: {error}");

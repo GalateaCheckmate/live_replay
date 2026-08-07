@@ -1,6 +1,6 @@
 use crate::server::common::upload::{build_studio, submit_to_bilibili, upload};
 use crate::server::common::util::Recorder;
-use crate::server::config::Config;
+use crate::server::config::{Config, ConfigPatch};
 use crate::server::core::download_manager::DownloadManager;
 use crate::server::errors::{AppError, report_to_response};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
@@ -76,12 +76,52 @@ pub async fn get_streamers_endpoint(
     Ok(Json(results))
 }
 
+fn default_simple_title() -> String {
+    "{streamer} 直播回放 %Y-%m-%d %H-%M".to_string()
+}
+
+fn default_simple_tags() -> Vec<String> {
+    vec!["游戏".to_string()]
+}
+
+fn default_simple_copyright() -> u8 {
+    2
+}
+
+fn default_simple_visibility() -> u8 {
+    1
+}
+
+fn default_simple_segment_minutes() -> u64 {
+    60
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Deserialize)]
 pub struct SimpleStreamerRequest {
     pub url: String,
     pub remark: String,
     pub user_cookie: String,
     pub tid: u16,
+    #[serde(default = "default_simple_title")]
+    pub title: String,
+    #[serde(default = "default_simple_tags")]
+    pub tags: Vec<String>,
+    #[serde(default = "default_simple_copyright")]
+    pub copyright: u8,
+    #[serde(default)]
+    pub copyright_source: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default = "default_simple_visibility")]
+    pub is_only_self: u8,
+    #[serde(default = "default_simple_segment_minutes")]
+    pub segment_minutes: u64,
+    #[serde(default = "default_true")]
+    pub delete_after_success: bool,
 }
 
 pub async fn post_simple_streamer_endpoint(
@@ -101,16 +141,63 @@ pub async fn post_simple_streamer_endpoint(
             .into_response());
     }
 
+    if payload.tid == 0 {
+        return Err((StatusCode::BAD_REQUEST, "请选择有效的B站视频分区").into_response());
+    }
+    if !matches!(payload.copyright, 1 | 2) {
+        return Err((StatusCode::BAD_REQUEST, "投稿类型只能是自制或转载").into_response());
+    }
+    if payload.is_only_self > 1 {
+        return Err((StatusCode::BAD_REQUEST, "可见范围参数无效").into_response());
+    }
+    if !(1..=1440).contains(&payload.segment_minutes) {
+        return Err((StatusCode::BAD_REQUEST, "单段时长必须在1到1440分钟之间").into_response());
+    }
+
+    let title = if payload.title.trim().is_empty() {
+        default_simple_title()
+    } else {
+        payload.title.trim().to_string()
+    };
+    let tags = {
+        let mut tags: Vec<String> = payload
+            .tags
+            .into_iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect();
+        tags.dedup();
+        if tags.is_empty() {
+            tags.push("游戏".to_string());
+        }
+        tags
+    };
+    let copyright_source = if payload.copyright == 2 {
+        Some(if payload.copyright_source.trim().is_empty() {
+            url.clone()
+        } else {
+            payload.copyright_source.trim().to_string()
+        })
+    } else {
+        None
+    };
+    let hours = payload.segment_minutes / 60;
+    let minutes = payload.segment_minutes % 60;
+    let segment_time = format!("{hours:02}:{minutes:02}:00");
+    let override_cfg: ConfigPatch = serde_json::from_value(json!({ "segment_time": segment_time }))
+        .change_context(AppError::Unknown)
+        .map_err(report_to_response)?;
+
     let upload = ormlite::Insert::insert(
         InsertUploadStreamer {
             id: None,
             template_name: format!("live-replay:{}:{}", remark, Utc::now().timestamp_millis()),
-            title: Some("{streamer} 直播回放 %Y-%m-%d %H-%M".to_string()),
+            title: Some(title),
             tid: Some(payload.tid),
-            copyright: Some(2),
-            copyright_source: Some(url.clone()),
+            copyright: Some(payload.copyright),
+            copyright_source,
             cover_path: None,
-            description: Some(String::new()),
+            description: Some(payload.description.trim().to_string()),
             dynamic: None,
             dtime: None,
             dolby: None,
@@ -119,13 +206,16 @@ pub async fn post_simple_streamer_endpoint(
             no_reprint: None,
             uploader: Some("biliup-rs".to_string()),
             user_cookie: Some(user_cookie),
-            tags: vec!["三角洲行动".to_string(), "游戏".to_string()],
+            tags,
             credits: None,
             up_selection_reply: None,
             up_close_reply: None,
             up_close_danmu: None,
-            extra_fields: None,
-            is_only_self: Some(1),
+            extra_fields: Some(
+                json!({ "live_replay_delete_after_success": payload.delete_after_success })
+                    .to_string(),
+            ),
+            is_only_self: Some(payload.is_only_self),
         },
         &pool,
     )
@@ -141,7 +231,7 @@ pub async fn post_simple_streamer_endpoint(
         time_range: None,
         upload_streamers_id: Some(upload.id),
         format: None,
-        override_cfg: None,
+        override_cfg: Some(override_cfg),
         preprocessor: None,
         segment_processor: None,
         downloaded_processor: None,
@@ -709,37 +799,45 @@ pub async fn post_uploads(
         let submit_api = config.submit_api.clone();
         (line, limit, submit_api)
     };
-    info!("通过页面开始上传");
-    tokio::spawn(async move {
-        let (bilibili, videos) = upload(
-            upload_config
-                .user_cookie
-                .as_deref()
-                .unwrap_or("cookies.json"),
-            None,
-            line,
-            &json_data.files,
-            limit as usize,
-        )
-        .await?;
-        if !videos.is_empty() {
-            let recorder = Recorder::new(
-                upload_config.title.clone(),
-                StreamerInfo::new(
-                    &upload_config.template_name,
-                    "stream_title",
-                    "",
-                    Utc::now(),
-                    "",
-                ),
-            );
-            let studio = build_studio(&upload_config, &bilibili, videos, &recorder).await?;
-            let response_data =
-                submit_to_bilibili(&bilibili, &studio, submit_api.as_deref()).await?;
-            info!("通过页面上传成功 {:?}", response_data);
-        }
-        Ok::<_, Report<AppError>>(())
-    });
+    if json_data.files.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "请至少选择一个视频文件").into_response());
+    }
 
-    Ok(Json(serde_json::json!({})))
+    info!(files = ?json_data.files, "通过页面开始上传");
+    let (bilibili, videos) = upload(
+        upload_config
+            .user_cookie
+            .as_deref()
+            .unwrap_or("cookies.json"),
+        None,
+        line,
+        &json_data.files,
+        limit as usize,
+    )
+    .await
+    .map_err(report_to_response)?;
+
+    if videos.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "没有成功上传任何视频文件").into_response());
+    }
+
+    let recorder = Recorder::new(
+        upload_config.title.clone(),
+        StreamerInfo::new(
+            &upload_config.template_name,
+            "stream_title",
+            "",
+            Utc::now(),
+            "",
+        ),
+    );
+    let studio = build_studio(&upload_config, &bilibili, videos, &recorder)
+        .await
+        .map_err(report_to_response)?;
+    let response_data = submit_to_bilibili(&bilibili, &studio, submit_api.as_deref())
+        .await
+        .map_err(report_to_response)?;
+    info!("通过页面上传成功 {:?}", response_data);
+
+    Ok(Json(json!({ "ok": true })))
 }

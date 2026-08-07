@@ -51,6 +51,8 @@ const TemplateFields: React.FC<FormFCChild<StudioEntity & { isDtime: boolean }>>
   const treeData = typeTree?.map((type: BiliType) => {
     return {
       ...type,
+      label: type.name,
+      value: type.id,
       children: type.children.map(cType => {
         return {
           label: (

@@ -58,15 +58,22 @@ export function useBiliUsers() {
   };
 }
 
-export function useTypeTree() {
-  const { data: archivePre, error, isLoading } = useSWR("/bili/archive/pre", fetcher);
-  const treeData = archivePre?.data?.typelist.map((type: BiliType)=> {
-    return {
-      label: type.name,
-      value: type.id,
-      children: type.children
-    };
+export function useTypeTree(userCookie?: string) {
+  const key = userCookie
+    ? `/bili/archive/pre?user=${encodeURIComponent(userCookie)}`
+    : '/bili/archive/pre';
+  const { data: archivePre, error, isLoading } = useSWR(key, fetcher);
+
+  const mapType = (type: BiliType): any => ({
+    label: type.name,
+    value: type.id,
+    name: type.name,
+    id: type.id,
+    children: (type.children ?? []).map(mapType),
   });
+  const types = archivePre?.data?.typelist;
+  const treeData = Array.isArray(types) ? types.map(mapType) : [];
+
   return {
     isLoading,
     isError: error,

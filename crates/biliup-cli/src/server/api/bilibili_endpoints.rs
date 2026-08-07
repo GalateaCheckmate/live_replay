@@ -13,10 +13,30 @@ use std::collections::HashMap;
 
 /// B站投稿预处理端点
 pub async fn archive_pre_endpoint(
-    Query(_params): Query<HashMap<String, String>>,
+    Query(params): Query<HashMap<String, String>>,
     State(pool): State<ConnectionPool>,
 ) -> Result<Json<serde_json::Value>, Response> {
-    // 获取所有B站Cookie配置
+    // 添加主播时优先使用用户当前选择的已登录账号获取分区。
+    // 这样不同账号看到的投稿能力/分区信息与真正投稿账号保持一致。
+    if let Some(user) = params
+        .get("user")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        let bili = login_by_cookies(user, None)
+            .await
+            .change_context(AppError::Custom("所选B站账号登录状态已失效".to_string()))
+            .map_err(report_to_response)?;
+        return Ok(Json(
+            bili.archive_pre()
+                .await
+                .change_context(AppError::Unknown)
+                .map_err(report_to_response)?,
+        ));
+    }
+
+    // 未指定账号时兼容旧页面：获取所有B站Cookie配置
     let configurations = Configuration::select()
         .where_("key = 'bilibili-cookies'")
         .fetch_all(&pool)

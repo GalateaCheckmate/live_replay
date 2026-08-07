@@ -59,18 +59,37 @@ export default function Union() {
   const [visibleModal, setVisibleModal] = useState(false)
   const [selectFiles, setSelectFiles] = useState<(string | number)[]>([])
   const [selectEntity, setSelectEntity] = useState<StudioEntity>()
+  const [uploading, setUploading] = useState(false)
   const showDialog = (entity: StudioEntity) => {
     setSelectEntity(entity)
     setVisibleModal(true)
   }
   const handleOk = async () => {
-    await sendRequest('/v1/uploads', {
-      arg: {
-        files: selectFiles,
-        params: selectEntity,
-      },
-    })
-    setVisibleModal(false)
+    if (selectFiles.length === 0 || !selectEntity) {
+      Notification.warning({ title: '请选择文件', content: '至少选择一个视频文件后再上传。' })
+      return
+    }
+    setUploading(true)
+    try {
+      await sendRequest('/v1/uploads', {
+        arg: {
+          files: selectFiles,
+          params: selectEntity,
+        },
+      })
+      Notification.success({ title: '上传成功', content: '视频文件和投稿信息均已成功提交到B站。' })
+      setVisibleModal(false)
+      setSelectFiles([])
+      setTransferData([])
+    } catch (error: any) {
+      Notification.error({
+        title: '上传失败',
+        content: error?.message ?? String(error),
+        duration: 0,
+      })
+    } finally {
+      setUploading(false)
+    }
   }
   const handleCancel = () => {
     setVisibleModal(false)
@@ -104,6 +123,7 @@ export default function Union() {
         okText="上传"
         style={{ width: 'min(600px, 90vw)' }}
         visible={visibleModal}
+        confirmLoading={uploading}
         onOk={handleOk}
         afterClose={handleAfterClose}
         onCancel={handleCancel}

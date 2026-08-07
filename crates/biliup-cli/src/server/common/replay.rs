@@ -810,7 +810,16 @@ async fn ensure_session(
     let frozen_upload_config = freeze_upload_config(upload_config, &token).await?;
     let upload_json =
         serde_json::to_string(&frozen_upload_config).change_context(AppError::Unknown)?;
-    let delete_after_success = env_bool("LIVE_REPLAY_DELETE_AFTER_SUCCESS", true);
+    let delete_after_success = upload_config
+        .extra_fields
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|value| {
+            value
+                .get("live_replay_delete_after_success")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or_else(|| env_bool("LIVE_REPLAY_DELETE_AFTER_SUCCESS", true));
     let preserve_danmaku = env_bool("LIVE_REPLAY_PRESERVE_DANMAKU", false);
     let result = sqlx::query(
         "INSERT INTO live_sessions \

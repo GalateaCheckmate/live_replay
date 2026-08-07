@@ -46,6 +46,11 @@ pub fn router(service_register: ServiceRegister) -> Router<()> {
             "/v1/replay/streamers/{id}/settings",
             get(get_replay_streamer_settings).put(update_replay_streamer_settings),
         )
+        .route(
+            "/v1/replay/settings",
+            get(get_configuration).put(put_configuration),
+        )
+        .route("/v1/replay/storage", get(get_disk_status_endpoint))
         .route("/v1/replay/activity", get(get_replay_activity))
         .route("/v1/replay/sessions", get(get_replay_sessions))
         .route("/v1/replay/jobs", get(get_replay_jobs))

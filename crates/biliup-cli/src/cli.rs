@@ -17,9 +17,6 @@ pub fn expand_path(path: PathBuf) -> PathBuf {
 #[derive(Parser)]
 #[command(author, version, about)]
 pub struct Cli {
-    // /// Turn debugging information on
-    // #[clap(short, long, parse(from_occurrences))]
-    // debug: usize,
     #[clap(subcommand)]
     pub command: Commands,
 
@@ -31,7 +28,6 @@ pub struct Cli {
     #[arg(short, long, default_value = "cookies.json")]
     pub user_cookie: PathBuf,
 
-    // #[arg(long, default_value = "sqlx=debug,tower_http=debug,info")]
     #[arg(long, default_value = "tower_http=debug,info")]
     pub rust_log: String,
 }
@@ -48,67 +44,61 @@ pub enum Commands {
         #[arg(long)]
         submit: Option<SubmitOption>,
 
-        // Optional name to operate on
-        // name: Option<String>,
-        /// 需要上传的视频路径,若指定配置文件投稿不需要此参数
+        /// 需要上传的视频路径；使用配置文件投稿时可省略
         #[arg()]
         video_path: Vec<PathBuf>,
 
-        /// Sets a custom config file
+        /// 投稿配置文件
         #[arg(short, long, value_name = "FILE")]
         config: Option<PathBuf>,
 
-        /// 选择上传线路
+        /// 上传线路
         #[arg(short, long, value_enum)]
         line: Option<UploadLine>,
 
-        /// 单视频文件最大并发数
+        /// 单文件上传并发数
         #[arg(long, default_value = "3")]
         limit: usize,
 
         #[command(flatten)]
         studio: Studio,
-        // #[arg(required = false, last = true, default_value = "client")]
-        // submit: Option<String>,
     },
-    /// 是否要对某稿件追加视频
+    /// 向已有稿件追加视频
     Append {
         /// 提交接口
         #[arg(long)]
         submit: Option<SubmitOption>,
 
-        // Optional name to operate on
-        // name: Option<String>,
-        /// vid为稿件 av 或 bv 号
+        /// 稿件 AV 号或 BV 号
         #[arg(short, long)]
         vid: Vid,
-        /// 需要上传的视频路径,若指定配置文件投稿不需要此参数
+
+        /// 需要上传的视频路径
         #[arg()]
         video_path: Vec<PathBuf>,
 
-        /// 选择上传线路
+        /// 上传线路
         #[arg(short, long, value_enum)]
         line: Option<UploadLine>,
 
-        /// 单视频文件最大并发数
+        /// 单文件上传并发数
         #[arg(long, default_value = "3")]
         limit: usize,
 
         #[command(flatten)]
         studio: Studio,
     },
-    /// 打印视频详情
+    /// 查看视频详情
     Show {
-        /// vid为稿件 av 或 bv 号
-        // #[clap()]
+        /// 稿件 AV 号或 BV 号
         vid: Vid,
     },
     /// 查看视频评论
     Comments {
-        /// vid为稿件 av 或 bv 号
+        /// 稿件 AV 号或 BV 号
         vid: Vid,
 
-        /// 排序方式，0为按时间，2为按热度
+        /// 排序方式：0 按时间，2 按热度
         #[arg(long, default_value = "0")]
         sort: u8,
 
@@ -120,9 +110,9 @@ pub enum Commands {
         #[arg(long, default_value = "20")]
         ps: u32,
     },
-    /// 回复视频评论，默认只打印将要回复的内容
+    /// 回复视频评论；默认仅预览，不实际发送
     Reply {
-        /// vid为稿件 av 或 bv 号
+        /// 稿件 AV 号或 BV 号
         vid: Vid,
 
         /// 评论 rpid
@@ -135,7 +125,7 @@ pub enum Commands {
         #[arg(long)]
         execute: bool,
     },
-    /// 输出flv元数据
+    /// 输出 FLV 元数据
     DumpFlv {
         #[arg()]
         file_name: PathBuf,
@@ -144,25 +134,25 @@ pub enum Commands {
     Download {
         url: String,
 
-        /// Output filename template. e.p. "./video/%Y-%m-%dT%H_%M_%S{title}"
+        /// 输出文件名模板，例如 ./video/%Y-%m-%dT%H_%M_%S{title}
         #[arg(short, long, default_value = "{title}")]
         output: String,
 
-        /// 按照大小分割视频
+        /// 按文件大小分割
         #[arg(long, value_parser = human_size)]
         split_size: Option<u64>,
 
-        /// 按照时间分割视频
+        /// 按时长分割
         #[arg(long)]
         split_time: Option<humantime::Duration>,
     },
-    /// 启动web服务，默认端口19159
+    /// 启动 Live Replay 服务，默认仅允许本机访问
     Server {
-        /// Specify bind address
-        #[arg(short, long, default_value = "0.0.0.0")]
+        /// 监听地址
+        #[arg(short, long, default_value = "127.0.0.1")]
         bind: String,
 
-        /// Port to use
+        /// 服务端口
         #[arg(short, long, default_value = "19159")]
         port: u16,
 
@@ -170,29 +160,29 @@ pub enum Commands {
         #[arg(long, default_value = "false")]
         auth: bool,
 
-        /// 使用 biliup 1.0.7 风格配置文件启动录制
+        /// 使用配置文件启动录制
         #[arg(short, long, value_name = "FILE")]
         config: Option<PathBuf>,
     },
-    /// 列出所有已上传的视频
+    /// 列出已上传的视频
     List {
-        /// 只包含进行中的视频
+        /// 仅显示处理中视频
         #[arg(long)]
         is_pubing: bool,
 
-        /// 只包含已通过的视频
+        /// 仅显示已通过视频
         #[arg(long)]
         pubed: bool,
 
-        /// 只包含未通过的视频
+        /// 仅显示未通过视频
         #[arg(long)]
         not_pubed: bool,
 
-        /// 从第几页开始获取
+        /// 起始页码
         #[arg(short, long, default_value = "1")]
         from_page: u32,
 
-        /// 最大获取页数
+        /// 最大页数
         #[arg(short, long)]
         max_pages: Option<u32>,
     },

@@ -28,7 +28,7 @@ export default function Home() {
     {
       title: '标题',
       dataIndex: 'name',
-      render: (text: string) => <Text strong>{text}</Text>,
+      render: (text: any) => <Text strong>{text}</Text>,
     },
     {
       title: '大小',
@@ -39,13 +39,13 @@ export default function Home() {
       title: '更新日期',
       dataIndex: 'updateTime',
       defaultSortOrder: 'descend' as SortOrder,
-      sorter: (a: FileList, b: FileList) => a.updateTime - b.updateTime,
+      sorter: (a: any, b: any) => (a.updateTime - b.updateTime > 0 ? 1 : -1),
       render: (time: number) => humDate(time),
     },
     {
       title: '',
       dataIndex: 'operate',
-      render: (_: unknown, record: FileList) => (
+      render: (_text: any, record: any) => (
         <IconUserCardVideo
           style={{ cursor: 'pointer' }}
           onClick={() => showDialog(record.path || record.name)}
@@ -96,7 +96,7 @@ export default function Home() {
         }}
       >
         <main>
-          <Table size="small" columns={columns} dataSource={data ?? []} rowKey="key" />
+          <Table size="small" columns={columns} dataSource={data ?? []} />
         </main>
         <Modal
           visible={visible}

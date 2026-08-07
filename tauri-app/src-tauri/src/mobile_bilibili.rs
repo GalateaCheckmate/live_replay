@@ -1,5 +1,6 @@
 use live_replay_core::recording::RecordingSegment;
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tauri::Manager;
@@ -90,12 +91,53 @@ fn store_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| format!("无法获取 B站状态目录: {error}"))
 }
 
+fn backup_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.bak", path.to_string_lossy()))
+}
+
+async fn decode_store(path: &Path) -> Result<BilibiliStore, String> {
+    let bytes = fs::read(path)
+        .await
+        .map_err(|error| format!("读取 B站上传状态文件失败 {}: {error}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("解析 B站上传状态失败 {}: {error}", path.display()))
+}
+
 async fn read_store(path: &Path) -> Result<BilibiliStore, String> {
-    match fs::read(path).await {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map_err(|error| format!("读取 B站上传状态失败: {error}")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BilibiliStore::default()),
-        Err(error) => Err(format!("读取 B站上传状态文件失败: {error}")),
+    match decode_store(path).await {
+        Ok(store) => Ok(store),
+        Err(primary_error) => {
+            let primary_missing = fs::metadata(path)
+                .await
+                .err()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+            let backup = backup_path(path);
+            match decode_store(&backup).await {
+                Ok(store) => Ok(store),
+                Err(backup_error) if primary_missing => {
+                    let backup_missing = fs::metadata(&backup)
+                        .await
+                        .err()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+                    if backup_missing {
+                        Ok(BilibiliStore::default())
+                    } else {
+                        Err(backup_error)
+                    }
+                }
+                Err(backup_error) => Err(format!(
+                    "B站上传状态主文件与备份均不可用；主文件: {primary_error}; 备份: {backup_error}"
+                )),
+            }
+        }
+    }
+}
+
+fn sync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(directory) = std::fs::File::open(parent) {
+            let _ = directory.sync_all();
+        }
     }
 }
 
@@ -108,19 +150,38 @@ async fn save_store(path: &Path, store: &BilibiliStore) -> Result<(), String> {
     let temp = PathBuf::from(format!("{}.tmp", path.to_string_lossy()));
     let bytes = serde_json::to_vec_pretty(store)
         .map_err(|error| format!("序列化 B站上传状态失败: {error}"))?;
-    fs::write(&temp, bytes)
-        .await
-        .map_err(|error| format!("写入 B站临时状态失败: {error}"))?;
-    if fs::metadata(path).await.is_ok() {
-        let backup = PathBuf::from(format!("{}.bak", path.to_string_lossy()));
-        let _ = fs::copy(path, backup).await;
-        fs::remove_file(path)
-            .await
-            .map_err(|error| format!("替换 B站状态失败: {error}"))?;
+    {
+        let mut file = std::fs::File::create(&temp)
+            .map_err(|error| format!("创建 B站临时状态失败: {error}"))?;
+        file.write_all(&bytes)
+            .map_err(|error| format!("写入 B站临时状态失败: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("同步 B站临时状态失败: {error}"))?;
     }
+
+    if fs::metadata(path).await.is_ok() {
+        let backup = backup_path(path);
+        let backup_temp = PathBuf::from(format!("{}.tmp", backup.to_string_lossy()));
+        fs::copy(path, &backup_temp)
+            .await
+            .map_err(|error| format!("创建 B站状态备份失败: {error}"))?;
+        if let Ok(file) = std::fs::OpenOptions::new().read(true).open(&backup_temp) {
+            file.sync_all()
+                .map_err(|error| format!("同步 B站状态备份失败: {error}"))?;
+        }
+        if fs::metadata(&backup).await.is_ok() {
+            let _ = fs::remove_file(&backup).await;
+        }
+        fs::rename(&backup_temp, &backup)
+            .await
+            .map_err(|error| format!("提交 B站状态备份失败: {error}"))?;
+    }
+
     fs::rename(&temp, path)
         .await
-        .map_err(|error| format!("提交 B站状态失败: {error}"))
+        .map_err(|error| format!("提交 B站状态失败: {error}"))?;
+    sync_parent_dir(path);
+    Ok(())
 }
 
 pub(crate) async fn mutate_store<F, T>(app: &tauri::AppHandle, mutate: F) -> Result<T, String>
@@ -173,7 +234,10 @@ pub async fn enqueue_finalized_segment(
                 submission_state: "NOT_SUBMITTED".to_string(),
                 segments: Vec::new(),
             });
-            store.sessions.last_mut().expect("just inserted Bilibili session")
+            store
+                .sessions
+                .last_mut()
+                .expect("just inserted Bilibili session")
         };
 
         if session

@@ -10,9 +10,10 @@ use ormlite::Model;
 use ormlite::model::ModelBuilder;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::sync::{Notify, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
@@ -38,6 +39,19 @@ enum BatchVerdict {
 /// 短暂停即可在一个检测周期内扫完整个队列（网络频率仍由缓存 TTL 限制）。
 const BATCH_ROTATE_SLEEP: Duration = Duration::from_secs(1);
 
+/// 活跃录制计数许可。Drop 时自动归还一个活跃槽位。
+/// 并发上限本身不冻结在这里，而是每次申请时实时读取 Worker 当前配置，
+/// 因此修改 pool1_size 后不需要重启程序。
+struct RecordingSlotPermit {
+    active_downloads: Arc<AtomicU32>,
+}
+
+impl Drop for RecordingSlotPermit {
+    fn drop(&mut self) {
+        self.active_downloads.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// 房间处理器
 /// 管理多个直播间的状态和操作
 #[derive(Debug)]
@@ -48,13 +62,16 @@ pub struct Monitor {
     pool: ConnectionPool,
     /// 上传消息发送器，下载任务产生分段后会通过它交给上传流程。
     uploader: Sender<UploaderMessage>,
-    /// 下载池许可。监控循环必须先拿到许可，才允许检测开播并启动录制。
-    /// 这样 “开播了/成功开始录制” 只会出现在真正拥有下载并发槽位时。
-    /// 许可由下载任务持有到录制结束，pool1_size 的唯一限流语义在这里表达。
-    download_slots: Arc<Semaphore>,
+    /// 当前真正占用录制槽位的任务数。
+    /// 上限在申请新槽位时从 Worker 当前 Config.pool1_size 实时读取。
+    active_downloads: Arc<AtomicU32>,
     monitors: RwLock<HashMap<String, JoinHandle<()>>>,
     /// 各批量检测平台的开播缓存（platform_name -> 最近一次批量结果）。
     batch_live: RwLock<HashMap<String, BatchLiveCache>>,
+    /// 手动刷新期间暂时跳过普通轮询等待，让各平台快速扫完整个等待队列。
+    refresh_until: RwLock<Option<Instant>>,
+    /// 唤醒正在 event_loop_interval 睡眠中的平台监控任务。
+    refresh_notify: Notify,
 }
 
 impl Drop for Monitor {
@@ -77,11 +94,7 @@ impl Monitor {
     ///
     /// # 参数
     /// * `name` - 平台名称
-    pub fn new(
-        uploader: Sender<UploaderMessage>,
-        download_slots: Arc<Semaphore>,
-        pool: ConnectionPool,
-    ) -> Self {
+    pub fn new(uploader: Sender<UploaderMessage>, pool: ConnectionPool) -> Self {
         // 创建消息通道
         let (sender, receiver) = tokio::sync::mpsc::channel(1);
         let mut actor = RoomsActor::new(receiver);
@@ -92,9 +105,11 @@ impl Monitor {
             sender,
             pool,
             uploader,
-            download_slots,
+            active_downloads: Arc::new(AtomicU32::new(0)),
             monitors: Default::default(),
             batch_live: Default::default(),
+            refresh_until: Default::default(),
+            refresh_notify: Notify::new(),
         }
     }
 
@@ -102,7 +117,7 @@ impl Monitor {
     ///
     /// # 参数
     /// * `rooms_handle` - 房间处理器
-    /// * `plugin` - 下载插件
+    /// * `plugin` - 下载插件实现
     /// * `actor_handle` - Actor处理器
     /// * `interval` - 监控间隔（秒）
     pub(crate) async fn start_monitor(
@@ -129,7 +144,7 @@ impl Monitor {
                     BatchVerdict::Offline => {
                         self.wake_waker(room.id()).await;
                         debug!(url = url, "批量检测未开播");
-                        tokio::time::sleep(BATCH_ROTATE_SLEEP).await;
+                        self.wait_between_checks(BATCH_ROTATE_SLEEP).await;
                         continue;
                     }
                     // Live / Fallback 都继续走下面的逐间完整检测
@@ -138,7 +153,7 @@ impl Monitor {
             }
             let Some(download_permit) = self.try_acquire_download_slot(&room).await else {
                 self.wake_waker(room.id()).await;
-                tokio::time::sleep(Duration::from_secs(interval)).await;
+                self.wait_between_checks(Duration::from_secs(interval)).await;
                 continue;
             };
             let request = live_request(&room);
@@ -169,8 +184,8 @@ impl Monitor {
                     let uploader = self.uploader.clone();
                     let rooms_handle = Arc::clone(self);
 
-                    // 只能在已经拿到下载池许可后启动录制。许可移动到任务内并持有到流程结束，
-                    // 因此 pool1_size 只在这里表达，不再通过下载 Actor 池或消息队列重复限流。
+                    // 只能在已经拿到下载池许可后启动录制。许可移动到任务内并持有到流程结束。
+                    // 新许可的上限每次从最新配置读取，因此 pool1_size 修改后可动态生效。
                     tokio::spawn(async move {
                         let _download_permit = download_permit;
                         start_download_workflow(downloader, context, uploader, rooms_handle).await;
@@ -187,23 +202,107 @@ impl Monitor {
                     error!(e=?e, ctx=room.get_streamer().url,"检查直播间出错")
                 }
             };
-            // 等待下一次检查
-            tokio::time::sleep(Duration::from_secs(interval)).await;
+            // 等待下一次检查；手动刷新时会被立即唤醒并临时跳过等待。
+            self.wait_between_checks(Duration::from_secs(interval)).await;
         }
         info!("exit -> [{platform_name}]")
     }
 
-    async fn try_acquire_download_slot(&self, room: &Arc<Worker>) -> Option<OwnedSemaphorePermit> {
-        match self.download_slots.clone().try_acquire_owned() {
-            Ok(permit) => Some(permit),
-            Err(_) => {
+    async fn try_acquire_download_slot(&self, room: &Arc<Worker>) -> Option<RecordingSlotPermit> {
+        let limit = room.get_config().pool1_size.max(1);
+        loop {
+            let active = self.active_downloads.load(Ordering::Acquire);
+            if active >= limit {
                 debug!(
                     url = room.get_streamer().url,
+                    active_downloads = active,
+                    download_limit = limit,
                     "download pool is full, skip live check"
                 );
-                None
+                return None;
+            }
+            if self
+                .active_downloads
+                .compare_exchange_weak(
+                    active,
+                    active.saturating_add(1),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Some(RecordingSlotPermit {
+                    active_downloads: self.active_downloads.clone(),
+                });
             }
         }
+    }
+
+    async fn wait_between_checks(&self, duration: Duration) {
+        let refresh_active = self
+            .refresh_until
+            .read()
+            .unwrap()
+            .is_some_and(|until| Instant::now() < until);
+        if refresh_active {
+            tokio::task::yield_now().await;
+            return;
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(duration) => {}
+            _ = self.refresh_notify.notified() => {}
+        }
+    }
+
+    /// 立即触发一轮主播状态检查。
+    ///
+    /// 已经在录制或被关闭的主播不会被打断；等待中的主播会被标记为 Pending，
+    /// 清除批量检测缓存并唤醒各平台监控循环。刷新窗口内普通轮询等待被临时跳过，
+    /// 因而同一平台的等待队列会连续扫完。返回本轮纳入检查的主播数量。
+    pub async fn refresh_all_now(self: &Arc<Self>) -> usize {
+        self.batch_live.write().unwrap().clear();
+        *self.refresh_until.write().unwrap() = Some(Instant::now() + Duration::from_secs(20));
+
+        let workers = self.get_all().await;
+        let targets: Vec<_> = workers
+            .into_iter()
+            .filter(|worker| {
+                if !worker.live_streamer.enabled {
+                    return false;
+                }
+                matches!(
+                    &*worker.downloader_status.read().unwrap(),
+                    WorkerStatus::Idle | WorkerStatus::Pending
+                )
+            })
+            .collect();
+
+        for worker in &targets {
+            let mut status = worker.downloader_status.write().unwrap();
+            if matches!(&*status, WorkerStatus::Idle) {
+                *status = WorkerStatus::Pending;
+            }
+        }
+
+        self.refresh_notify.notify_waiters();
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let all_settled = targets.iter().all(|worker| {
+                !matches!(
+                    &*worker.downloader_status.read().unwrap(),
+                    WorkerStatus::Pending
+                )
+            });
+            if all_settled || Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        *self.refresh_until.write().unwrap() = None;
+        targets.len()
     }
 
     /// 用批量检测结果判定单个房间是否开播。
@@ -555,7 +654,7 @@ impl RoomsActor {
                     let _ = respond_to.send(self.del(id).await);
                 }
                 ActorMessage::WakeWaker(sender, id) => {
-                    // `let _ =` 忽略发送时的任何错误
+                    // `let _ =` 忽略发送错误
                     let _ = sender.send(self.push_back(id));
                 }
                 ActorMessage::Shutdown => {

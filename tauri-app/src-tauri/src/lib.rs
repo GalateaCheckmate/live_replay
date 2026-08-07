@@ -5,13 +5,13 @@ use std::sync::{Arc, Mutex};
 
 use tauri::{Manager, RunEvent};
 #[cfg(desktop)]
-use tauri::path::BaseDirectory;
-#[cfg(desktop)]
 use tauri::Emitter;
 #[cfg(desktop)]
-use tauri_plugin_shell::process::{CommandChild, CommandEvent, Encoding};
+use tauri::path::BaseDirectory;
 #[cfg(desktop)]
 use tauri_plugin_shell::ShellExt;
+#[cfg(desktop)]
+use tauri_plugin_shell::process::{CommandChild, CommandEvent, Encoding};
 
 #[cfg(mobile)]
 mod mobile_bilibili;
@@ -181,8 +181,6 @@ async fn mobile_probe_stream(
     let result = probe_stream(&url, &display_name, credentials.clone()).await?;
 
     if let ProbeResult::Live { stream } = &result {
-        // The live check has already resolved the actual media URL. Hand that exact result into the
-        // recorder; there is no second platform probe before the first media connection/file write.
         mobile_recordings::start_recording_resolved(
             app,
             url,
@@ -259,22 +257,25 @@ pub fn run() {
 
             #[cfg(mobile)]
             {
-                // Persistent upload workers remain loaded, but this debugging pass does not add or
-                // change uploader behavior. Crucially, monitor startup is no longer blocked behind
-                // potentially slow crash recovery/remux work.
                 mobile_bilibili_worker::start_upload_worker(app.handle().clone());
                 mobile_youtube::start_upload_worker(app.handle().clone());
-                mobile_monitor::start_monitor_worker(app.handle().clone());
 
+                // Startup recovery owns the recording directory/journal until it finishes. Starting
+                // the monitor before this barrier can let a fresh P1 race an old crash-recovered P1.
+                // Recovery errors are non-fatal because ambiguous files are deliberately retained;
+                // monitoring starts only after the recovery pass has relinquished ownership.
                 let recovery_app = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     if let Err(error) =
                         mobile_recording_recovery::recover_startup(&recovery_app).await
                     {
-                        eprintln!("[recording-recovery] startup recovery completed with retained files: {error}");
+                        eprintln!(
+                            "[recording-recovery] startup recovery completed with retained files: {error}"
+                        );
                     }
+                    mobile_monitor::start_monitor_worker(recovery_app.clone());
+                    println!("[tauri] Android recovery barrier complete; monitor worker started.");
                 });
-                println!("[tauri] Android monitor starts immediately; recording recovery runs independently.");
             }
 
             Ok(())

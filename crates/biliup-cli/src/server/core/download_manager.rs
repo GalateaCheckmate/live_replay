@@ -5,7 +5,6 @@ use crate::server::infrastructure::context::{Stage, Worker, WorkerStatus};
 use async_channel::bounded;
 use biliup::downloader::live::LivePlugin;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tracing::info;
 
@@ -16,7 +15,8 @@ pub struct DownloadManager {
     // plugins: Vec<Arc<dyn LivePlugin + Send + Sync>>,
     rooms_handle: Arc<Monitor>,
 
-    /// 下载池大小。真正的并发控制由 Monitor 持有的 Semaphore 完成。
+    /// 启动时的下载池大小，仅保留给兼容状态接口。
+    /// 真正的并发上限由 Monitor 每次从当前 Config.pool1_size 实时读取。
     pub download_semaphore: u32,
     /// 上传Actor任务句柄列表
     pub(crate) u_kills: Vec<JoinHandle<()>>,
@@ -33,11 +33,7 @@ impl DownloadManager {
         let (up_tx, up_rx) = bounded(16);
         let mut u_kills = Vec::new();
 
-        let rooms_handle = Arc::new(Monitor::new(
-            up_tx.clone(),
-            Arc::new(Semaphore::new(download_semaphore as usize)),
-            pool.clone(),
-        ));
+        let rooms_handle = Arc::new(Monitor::new(up_tx.clone(), pool.clone()));
         // 创建上传Actor
         for _ in 0..update_semaphore {
             let mut u_actor = UActor::new(up_rx.clone());
@@ -70,6 +66,11 @@ impl DownloadManager {
 
     pub async fn get_rooms(&self) -> Vec<Arc<Worker>> {
         self.rooms_handle.get_all().await
+    }
+
+    /// 强制唤醒各平台监控循环并尽快完成一轮状态检查。
+    pub async fn refresh_all_now(&self) -> usize {
+        self.rooms_handle.refresh_all_now().await
     }
 
     /// 移出工作队列

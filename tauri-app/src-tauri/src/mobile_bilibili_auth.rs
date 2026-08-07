@@ -2,6 +2,7 @@ use biliup::uploader::credential::LoginInfo;
 use live_replay_core::bilibili::{
     account_info, complete_qr_login, create_qr_challenge, refresh_login_if_needed,
 };
+use qrcode::{QrCode, render::svg};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -13,6 +14,7 @@ use tokio::time::timeout;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BilibiliQrStart {
     pub url: String,
+    pub svg: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,8 +79,6 @@ async fn read_login(app: &tauri::AppHandle) -> Result<LoginInfo, String> {
 pub async fn load_valid_login(app: &tauri::AppHandle) -> Result<LoginInfo, String> {
     let login = read_login(app).await?;
     let refreshed = refresh_login_if_needed(login).await?;
-    // Persist refreshed tokens before returning them to an uploader. A crash after this point can
-    // always restart from the newest credential set.
     save_login(app, &refreshed).await?;
     Ok(refreshed)
 }
@@ -91,7 +91,19 @@ pub async fn mobile_bilibili_auth_start(
     let payload = serde_json::to_vec_pretty(&challenge.payload)
         .map_err(|error| format!("保存 B站二维码会话失败: {error}"))?;
     atomic_write(&pending_qr_path(&app)?, &payload).await?;
-    Ok(BilibiliQrStart { url: challenge.url })
+
+    let code = QrCode::new(challenge.url.as_bytes())
+        .map_err(|error| format!("生成 B站登录二维码失败: {error}"))?;
+    let svg = code
+        .render::<svg::Color>()
+        .min_dimensions(256, 256)
+        .quiet_zone(true)
+        .build();
+
+    Ok(BilibiliQrStart {
+        url: challenge.url,
+        svg,
+    })
 }
 
 #[tauri::command]

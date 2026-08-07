@@ -1,4 +1,4 @@
-use live_replay_core::{probe_stream, CoreCredentials, ProbeResult};
+use live_replay_core::CoreCredentials;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -199,42 +199,28 @@ async fn enabled_targets(app: &tauri::AppHandle) -> Result<Vec<MonitorTarget>, S
 
 async fn monitor_tick(app: &tauri::AppHandle) -> Result<(), String> {
     for target in enabled_targets(app).await? {
-        let current = super::mobile_core_status(app.clone())?;
-        if current.active {
-            if current.room_url.as_deref() == Some(target.url.as_str()) {
-                update_target_state(app, &target.id, "正在录制", None).await?;
-            } else {
-                update_target_state(app, &target.id, "等待录制器空闲", None).await?;
-            }
+        if super::mobile_recordings::is_recording(&target.url)? {
+            update_target_state(app, &target.id, "正在录制", None).await?;
             continue;
         }
 
-        match probe_stream(&target.url, &target.name, CoreCredentials::default()).await {
-            Ok(ProbeResult::Offline) => {
+        update_target_state(app, &target.id, "正在检测", None).await?;
+        match super::mobile_recordings::start_recording(
+            app.clone(),
+            target.url.clone(),
+            target.name.clone(),
+            CoreCredentials::default(),
+        )
+        .await
+        {
+            Ok(_) => {
+                update_target_state(app, &target.id, "正在录制", None).await?;
+            }
+            Err(error) if error.contains("主播当前未开播") => {
                 update_target_state(app, &target.id, "等待开播", None).await?;
             }
-            Ok(ProbeResult::Live { .. }) => {
-                update_target_state(app, &target.id, "检测到开播，正在启动录制", None).await?;
-                match super::mobile_start_recording(
-                    app.clone(),
-                    target.url.clone(),
-                    Some(target.name.clone()),
-                    None,
-                    None,
-                )
-                .await
-                {
-                    Ok(_) => {
-                        update_target_state(app, &target.id, "正在录制", None).await?;
-                        break;
-                    }
-                    Err(error) => {
-                        update_target_state(app, &target.id, "启动录制失败", Some(error)).await?;
-                    }
-                }
-            }
             Err(error) => {
-                update_target_state(app, &target.id, "检测失败", Some(error)).await?;
+                update_target_state(app, &target.id, "检测或启动失败", Some(error)).await?;
             }
         }
     }
@@ -243,7 +229,6 @@ async fn monitor_tick(app: &tauri::AppHandle) -> Result<(), String> {
 
 pub fn start_monitor_worker(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
-        // Short startup delay lets Tauri finish plugin/state initialization first.
         sleep(Duration::from_secs(3)).await;
         loop {
             if let Err(error) = monitor_tick(&app).await {

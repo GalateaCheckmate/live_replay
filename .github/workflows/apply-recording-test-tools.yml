@@ -52,11 +52,13 @@ jobs:
           SQLX_OFFLINE: "true"
         run: cargo check --workspace --all-targets --locked
 
-      - name: Remove one-shot files
+      - name: Prepare source-only commit
         shell: bash
         run: |
+          # full.yml is committed separately with the GitHub connector because
+          # GITHUB_TOKEN cannot modify another workflow file without workflows permission.
+          git checkout -- .github/workflows/full.yml
           rm -f tools/apply_recording_test_tools.py
-          rm -f .github/workflows/apply-recording-test-tools.yml
           rm -f .github/recording-test-tools-trigger
 
       - name: Commit changes

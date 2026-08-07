@@ -8,7 +8,7 @@ use crate::server::api::endpoints::{
     get_upload_streamer_endpoint, get_upload_streamers_endpoint, get_users_endpoint, get_videos,
     login_by_qrcode, pause_streamers_endpoint, post_simple_streamer_endpoint,
     post_streamers_endpoint, post_uploads, put_configuration, put_streamers_endpoint,
-    upload_now_streamer_endpoint,
+    refresh_streamers_endpoint, upload_now_streamer_endpoint,
 };
 use crate::server::api::replay_endpoints::{
     bind_replay_submission, get_replay_jobs, get_replay_sessions, reset_replay_submission,
@@ -20,12 +20,14 @@ use crate::server::api::replay_state_endpoints::{
 use crate::server::api::replay_streamer_endpoints::{
     set_replay_streamer_enabled_safe, update_replay_streamer_settings_safe,
 };
+use crate::server::infrastructure::context::default_recording_output_dir;
 use crate::server::infrastructure::service_register::ServiceRegister;
 use axum::Router;
 use axum::body::Body;
-use axum::http::Request;
-use axum::response::IntoResponse;
+use axum::http::{Request, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
+use std::path::{Component, PathBuf};
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 
@@ -53,6 +55,7 @@ pub fn router(service_register: ServiceRegister) -> Router<()> {
             get(get_configuration).put(put_configuration),
         )
         .route("/v1/replay/storage", get(get_disk_status_endpoint))
+        .route("/v1/replay/refresh", post(refresh_streamers_endpoint))
         .route("/v1/replay/activity", get(get_replay_activity))
         .route("/v1/replay/sessions", get(get_replay_sessions))
         .route("/v1/replay/jobs", get(get_replay_jobs))
@@ -101,14 +104,26 @@ pub fn router(service_register: ServiceRegister) -> Router<()> {
         .route("/v1/login_by_qrcode", post(login_by_qrcode))
         .route("/v1/videos", get(get_videos))
         .route("/v1/uploads", post(post_uploads))
-        .route_service("/static/{path}", get(using_serve_file_from_a_route))
+        .route_service("/static/{*path}", get(using_serve_file_from_a_route))
         .with_state(service_register)
 }
 
 async fn using_serve_file_from_a_route(
     axum::extract::Path(path): axum::extract::Path<String>,
     request: Request<Body>,
-) -> impl IntoResponse {
-    let serve_file = ServeFile::new(path);
-    serve_file.oneshot(request).await
+) -> Response {
+    let relative = PathBuf::from(path);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return (StatusCode::BAD_REQUEST, "无效的录像文件路径").into_response();
+    }
+
+    let serve_file = ServeFile::new(default_recording_output_dir().join(relative));
+    serve_file.oneshot(request).await.into_response()
 }

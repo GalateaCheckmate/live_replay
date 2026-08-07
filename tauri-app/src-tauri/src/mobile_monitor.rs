@@ -129,7 +129,6 @@ async fn save_store(path: &Path, store: &MonitorStore) -> Result<(), String> {
             .map_err(|error| format!("提交监控状态备份失败: {error}"))?;
     }
 
-    // Android/Linux rename over an existing file is atomic; never delete the live state first.
     fs::rename(&temp, path)
         .await
         .map_err(|error| format!("提交监控状态文件失败: {error}"))?;
@@ -323,7 +322,15 @@ async fn monitor_target_once(app: &tauri::AppHandle, target: &MonitorTarget) -> 
     )
     .await?;
 
-    let credentials = CoreCredentials::default();
+    let lower_url = target.url.to_ascii_lowercase();
+    let credentials = CoreCredentials {
+        bilibili_cookie: if lower_url.contains("bilibili.com") {
+            super::mobile_bilibili_auth::cached_recording_cookie(app).await
+        } else {
+            None
+        },
+        douyin_cookie: None,
+    };
     match probe_stream(&target.url, &target.name, credentials.clone()).await {
         Ok(ProbeResult::Offline) => {
             if target.suppress_until_offline {

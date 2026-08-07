@@ -141,14 +141,49 @@ class LiveReplayForegroundService : Service() {{
     companion object {{
         private const val CHANNEL_ID = "live_replay_recording"
         private const val NOTIFICATION_ID = 19159
+        private const val ACTION_SET_BACKGROUND_ACTIVE = "app.tauri.livereplay.SET_BACKGROUND_ACTIVE"
+        private const val EXTRA_BACKGROUND_ACTIVE = "active"
     }}
 
     private var wakeLock: PowerManager.WakeLock? = null
+    private var backgroundActive = false
 
     override fun onCreate() {{
         super.onCreate()
         createNotificationChannel()
+        // Foreground visibility is kept from app start, but the CPU wake lock is deliberately lazy.
+        // An idle Live Replay install should not prevent deep sleep merely because the UI was opened.
+        startForeground(NOTIFICATION_ID, buildNotification(false))
+    }}
 
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {{
+        if (intent?.action == ACTION_SET_BACKGROUND_ACTIVE) {{
+            setBackgroundActive(intent.getBooleanExtra(EXTRA_BACKGROUND_ACTIVE, false))
+        }} else if (intent == null) {{
+            // A sticky Service restart does not prove the Rust/Tauri monitor was restored. Stay idle
+            // rather than presenting a false "recording" state or burning battery with a stale lock.
+            setBackgroundActive(false)
+        }}
+        return START_STICKY
+    }}
+
+    override fun onDestroy() {{
+        releaseWakeLock()
+        super.onDestroy()
+    }}
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun setBackgroundActive(active: Boolean) {{
+        backgroundActive = active
+        if (active) acquireWakeLock() else releaseWakeLock()
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.notify(NOTIFICATION_ID, buildNotification(active))
+    }}
+
+    private fun acquireWakeLock() {{
+        val existing = wakeLock
+        if (existing?.isHeld == true) return
         val powerManager = getSystemService(POWER_SERVICE) as PowerManager
         wakeLock = powerManager.newWakeLock(
             PowerManager.PARTIAL_WAKE_LOCK,
@@ -157,23 +192,14 @@ class LiveReplayForegroundService : Service() {{
             setReferenceCounted(false)
             acquire()
         }}
-
-        startForeground(NOTIFICATION_ID, buildNotification())
     }}
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {{
-        return START_STICKY
-    }}
-
-    override fun onDestroy() {{
+    private fun releaseWakeLock() {{
         wakeLock?.let {{ lock ->
             if (lock.isHeld) lock.release()
         }}
         wakeLock = null
-        super.onDestroy()
     }}
-
-    override fun onBind(intent: Intent?): IBinder? = null
 
     private fun createNotificationChannel() {{
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {{
@@ -189,7 +215,7 @@ class LiveReplayForegroundService : Service() {{
         }}
     }}
 
-    private fun buildNotification(): Notification {{
+    private fun buildNotification(active: Boolean = backgroundActive): Notification {{
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {{
             Notification.Builder(this, CHANNEL_ID)
         }} else {{
@@ -199,8 +225,8 @@ class LiveReplayForegroundService : Service() {{
 
         return builder
             .setSmallIcon(applicationInfo.icon)
-            .setContentTitle("Live Replay 正在后台运行")
-            .setContentText("直播监控与录制服务已启动")
+            .setContentTitle(if (active) "Live Replay 正在后台监控" else "Live Replay 后台服务空闲")
+            .setContentText(if (active) "监控/录制任务活动中 · 已保持 CPU 唤醒" else "暂无活动监控任务 · 未持有 CPU 唤醒锁")
             .setOngoing(true)
             .setCategory(Notification.CATEGORY_SERVICE)
             .build()
@@ -215,5 +241,6 @@ print(f"  manifest: {manifest_path}")
 print(f"  activity: {main_activity_path}")
 print(f"  service:  {service_path}")
 print("  foreground service type: specialUse")
+print("  wake lock policy: active monitoring only")
 for permission in required_permissions:
     print(f"  permission: {permission}")

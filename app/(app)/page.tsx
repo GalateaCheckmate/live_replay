@@ -135,8 +135,7 @@ export default function Home() {
       copyright_source: String(values.copyright_source ?? '').trim(),
       description: String(values.description ?? '').trim(),
       is_only_self: Number(values.is_only_self),
-      // 后端仍保留该兼容字段；实际录制统一按约 15 GB 自动分段。
-      segment_minutes: 60,
+      segment_minutes: Number(values.segment_minutes),
       delete_after_success: values.delete_after_success !== false,
     }
 
@@ -271,6 +270,7 @@ export default function Home() {
             copyright: 2,
             is_only_self: 1,
             description: '',
+            segment_minutes: 60,
             delete_after_success: true,
           }}
         >
@@ -296,7 +296,7 @@ export default function Home() {
 
           <Card style={{ margin: '12px 0' }}>
             <Text strong>投稿设置</Text><br />
-            <Text type="tertiary">每场直播作为一个投稿；录像达到约 15 GB 时自动分段，并按顺序追加为分P。</Text>
+            <Text type="tertiary">每场直播作为一个投稿；录像分段会按顺序追加为分P。</Text>
           </Card>
 
           <Form.Input field="title" label="视频标题" rules={[{ required: true, message: '请填写视频标题格式' }]} />
@@ -327,6 +327,7 @@ export default function Home() {
           />
           <Form.Input field="copyright_source" label="转载来源" placeholder="默认使用当前直播间链接；自制投稿时无需填写" />
           <Form.TextArea field="description" label="简介" placeholder="可选" autosize={{ minRows: 2, maxRows: 5 }} />
+          <Form.InputNumber field="segment_minutes" label="单段时长（分钟）" min={1} max={1440} style={{ width: '100%' }} />
           <Form.Switch field="delete_after_success" label="投稿确认可播放后自动删除本地录像" />
         </Form>
       </Modal>

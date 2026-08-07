@@ -1,2 +1,2 @@
-Validate bundled portable ffmpeg/ffprobe resolution and package assembly.
-Triggered: 2026-08-08T00:31:00+08:00
+Validate Windows main after removing Android-only 15 GB segmentation remnants.
+Triggered: 2026-08-08T01:11:00+08:00

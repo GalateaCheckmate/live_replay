@@ -6,6 +6,8 @@ pub mod bilibili_endpoints;
 pub mod endpoints;
 /// Live Replay 场次与上传队列端点
 pub mod replay_endpoints;
+/// Live Replay 稳定领域状态端点
+pub mod replay_state_endpoints;
 /// 单页应用静态文件处理
 pub mod spa;
 pub mod ws;

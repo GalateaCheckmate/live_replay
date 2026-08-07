@@ -1,2 +1,0 @@
-Make ffprobe optional and use built-in container header validation when it is unavailable.
-Triggered: 2026-08-07T15:25:00+08:00

@@ -31,7 +31,7 @@ mod mobile_recordings;
 mod mobile_youtube;
 
 #[cfg(mobile)]
-use live_replay_core::{CoreCredentials, ProbeResult, prime_resolved_stream, probe_stream};
+use live_replay_core::{CoreCredentials, ProbeResult, probe_stream};
 
 #[tauri::command]
 fn greet(name: &str) -> String {
@@ -181,11 +181,9 @@ async fn mobile_probe_stream(
     let result = probe_stream(&url, &display_name, credentials.clone()).await?;
 
     if let ProbeResult::Live { stream } = &result {
-        // The user explicitly asked to detect a live room. Do not discard the resolved media URL
-        // and then probe the platform twice more. Reuse this exact resolution through the existing
-        // start_recording guard and recorder startup, and start recording before returning to UI.
-        prime_resolved_stream(&url, stream.clone(), 2);
-        mobile_recordings::start_recording(
+        // The live check has already resolved the actual media URL. Hand that exact result into the
+        // recorder; there is no second platform probe before the first media connection/file write.
+        mobile_recordings::start_recording_resolved(
             app,
             url,
             if display_name.trim().is_empty() {
@@ -194,6 +192,7 @@ async fn mobile_probe_stream(
                 display_name
             },
             credentials,
+            stream.clone(),
         )
         .await?;
     }

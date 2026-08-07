@@ -4,14 +4,14 @@ use biliup::downloader::flv_parser::header;
 use biliup::downloader::hls;
 use biliup::downloader::httpflv::{self, Connection};
 use biliup::downloader::util::{LifecycleFile, Segmentable};
-use nom::Err as NomErr;
+use biliup::uploader::line::{recording_finished, recording_started};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::fs;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::sleep;
 
 #[derive(Debug, Clone)]
@@ -20,12 +20,38 @@ pub struct SegmentedRecordingResult {
     pub stopped_by_user: bool,
 }
 
+struct RecordingGuard;
+
+impl RecordingGuard {
+    fn new() -> Self {
+        recording_started();
+        Self
+    }
+}
+
+impl Drop for RecordingGuard {
+    fn drop(&mut self) {
+        recording_finished();
+    }
+}
+
 pub async fn record_segmented_stream(
     stream: ResolvedStream,
     output_dir: impl AsRef<Path>,
     stop_flag: StopFlag,
     segment_minutes: u64,
 ) -> Result<SegmentedRecordingResult, String> {
+    record_segmented_stream_with_events(stream, output_dir, stop_flag, segment_minutes, None).await
+}
+
+pub async fn record_segmented_stream_with_events(
+    stream: ResolvedStream,
+    output_dir: impl AsRef<Path>,
+    stop_flag: StopFlag,
+    segment_minutes: u64,
+    segment_tx: Option<UnboundedSender<String>>,
+) -> Result<SegmentedRecordingResult, String> {
+    let _recording_guard = RecordingGuard::new();
     let output_dir = output_dir.as_ref();
     fs::create_dir_all(output_dir)
         .await
@@ -43,8 +69,8 @@ pub async fn record_segmented_stream(
         .await
         .map_err(|error| format!("读取直播流头失败: {error}"))?;
 
-    let completed = Arc::new(Mutex::new(Vec::<String>::new()));
-    let completed_hook = Arc::clone(&completed);
+    let completed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let completed_hook = std::sync::Arc::clone(&completed);
     let template = output_dir
         .join(format!("{}_%Y-%m-%d_%H-%M-%S", safe_file_component(&stream.name)))
         .to_string_lossy()
@@ -54,48 +80,51 @@ pub async fn record_segmented_stream(
         None,
     );
 
-    let download = async move {
-        let hook = move |path: &str| {
-            if let Ok(mut files) = completed_hook.lock() {
-                if !files.iter().any(|existing| existing == path) {
+    {
+        let download = async move {
+            let hook = move |path: &str| {
+                let mut should_emit = false;
+                if let Ok(mut files) = completed_hook.lock()
+                    && !files.iter().any(|existing| existing == path)
+                {
                     files.push(path.to_string());
+                    should_emit = true;
                 }
-            }
-        };
+                if should_emit && let Some(tx) = &segment_tx {
+                    let _ = tx.send(path.to_string());
+                }
+            };
 
-        match header(&first) {
-            Ok((_remaining, _header)) => {
+            if header(&first).is_ok() {
                 let file = LifecycleFile::with_hook(&template, "flv", hook);
                 httpflv::download(connection, file, segment).await;
                 Ok::<(), String>(())
-            }
-            Err(NomErr::Incomplete(_)) | Err(NomErr::Error(_)) | Err(NomErr::Failure(_)) => {
+            } else {
                 let file = LifecycleFile::with_hook(&template, "ts", hook);
                 hls::download(&stream.stream_url, &client, file, segment)
                     .await
                     .map_err(|error| format!("HLS 录制失败: {error}"))
             }
-        }
-    };
+        };
 
-    tokio::pin!(download);
-    loop {
-        tokio::select! {
-            result = &mut download => {
-                result?;
-                break;
-            }
-            _ = sleep(Duration::from_millis(250)) => {
-                if stop_flag.load(Ordering::Acquire) {
+        tokio::pin!(download);
+        loop {
+            tokio::select! {
+                result = &mut download => {
+                    result?;
                     break;
+                }
+                _ = sleep(Duration::from_millis(250)) => {
+                    if stop_flag.load(Ordering::Acquire) {
+                        break;
+                    }
                 }
             }
         }
     }
 
-    // Dropping the downloader future drops FlvFile/TsFile; their lifecycle
-    // handler finalizes the current .part file and invokes our completion hook.
-    drop(download);
+    // The downloader future is now dropped, which finalizes the active .part
+    // through FlvFile/TsFile::drop and sends its completion event.
     tokio::task::yield_now().await;
 
     let files = completed

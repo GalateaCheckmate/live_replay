@@ -415,24 +415,33 @@ fn parse_positive_duration(value: &str) -> Option<f64> {
     (duration.is_finite() && duration > 0.0).then_some(duration)
 }
 
-fn ffprobe_program() -> PathBuf {
+fn bundled_or_path_program(name: &str) -> PathBuf {
     if let Ok(exe) = std::env::current_exe()
         && let Some(directory) = exe.parent()
     {
-        let bundled = directory.join(if cfg!(windows) {
-            "ffprobe.exe"
+        let filename = if cfg!(windows) {
+            format!("{name}.exe")
         } else {
-            "ffprobe"
-        });
+            name.to_string()
+        };
+        let bundled = directory.join(filename);
         if bundled.exists() {
             return bundled;
         }
     }
     PathBuf::from(if cfg!(windows) {
-        "ffprobe.exe"
+        format!("{name}.exe")
     } else {
-        "ffprobe"
+        name.to_string()
     })
+}
+
+fn ffmpeg_program() -> PathBuf {
+    bundled_or_path_program("ffmpeg")
+}
+
+fn ffprobe_program() -> PathBuf {
+    bundled_or_path_program("ffprobe")
 }
 
 async fn validate_media_file(path: &Path) -> AppResult<()> {
@@ -1611,7 +1620,8 @@ async fn remux_to_mp4(source: &Path) -> AppResult<PathBuf> {
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let mut command = Command::new("ffmpeg");
+    let ffmpeg = ffmpeg_program();
+    let mut command = Command::new(&ffmpeg);
     command.args(["-hide_banner", "-loglevel", "warning", "-y", "-i"]);
     command
         .arg(source)
@@ -1630,10 +1640,10 @@ async fn remux_to_mp4(source: &Path) -> AppResult<PathBuf> {
         ])
         .arg(&temporary)
         .kill_on_drop(true);
-    let status = command
-        .status()
-        .await
-        .change_context(AppError::Custom("failed to start ffmpeg remux".to_string()))?;
+    let status = command.status().await.change_context(AppError::Custom(format!(
+        "无法启动 FFmpeg（{}）；源录像已保留并等待重试",
+        ffmpeg.display()
+    )))?;
     if !status.success() {
         let _ = tokio::fs::remove_file(&temporary).await;
         return Err(

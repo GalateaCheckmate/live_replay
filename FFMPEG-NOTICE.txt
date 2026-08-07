@@ -1,0 +1,12 @@
+FFmpeg notice for Live Replay
+
+The Windows portable package includes ffmpeg.exe and ffprobe.exe from BtbN/FFmpeg-Builds.
+Live Replay uses the win64 LGPL build and invokes FFmpeg as separate executables for container remux/probing.
+
+FFmpeg project: https://ffmpeg.org/
+FFmpeg source: https://git.ffmpeg.org/ffmpeg.git
+Windows builds: https://github.com/BtbN/FFmpeg-Builds
+FFmpeg licensing information: https://ffmpeg.org/legal.html
+GNU LGPL 2.1: https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html
+
+FFmpeg and its libraries are separate third-party software and remain under their respective licenses.

@@ -1,2 +1,2 @@
-Validate live recording duration/space metrics, immediate upload test action, and ffprobe-optional portable uploads.
-Triggered: 2026-08-07T15:32:00+08:00
+Validate bundled portable ffmpeg/ffprobe resolution and package assembly.
+Triggered: 2026-08-07T16:12:00+08:00

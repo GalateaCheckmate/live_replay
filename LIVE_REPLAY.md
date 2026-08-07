@@ -52,7 +52,7 @@ submission_uncertain
 
 ## MP4 直封装
 
-录像仍采用直播源码流，不转码。上传前若文件不是 MP4，会调用 FFmpeg 使用：
+录像仍采用直播源码流，不转码。Windows Full 便携包会在 `live-replay.exe` 同目录自带 `ffmpeg.exe` 与 `ffprobe.exe`；运行时优先使用这两个内置程序，不要求用户安装 FFmpeg 或配置 PATH。上传前若文件不是 MP4，会调用 FFmpeg 使用：
 
 ```text
 -c copy

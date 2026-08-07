@@ -16,7 +16,9 @@ use crate::server::api::replay_endpoints::{
 };
 use crate::server::api::replay_state_endpoints::{
     get_replay_activity, get_replay_streamer_settings, get_replay_streamer_states,
-    set_replay_streamer_enabled, update_replay_streamer_settings,
+};
+use crate::server::api::replay_streamer_endpoints::{
+    set_replay_streamer_enabled_safe, update_replay_streamer_settings_safe,
 };
 use crate::server::infrastructure::service_register::ServiceRegister;
 use axum::Router;
@@ -40,11 +42,11 @@ pub fn router(service_register: ServiceRegister) -> Router<()> {
         )
         .route(
             "/v1/replay/streamers/{id}/enabled",
-            put(set_replay_streamer_enabled),
+            put(set_replay_streamer_enabled_safe),
         )
         .route(
             "/v1/replay/streamers/{id}/settings",
-            get(get_replay_streamer_settings).put(update_replay_streamer_settings),
+            get(get_replay_streamer_settings).put(update_replay_streamer_settings_safe),
         )
         .route(
             "/v1/replay/settings",

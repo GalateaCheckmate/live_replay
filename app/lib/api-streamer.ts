@@ -39,7 +39,6 @@ export async function put<T>(url: string, { arg }: { arg: T }) {
 }
 
 async function handleResponse(res: Response) {
-	// 如果未登录，统一跳转
 	if (res.status === 401) {
 		const returnTo = encodeURIComponent(window.location.pathname + window.location.search);
 		window.location.href = `/login?next=${returnTo}`;
@@ -55,10 +54,7 @@ async function handleResponse(res: Response) {
 
 export type ReplayUserState = 'waiting' | 'recording' | 'uploading' | 'error';
 
-/**
- * Live Replay 自己的稳定主播状态。
- * 新 UI 不再读取 Working / Pending / upload_status 等旧任务枚举。
- */
+/** Live Replay 自己的稳定主播状态。 */
 export interface ReplayStreamerState {
 	id: number;
 	name: string;
@@ -68,6 +64,26 @@ export interface ReplayStreamerState {
 	pending_upload_parts: number;
 	active_session_id?: number;
 	active_session_started_at?: string;
+	recording_elapsed_seconds?: number;
+	recording_bytes?: number;
+}
+
+/** Live Replay 自己的主播设置视图；前端不再理解 upload template / override。 */
+export interface ReplayStreamerSettings {
+	id: number;
+	url: string;
+	name: string;
+	enabled: boolean;
+	user_cookie: string;
+	title: string;
+	tid: number;
+	tags: string[];
+	copyright: number;
+	copyright_source: string;
+	description: string;
+	is_only_self: number;
+	segment_minutes: number;
+	delete_after_success: boolean;
 }
 
 type Credit = {
@@ -75,6 +91,7 @@ type Credit = {
 	uid: number;
 };
 
+// Compatibility types below are retained while old backend endpoints are migrated.
 export interface StudioEntity {
 	id: number;
 	template_name: string;

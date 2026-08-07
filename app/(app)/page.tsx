@@ -135,7 +135,8 @@ export default function Home() {
       copyright_source: String(values.copyright_source ?? '').trim(),
       description: String(values.description ?? '').trim(),
       is_only_self: Number(values.is_only_self),
-      segment_minutes: Number(values.segment_minutes),
+      // 后端仍保留该兼容字段；实际录制统一按约 15 GB 自动分段。
+      segment_minutes: 60,
       delete_after_success: values.delete_after_success !== false,
     }
 
@@ -147,7 +148,7 @@ export default function Home() {
         body: JSON.stringify(body),
       })
       if (!response.ok) throw new Error(await response.text())
-      Notification.success({ title: '添加成功', content: '已进入等待开播；开播后会自动录制并进入投稿队列。' })
+      Notification.success({ title: '主播已添加', content: '检测到开播后将自动开始录制。' })
       setVisible(false)
       formApi?.reset()
       await refreshStreamers()
@@ -169,7 +170,7 @@ export default function Home() {
       if (!response.ok) throw new Error(await response.text())
       await refreshStreamers()
     } catch (error: any) {
-      Notification.error({ title: '切换失败', content: error?.message ?? String(error) })
+      Notification.error({ title: '操作失败', content: error?.message ?? String(error) })
     } finally {
       setSwitching(previous => {
         const next = new Set(previous)
@@ -188,7 +189,7 @@ export default function Home() {
         <div style={{ minHeight: 64, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
           <div>
             <Title heading={4}>主播</Title>
-            <Text type="tertiary">持续关注开播状态；录制、分段和上传在后台自动完成</Text>
+            <Text type="tertiary">自动监控开播状态，并完成录制与投稿</Text>
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
             <Button icon={<IconRefresh />} onClick={refreshAll}>刷新</Button>
@@ -208,8 +209,8 @@ export default function Home() {
         {!isLoading && (streamers?.length ?? 0) === 0 && (
           <Card style={{ maxWidth: 720, margin: '48px auto', textAlign: 'center' }}>
             <Title heading={4}>还没有主播</Title>
-            <Text type="tertiary">添加直播间后，这里只会显示等待开播、正在录制、正在上传或异常。</Text>
-            <div style={{ marginTop: 20 }}><Button theme="solid" onClick={openAdd}>添加第一个主播</Button></div>
+            <Text type="tertiary">添加主播后，Live Replay 会自动监控开播状态。</Text>
+            <div style={{ marginTop: 20 }}><Button theme="solid" onClick={openAdd}>添加主播</Button></div>
           </Card>
         )}
 
@@ -237,14 +238,14 @@ export default function Home() {
                     <Text>已录制 {formatDuration(streamer.recording_elapsed_seconds)} · {formatBytes(streamer.recording_bytes)}</Text>
                   )}
                   {streamer.pending_upload_parts > 0 && (
-                    <Text>后台还有 {streamer.pending_upload_parts} 个分段待完成上传/确认</Text>
+                    <Text>还有 {streamer.pending_upload_parts} 个录像分段正在处理</Text>
                   )}
                   {streamer.user_state === 'error' && (
-                    <Text type="danger">有任务需要处理，进入“场次与投稿”查看原因。</Text>
+                    <Text type="danger">有任务需要处理，请在“场次与投稿”中查看详情。</Text>
                   )}
                   <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
                     <Link href="/replay"><Button size="small">场次与投稿</Button></Link>
-                    <Link href="/streamers"><Button size="small" theme="borderless">详细设置</Button></Link>
+                    <Link href="/streamers"><Button size="small" theme="borderless">主播设置</Button></Link>
                   </div>
                 </div>
               </Card>
@@ -259,7 +260,7 @@ export default function Home() {
         confirmLoading={saving}
         onOk={createStreamer}
         onCancel={() => setVisible(false)}
-        okText="开始持续关注"
+        okText="添加主播"
         style={{ width: 680 }}
       >
         <Form
@@ -270,7 +271,6 @@ export default function Home() {
             copyright: 2,
             is_only_self: 1,
             description: '',
-            segment_minutes: 60,
             delete_after_success: true,
           }}
         >
@@ -281,7 +281,7 @@ export default function Home() {
             onChange={(value: any) => formApi?.setValue('copyright_source', String(value ?? ''))}
             rules={[{ required: true, message: '请填写直播间链接' }]}
           />
-          <Form.Input field="remark" label="主播名称" placeholder="例如：小天才" rules={[{ required: true, message: '请填写主播名称' }]} />
+          <Form.Input field="remark" label="主播名称" placeholder="填写便于识别的主播名称" rules={[{ required: true, message: '请填写主播名称' }]} />
           <Form.Select
             field="user_cookie"
             label="投稿账号"
@@ -296,7 +296,7 @@ export default function Home() {
 
           <Card style={{ margin: '12px 0' }}>
             <Text strong>投稿设置</Text><br />
-            <Text type="tertiary">一场直播对应一个投稿，分段会按顺序追加为分P。</Text>
+            <Text type="tertiary">每场直播作为一个投稿；录像达到约 15 GB 时自动分段，并按顺序追加为分P。</Text>
           </Card>
 
           <Form.Input field="title" label="视频标题" rules={[{ required: true, message: '请填写视频标题格式' }]} />
@@ -310,7 +310,7 @@ export default function Home() {
             style={{ width: '100%' }}
           />
           {deltaForceTid === undefined && !typeTreeLoading && (
-            <Text type="warning">当前账号没有匹配到默认“三角洲行动”，请手动选择分区。</Text>
+            <Text type="warning">未找到默认的“三角洲行动”分区，请手动选择。</Text>
           )}
           <Form.Input field="tags_text" label="视频标签" placeholder="多个标签用逗号分隔，例如：游戏,直播回放" />
           <Form.Select
@@ -325,10 +325,9 @@ export default function Home() {
             optionList={[{ label: '转载', value: 2 }, { label: '自制', value: 1 }]}
             style={{ width: '100%' }}
           />
-          <Form.Input field="copyright_source" label="转载来源" placeholder="默认使用当前直播间链接；自制投稿时忽略" />
-          <Form.TextArea field="description" label="简介" placeholder="默认留空" autosize={{ minRows: 2, maxRows: 5 }} />
-          <Form.InputNumber field="segment_minutes" label="单段时长（分钟）" min={1} max={1440} style={{ width: '100%' }} />
-          <Form.Switch field="delete_after_success" label="B站确认可播放后删除本地录像" />
+          <Form.Input field="copyright_source" label="转载来源" placeholder="默认使用当前直播间链接；自制投稿时无需填写" />
+          <Form.TextArea field="description" label="简介" placeholder="可选" autosize={{ minRows: 2, maxRows: 5 }} />
+          <Form.Switch field="delete_after_success" label="投稿确认可播放后自动删除本地录像" />
         </Form>
       </Modal>
     </>

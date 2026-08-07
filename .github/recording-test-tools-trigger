@@ -1,2 +1,2 @@
-Apply runtime recording duration/space metrics, immediate upload test action, and bundled ffprobe.
-Triggered: 2026-08-07T15:05:00+08:00
+Apply runtime recording duration/space metrics and immediate upload test action. Full workflow packaging is committed separately.
+Triggered: 2026-08-07T15:18:00+08:00

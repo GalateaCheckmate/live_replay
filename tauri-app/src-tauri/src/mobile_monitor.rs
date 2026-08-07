@@ -1,4 +1,4 @@
-use live_replay_core::CoreCredentials;
+use live_replay_core::{CoreCredentials, ProbeResult, prime_resolved_stream, probe_stream};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 use tauri::Manager;
 use tokio::fs;
 use tokio::sync::Mutex;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 static TARGET_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -116,11 +116,11 @@ pub async fn mobile_monitor_add(
     let url = url.trim().to_string();
     validate_url(&url)?;
     let display_name = name.unwrap_or_default().trim().to_string();
-    mutate_store(&app, |store| {
+    let target = mutate_store(&app, |store| {
         if store.targets.iter().any(|target| target.url == url) {
             return Err("这个直播间已经在监控列表里。".to_string());
         }
-        store.targets.push(MonitorTarget {
+        let target = MonitorTarget {
             id: new_id(),
             url,
             name: if display_name.is_empty() {
@@ -129,13 +129,19 @@ pub async fn mobile_monitor_add(
                 display_name
             },
             enabled: true,
-            last_state: "等待检测".to_string(),
+            last_state: "正在检测".to_string(),
             last_error: None,
             last_checked_at: None,
-        });
-        Ok(store.clone())
+        };
+        store.targets.push(target.clone());
+        Ok(target)
     })
-    .await
+    .await?;
+
+    // Do not wait for the 20-second background loop. Adding a live target is an explicit user
+    // action, so run exactly one probe now and start recording immediately when it is live.
+    monitor_target_once(&app, &target).await?;
+    mobile_monitor_status(app).await
 }
 
 #[tauri::command]
@@ -160,18 +166,23 @@ pub async fn mobile_monitor_set_enabled(
     target_id: String,
     enabled: bool,
 ) -> Result<MonitorStore, String> {
-    mutate_store(&app, |store| {
+    let target = mutate_store(&app, |store| {
         let target = store
             .targets
             .iter_mut()
             .find(|target| target.id == target_id)
             .ok_or_else(|| "监控任务不存在。".to_string())?;
         target.enabled = enabled;
-        target.last_state = if enabled { "等待检测" } else { "已暂停" }.to_string();
+        target.last_state = if enabled { "正在检测" } else { "已暂停" }.to_string();
         target.last_error = None;
-        Ok(store.clone())
+        Ok(target.clone())
     })
-    .await
+    .await?;
+
+    if enabled {
+        monitor_target_once(&app, &target).await?;
+    }
+    mobile_monitor_status(app).await
 }
 
 async fn update_target_state(
@@ -197,39 +208,50 @@ async fn enabled_targets(app: &tauri::AppHandle) -> Result<Vec<MonitorTarget>, S
     Ok(store.targets.into_iter().filter(|target| target.enabled).collect())
 }
 
+async fn monitor_target_once(app: &tauri::AppHandle, target: &MonitorTarget) -> Result<(), String> {
+    if super::mobile_recordings::is_recording(&target.url)? {
+        return update_target_state(app, &target.id, "正在录制", None).await;
+    }
+
+    update_target_state(app, &target.id, "正在检测", None).await?;
+    let credentials = CoreCredentials::default();
+    match probe_stream(&target.url, &target.name, credentials.clone()).await {
+        Ok(ProbeResult::Offline) => {
+            update_target_state(app, &target.id, "等待开播", None).await
+        }
+        Ok(ProbeResult::Live { stream }) => {
+            // start_recording currently crosses two probe call-sites (its guard and the recorder
+            // startup). Prime both with this exact ResolvedStream so neither call hits the platform
+            // again. The cache expires quickly and is consumed, so reconnects still resolve fresh.
+            prime_resolved_stream(&target.url, stream, 2);
+            match super::mobile_recordings::start_recording(
+                app.clone(),
+                target.url.clone(),
+                target.name.clone(),
+                credentials,
+            )
+            .await
+            {
+                Ok(_) => update_target_state(app, &target.id, "正在录制", None).await,
+                Err(error) => {
+                    update_target_state(app, &target.id, "启动录制失败", Some(error)).await
+                }
+            }
+        }
+        Err(error) => update_target_state(app, &target.id, "检测失败", Some(error)).await,
+    }
+}
+
 async fn monitor_tick(app: &tauri::AppHandle) -> Result<(), String> {
     for target in enabled_targets(app).await? {
-        if super::mobile_recordings::is_recording(&target.url)? {
-            update_target_state(app, &target.id, "正在录制", None).await?;
-            continue;
-        }
-
-        update_target_state(app, &target.id, "正在检测", None).await?;
-        match super::mobile_recordings::start_recording(
-            app.clone(),
-            target.url.clone(),
-            target.name.clone(),
-            CoreCredentials::default(),
-        )
-        .await
-        {
-            Ok(_) => {
-                update_target_state(app, &target.id, "正在录制", None).await?;
-            }
-            Err(error) if error.contains("主播当前未开播") => {
-                update_target_state(app, &target.id, "等待开播", None).await?;
-            }
-            Err(error) => {
-                update_target_state(app, &target.id, "检测或启动失败", Some(error)).await?;
-            }
-        }
+        monitor_target_once(app, &target).await?;
     }
     Ok(())
 }
 
 pub fn start_monitor_worker(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
-        sleep(Duration::from_secs(3)).await;
+        // First pass runs immediately. The 20-second interval only applies after a completed pass.
         loop {
             if let Err(error) = monitor_tick(&app).await {
                 eprintln!("[monitor] worker error: {error}");

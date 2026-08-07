@@ -114,8 +114,16 @@ pub struct BilibiliUploadConfig {
     pub enabled: bool,
     pub login_info_json: Option<String>,
     pub visibility_public: bool,
+    #[serde(default = "default_bilibili_tid")]
+    pub tid: u16,
     pub tag: String,
     pub description_template: String,
+}
+
+fn default_bilibili_tid() -> u16 {
+    // Kept configurable in the UI/core because Bilibili partition IDs can change.
+    // 65 is the traditional online-game partition and is only a fallback.
+    65
 }
 
 impl Default for BilibiliUploadConfig {
@@ -124,6 +132,7 @@ impl Default for BilibiliUploadConfig {
             enabled: false,
             login_info_json: None,
             visibility_public: true,
+            tid: default_bilibili_tid(),
             tag: "直播回放".to_string(),
             description_template: "{streamer} 直播回放\n直播时间：{time}".to_string(),
         }
@@ -162,6 +171,20 @@ impl PersistentState {
             }
         }
         self.upload_queue.retain(|job| job.state != UploadState::Uploaded);
+
+        let missing_jobs = self
+            .segments
+            .iter()
+            .filter(|segment| {
+                segment.state == SegmentState::Ready
+                    && !segment.remote_confirmed
+                    && !self.upload_queue.iter().any(|job| job.segment_id == segment.id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for segment in missing_jobs {
+            self.enqueue_segment_job(&segment);
+        }
     }
 
     pub fn active_session_for_streamer(&mut self, streamer_id: &str) -> Option<&mut ReplaySession> {
@@ -175,6 +198,21 @@ impl PersistentState {
     }
 
     pub fn enqueue_segment(&mut self, segment: SegmentRecord) {
+        if segment.remote_confirmed
+            || self
+                .segments
+                .iter()
+                .any(|existing| existing.id == segment.id || existing.file_path == segment.file_path)
+        {
+            return;
+        }
+        if self.settings.auto_upload && self.bilibili.enabled {
+            self.enqueue_segment_job(&segment);
+        }
+        self.segments.push(segment);
+    }
+
+    pub fn enqueue_segment_job(&mut self, segment: &SegmentRecord) {
         if segment.remote_confirmed
             || self
                 .upload_queue
@@ -195,7 +233,6 @@ impl PersistentState {
             last_error: None,
             created_at: Utc::now().timestamp(),
         });
-        self.segments.push(segment);
     }
 }
 

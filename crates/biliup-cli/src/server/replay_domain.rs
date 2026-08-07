@@ -20,19 +20,19 @@ pub struct ReplayActivity {
     pub needs_attention: bool,
 }
 
-/// 将录制活动和持久化上传队列压缩成稳定的四态模型。
+/// 将当前录制活动和持久化上传队列压缩成稳定的四态模型。
 /// 优先级：需要人工处理 > 正在录制 > 有待处理分段 > 等待开播。
 ///
-/// 这里故意只接收 `is_recording`，不接收 WorkerStatus/DownloaderType 等底层枚举，
-/// 保证 Live Replay 领域模型可以独立于当前 biliup 实现存在。
+/// 这里不接收或公开 WorkerStatus 类型本身；具体 worker 实现只在 API adapter 内
+/// 被压缩成是否处于 Working，再传给领域状态映射。
 pub fn user_state(
     enabled: bool,
-    is_recording: bool,
+    worker_status: &str,
     activity: ReplayActivity,
 ) -> ReplayUserState {
     if activity.needs_attention {
         ReplayUserState::Error
-    } else if enabled && is_recording {
+    } else if enabled && worker_status == "Working" {
         ReplayUserState::Recording
     } else if activity.pending_upload_parts > 0 {
         ReplayUserState::Uploading
@@ -51,12 +51,12 @@ mod tests {
             pending_upload_parts: 2,
             needs_attention: false,
         };
-        assert_eq!(user_state(true, true, pending), ReplayUserState::Recording);
-        assert_eq!(user_state(true, false, pending), ReplayUserState::Uploading);
+        assert_eq!(user_state(true, "Working", pending), ReplayUserState::Recording);
+        assert_eq!(user_state(true, "Idle", pending), ReplayUserState::Uploading);
         assert_eq!(
             user_state(
                 true,
-                true,
+                "Working",
                 ReplayActivity {
                     pending_upload_parts: 1,
                     needs_attention: true,
@@ -65,7 +65,7 @@ mod tests {
             ReplayUserState::Error
         );
         assert_eq!(
-            user_state(false, false, ReplayActivity::default()),
+            user_state(false, "Pause", ReplayActivity::default()),
             ReplayUserState::Waiting
         );
     }

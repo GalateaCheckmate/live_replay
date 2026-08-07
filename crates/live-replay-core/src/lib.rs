@@ -1,3 +1,4 @@
+pub mod bilibili;
 pub mod recording;
 pub mod youtube;
 

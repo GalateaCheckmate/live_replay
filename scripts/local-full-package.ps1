@@ -6,14 +6,33 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location $RepoRoot
 
-function Test-Executable([string]$Path, [string[]]$Args) {
+function Test-Executable {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [string[]]$Arguments = @()
+    )
+
     if (-not (Test-Path $Path)) {
         return $false
     }
+
     try {
-        & $Path @Args *> $null
-        return $LASTEXITCODE -eq 0
+        $output = & $Path @Arguments 2>&1
+        $exitCode = $LASTEXITCODE
+        if ($exitCode -eq 0) {
+            return $true
+        }
+
+        Write-Host "[TOOL] $Path exited with code $exitCode." -ForegroundColor Yellow
+        if ($output) {
+            $output | Select-Object -First 6 | ForEach-Object {
+                Write-Host "       $_" -ForegroundColor Yellow
+            }
+        }
+        return $false
     } catch {
+        Write-Host "[TOOL] Failed to run $Path : $($_.Exception.Message)" -ForegroundColor Yellow
         return $false
     }
 }

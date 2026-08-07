@@ -225,6 +225,9 @@ async fn start_recording_inner(
         );
         state.last_error = None;
     }
+    if let Err(error) = super::mobile_monitor::sync_background_active(&app).await {
+        set_last_error(format!("录像已启动，但更新 Android 后台保活状态失败: {error}"));
+    }
 
     let worker_app = app.clone();
     let worker_url = url.clone();
@@ -352,6 +355,9 @@ async fn start_recording_inner(
 
         if let Ok(mut state) = runtime().lock() {
             state.recordings.remove(&worker_url);
+        }
+        if let Err(error) = super::mobile_monitor::sync_background_active(&worker_app).await {
+            eprintln!("[recording] failed to refresh Android background activity state: {error}");
         }
     });
 

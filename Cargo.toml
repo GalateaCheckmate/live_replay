@@ -4,6 +4,7 @@ members = [
     "crates/biliup-cli",
     "crates/stream-gears",
     "crates/danmaku",
+    "crates/live-replay-core",
 ]
 resolver = "3"
 

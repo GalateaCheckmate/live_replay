@@ -237,34 +237,65 @@ pub async fn heartbeat(app: &tauri::AppHandle, room_url: &str) -> Result<(), Str
     .await
 }
 
+fn register_segment_in_store(
+    store: &mut RecordingJournalStore,
+    room_url: &str,
+    segment: &RecordingSegment,
+    heartbeat_override: Option<i64>,
+) {
+    if !store.pending_segments.iter().any(|item| {
+        item.live_session_id == segment.live_session_id
+            && item.segment_index == segment.segment_index
+    }) {
+        store.pending_segments.push(segment.clone());
+        store.pending_segments.sort_by(|a, b| {
+            a.live_session_id
+                .cmp(&b.live_session_id)
+                .then(a.segment_index.cmp(&b.segment_index))
+        });
+    }
+    if let Some(session) = store
+        .sessions
+        .iter_mut()
+        .find(|item| item.room_url == room_url)
+    {
+        session.next_segment_index = session
+            .next_segment_index
+            .max(segment.segment_index.saturating_add(1));
+        session.current_segment_started_at = segment.ended_at;
+        session.last_heartbeat_at =
+            heartbeat_override.unwrap_or_else(|| chrono::Utc::now().timestamp());
+    }
+}
+
 pub async fn register_completed_segment(
     app: &tauri::AppHandle,
     room_url: &str,
     segment: &RecordingSegment,
 ) -> Result<(), String> {
     mutate_store(app, |store| {
-        if !store.pending_segments.iter().any(|item| {
-            item.live_session_id == segment.live_session_id
-                && item.segment_index == segment.segment_index
-        }) {
-            store.pending_segments.push(segment.clone());
-            store.pending_segments.sort_by(|a, b| {
-                a.live_session_id
-                    .cmp(&b.live_session_id)
-                    .then(a.segment_index.cmp(&b.segment_index))
-            });
-        }
-        if let Some(session) = store
-            .sessions
-            .iter_mut()
-            .find(|item| item.room_url == room_url)
-        {
-            session.next_segment_index = session
-                .next_segment_index
-                .max(segment.segment_index.saturating_add(1));
-            session.current_segment_started_at = segment.ended_at;
-            session.last_heartbeat_at = chrono::Utc::now().timestamp();
-        }
+        register_segment_in_store(store, room_url, segment, None);
+        Ok(())
+    })
+    .await
+}
+
+/// Startup recovery must advance P numbering without pretending the recorder was alive during the
+/// downtime. Preserving the pre-crash heartbeat lets `close_stale_sessions` correctly decide
+/// whether the old liveSession has exceeded the offline grace period.
+pub async fn register_recovered_segment(
+    app: &tauri::AppHandle,
+    room_url: &str,
+    segment: &RecordingSegment,
+    preserved_heartbeat_at: i64,
+) -> Result<(), String> {
+    mutate_store(app, |store| {
+        register_segment_in_store(
+            store,
+            room_url,
+            segment,
+            Some(preserved_heartbeat_at),
+        );
         Ok(())
     })
     .await

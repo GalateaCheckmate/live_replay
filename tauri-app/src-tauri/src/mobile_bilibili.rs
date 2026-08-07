@@ -123,7 +123,7 @@ async fn save_store(path: &Path, store: &BilibiliStore) -> Result<(), String> {
         .map_err(|error| format!("提交 B站状态失败: {error}"))
 }
 
-async fn mutate_store<F, T>(app: &tauri::AppHandle, mutate: F) -> Result<T, String>
+pub(crate) async fn mutate_store<F, T>(app: &tauri::AppHandle, mutate: F) -> Result<T, String>
 where
     F: FnOnce(&mut BilibiliStore) -> Result<T, String>,
 {
@@ -133,6 +133,11 @@ where
     let result = mutate(&mut store)?;
     save_store(&path, &store).await?;
     Ok(result)
+}
+
+pub(crate) async fn snapshot(app: &tauri::AppHandle) -> Result<BilibiliStore, String> {
+    let _guard = gate().lock().await;
+    read_store(&store_path(app)?).await
 }
 
 pub async fn enqueue_finalized_segment(
@@ -219,8 +224,7 @@ pub async fn mark_session_recording_complete(
 
 #[tauri::command]
 pub async fn mobile_bilibili_status(app: tauri::AppHandle) -> Result<BilibiliStore, String> {
-    let _guard = gate().lock().await;
-    read_store(&store_path(&app)?).await
+    snapshot(&app).await
 }
 
 #[tauri::command]

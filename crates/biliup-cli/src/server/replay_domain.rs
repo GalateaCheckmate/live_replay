@@ -25,11 +25,7 @@ pub struct ReplayActivity {
 ///
 /// 这里不接收或公开 WorkerStatus 类型本身；具体 worker 实现只在 API adapter 内
 /// 被压缩成是否处于 Working，再传给领域状态映射。
-pub fn user_state(
-    enabled: bool,
-    worker_status: &str,
-    activity: ReplayActivity,
-) -> ReplayUserState {
+pub fn user_state(enabled: bool, worker_status: &str, activity: ReplayActivity) -> ReplayUserState {
     if activity.needs_attention {
         ReplayUserState::Error
     } else if enabled && worker_status == "Working" {
@@ -51,8 +47,14 @@ mod tests {
             pending_upload_parts: 2,
             needs_attention: false,
         };
-        assert_eq!(user_state(true, "Working", pending), ReplayUserState::Recording);
-        assert_eq!(user_state(true, "Idle", pending), ReplayUserState::Uploading);
+        assert_eq!(
+            user_state(true, "Working", pending),
+            ReplayUserState::Recording
+        );
+        assert_eq!(
+            user_state(true, "Idle", pending),
+            ReplayUserState::Uploading
+        );
         assert_eq!(
             user_state(
                 true,

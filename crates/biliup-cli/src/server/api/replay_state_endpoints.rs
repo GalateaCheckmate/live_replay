@@ -182,9 +182,7 @@ pub async fn get_replay_streamer_states(
             enabled,
             user_state: state,
             pending_upload_parts,
-            active_session_id: row
-                .try_get("active_session_id")
-                .map_err(internal_error)?,
+            active_session_id: row.try_get("active_session_id").map_err(internal_error)?,
             active_session_started_at: row
                 .try_get("active_session_started_at")
                 .map_err(internal_error)?,
@@ -260,9 +258,7 @@ pub async fn update_replay_streamer_settings(
     let Some(row) = row else {
         return Err((axum::http::StatusCode::NOT_FOUND, "主播不存在").into_response());
     };
-    let upload_id: Option<i64> = row
-        .try_get("upload_streamers_id")
-        .map_err(internal_error)?;
+    let upload_id: Option<i64> = row.try_get("upload_streamers_id").map_err(internal_error)?;
     let Some(upload_id) = upload_id else {
         return Err((
             axum::http::StatusCode::CONFLICT,
@@ -391,7 +387,9 @@ pub async fn set_replay_streamer_enabled(
 
     if payload.enabled {
         if let Some(worker) = managers.get_room_by_id(id).await {
-            worker.change_status(Stage::Download, WorkerStatus::Idle).await;
+            worker
+                .change_status(Stage::Download, WorkerStatus::Idle)
+                .await;
             managers.wake_waker(id).await;
         } else {
             let streamer = get_all_streamer(&pool)
@@ -399,9 +397,7 @@ pub async fn set_replay_streamer_enabled(
                 .map_err(report_to_response)?
                 .into_iter()
                 .find(|streamer| streamer.id == id)
-                .ok_or_else(|| {
-                    (axum::http::StatusCode::NOT_FOUND, "主播不存在").into_response()
-                })?;
+                .ok_or_else(|| (axum::http::StatusCode::NOT_FOUND, "主播不存在").into_response())?;
             let upload_config = get_upload_config(&pool, id)
                 .await
                 .map_err(report_to_response)?;
@@ -409,16 +405,14 @@ pub async fn set_replay_streamer_enabled(
                 .add_room(service_register.worker(streamer, upload_config))
                 .await
                 .ok_or_else(|| {
-                    (
-                        axum::http::StatusCode::BAD_REQUEST,
-                        "不支持这个直播间链接",
-                    )
-                        .into_response()
+                    (axum::http::StatusCode::BAD_REQUEST, "不支持这个直播间链接").into_response()
                 })?;
         }
     } else if let Some(worker) = managers.get_room_by_id(id).await {
         // Worker::change_status 会先安全停止当前 DownloadTask，再进入 Pause。
-        worker.change_status(Stage::Download, WorkerStatus::Pause).await;
+        worker
+            .change_status(Stage::Download, WorkerStatus::Pause)
+            .await;
         managers.make_waker(id).await;
     }
 
@@ -510,10 +504,9 @@ pub async fn get_replay_activity(
         let segment_status: String = row.try_get("segment_status").map_err(internal_error)?;
         let job_status: String = row.try_get("job_status").map_err(internal_error)?;
         let completed = job_status == "complete";
-        let needs_attention = matches!(
-            segment_status.as_str(),
-            "conflict" | "submission_uncertain"
-        ) || matches!(job_status.as_str(), "conflict" | "submission_uncertain");
+        let needs_attention =
+            matches!(segment_status.as_str(), "conflict" | "submission_uncertain")
+                || matches!(job_status.as_str(), "conflict" | "submission_uncertain");
 
         segments.push(ReplaySegmentSummary {
             job_id: row.try_get("job_id").map_err(internal_error)?,
@@ -666,7 +659,12 @@ fn parse_json_object(raw: Option<&str>) -> Value {
 fn segment_minutes_from_override(raw: Option<&str>) -> u64 {
     let Some(value) = raw
         .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-        .and_then(|value| value.get("segment_time").and_then(Value::as_str).map(str::to_string))
+        .and_then(|value| {
+            value
+                .get("segment_time")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
     else {
         return 60;
     };

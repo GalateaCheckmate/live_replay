@@ -83,10 +83,7 @@ impl StreamGears {
                 httpflv::download(connection, file, segment.clone()).await;
             }
             Err(Err::Incomplete(needed)) => {
-                return Err(AppError::Custom(format!(
-                    "直播流头部数据不完整：{needed:?}"
-                ))
-                .into());
+                return Err(AppError::Custom(format!("直播流头部数据不完整：{needed:?}")).into());
             }
             Err(e) => {
                 error!("{e}");

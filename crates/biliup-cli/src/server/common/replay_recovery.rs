@@ -110,6 +110,13 @@ pub async fn recover_pending_sessions(
     if outbox_count > 0 {
         info!(outbox_count, "restored filesystem replay outbox records");
     }
+    let cleaned_credentials = replay::cleanup_completed_credentials(&pool).await?;
+    if cleaned_credentials > 0 {
+        info!(
+            cleaned_credentials,
+            "cleaned completed replay credential snapshots"
+        );
+    }
 
     let rows = sqlx::query(
         "SELECT s.id, s.live_streamer_id, s.source_streamer_info_id, s.streamer_name, \

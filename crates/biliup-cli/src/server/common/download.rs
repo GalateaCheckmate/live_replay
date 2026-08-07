@@ -352,24 +352,23 @@ pub async fn start_download_workflow(
         );
         return;
     }
-    let enabled = match sqlx::query_scalar::<_, i64>(
-        "SELECT enabled FROM livestreamers WHERE id = ?",
-    )
-    .bind(ctx.worker_id())
-    .fetch_optional(ctx.pool())
-    .await
-    {
-        Ok(Some(value)) => value != 0,
-        Ok(None) => false,
-        Err(error) => {
-            error!(
-                error = ?error,
-                url = ctx.live_streamer().url,
-                "failed to re-check streamer enabled state before recording"
-            );
-            false
-        }
-    };
+    let enabled =
+        match sqlx::query_scalar::<_, i64>("SELECT enabled FROM livestreamers WHERE id = ?")
+            .bind(ctx.worker_id())
+            .fetch_optional(ctx.pool())
+            .await
+        {
+            Ok(Some(value)) => value != 0,
+            Ok(None) => false,
+            Err(error) => {
+                error!(
+                    error = ?error,
+                    url = ctx.live_streamer().url,
+                    "failed to re-check streamer enabled state before recording"
+                );
+                false
+            }
+        };
     if !enabled {
         info!(
             url = ctx.live_streamer().url,

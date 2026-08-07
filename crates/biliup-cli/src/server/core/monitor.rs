@@ -153,7 +153,8 @@ impl Monitor {
             }
             let Some(download_permit) = self.try_acquire_download_slot(&room).await else {
                 self.wake_waker(room.id()).await;
-                self.wait_between_checks(Duration::from_secs(interval)).await;
+                self.wait_between_checks(Duration::from_secs(interval))
+                    .await;
                 continue;
             };
             let request = live_request(&room);
@@ -203,7 +204,8 @@ impl Monitor {
                 }
             };
             // 等待下一次检查；手动刷新时会被立即唤醒并临时跳过等待。
-            self.wait_between_checks(Duration::from_secs(interval)).await;
+            self.wait_between_checks(Duration::from_secs(interval))
+                .await;
         }
         info!("exit -> [{platform_name}]")
     }

@@ -37,15 +37,14 @@ pub async fn update_replay_streamer_settings_safe(
             .into_response());
     }
 
-    let was_enabled = sqlx::query_scalar::<_, i64>(
-        "SELECT enabled FROM livestreamers WHERE id = ?",
-    )
-    .bind(id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(db_error)?
-    .ok_or_else(|| (axum::http::StatusCode::NOT_FOUND, "主播不存在").into_response())?
-        != 0;
+    let was_enabled =
+        sqlx::query_scalar::<_, i64>("SELECT enabled FROM livestreamers WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| (axum::http::StatusCode::NOT_FOUND, "主播不存在").into_response())?
+            != 0;
 
     if was_enabled {
         set_replay_streamer_enabled(

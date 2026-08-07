@@ -196,6 +196,14 @@ const ReplaySettings: React.FC = () => {
             </Card>
 
             <Card title="后台上传" style={{ marginBottom: 16 }}>
+              <Form.InputNumber
+                field="pool2_size"
+                label="最大同时上传文件数"
+                min={1}
+                max={16}
+                style={{ width: '100%' }}
+                extraText="控制同时上传的录像文件数量。修改后立即生效，不会中断正在上传的文件。"
+              />
               <Form.Select
                 field="lines"
                 label="B站上传线路"

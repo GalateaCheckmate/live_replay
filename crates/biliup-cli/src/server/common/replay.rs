@@ -18,11 +18,12 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::sync::{Mutex, Notify};
 use tracing::{error, info, warn};
 
 const VERIFY_ATTEMPTS: usize = 180;
@@ -94,9 +95,34 @@ fn notifiers() -> &'static Mutex<HashMap<i64, Arc<Notify>>> {
     NOTIFIERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn upload_slots() -> &'static Semaphore {
-    static SLOTS: OnceLock<Semaphore> = OnceLock::new();
-    SLOTS.get_or_init(|| Semaphore::new(1))
+static ACTIVE_UPLOADS: AtomicUsize = AtomicUsize::new(0);
+
+struct UploadSlotPermit;
+
+impl Drop for UploadSlotPermit {
+    fn drop(&mut self) {
+        ACTIVE_UPLOADS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+async fn acquire_upload_slot(ctx: &Context) -> UploadSlotPermit {
+    loop {
+        let limit = ctx.config().pool2_size.max(1) as usize;
+        let active = ACTIVE_UPLOADS.load(Ordering::Acquire);
+        if active < limit
+            && ACTIVE_UPLOADS
+                .compare_exchange_weak(
+                    active,
+                    active.saturating_add(1),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        {
+            return UploadSlotPermit;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn session_notify(session_id: i64) -> Arc<Notify> {
@@ -266,7 +292,7 @@ async fn process_segment(
             .first()
             .cloned()
             .ok_or_else(|| AppError::Custom("segment has no upload path".to_string()))?;
-        let video = upload_single_file(&upload_path, &runtime).await?;
+        let video = upload_single_file(&upload_path, &runtime, ctx).await?;
         save_uploaded_file(ctx.pool(), current.id, &upload_path, &video.filename).await?;
         current = load_segment(ctx.pool(), current.id).await?;
         video.filename
@@ -784,11 +810,12 @@ async fn get_upload_line(client: &reqwest::Client, selected: &str) -> Line {
     }
 }
 
-async fn upload_single_file(file_path: &Path, runtime: &UploadRuntime) -> AppResult<Video> {
-    let _permit = upload_slots()
-        .acquire()
-        .await
-        .change_context(AppError::Custom("upload semaphore closed".to_string()))?;
+async fn upload_single_file(
+    file_path: &Path,
+    runtime: &UploadRuntime,
+    ctx: &Context,
+) -> AppResult<Video> {
+    let _permit = acquire_upload_slot(ctx).await;
     let video_file = VideoFile::new(file_path).change_context(AppError::Unknown)?;
     let total_size = video_file.total_size;
     let file_name = video_file.file_name.clone();
@@ -940,6 +967,40 @@ async fn ensure_session(
     Ok((session, frozen_upload_config))
 }
 
+fn credential_snapshot_path(session_key: &str) -> Option<PathBuf> {
+    if session_key.is_empty()
+        || session_key.len() > 200
+        || !session_key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+    {
+        return None;
+    }
+    Some(Path::new(CREDENTIAL_DIR).join(format!("{session_key}.json")))
+}
+
+async fn remove_credential_snapshot(session_key: &str) -> bool {
+    let Some(target) = credential_snapshot_path(session_key) else {
+        warn!(
+            session_key,
+            "refusing invalid replay credential snapshot path"
+        );
+        return false;
+    };
+    let temporary = target.with_extension("json.part");
+    let mut removed = false;
+    for path in [&target, &temporary] {
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                warn!(file = %path.display(), error = ?error, "failed to remove replay credential snapshot")
+            }
+        }
+    }
+    removed
+}
+
 async fn freeze_upload_config(
     upload_config: &UploadStreamer,
     session_key: &str,
@@ -954,7 +1015,9 @@ async fn freeze_upload_config(
         tokio::fs::create_dir_all(CREDENTIAL_DIR)
             .await
             .change_context(AppError::Unknown)?;
-        let target = Path::new(CREDENTIAL_DIR).join(format!("{session_key}.json"));
+        let target = credential_snapshot_path(session_key).ok_or_else(|| {
+            AppError::Custom("invalid Live Replay session key for credential snapshot".to_string())
+        })?;
         let temporary = target.with_extension("json.part");
         let _ = tokio::fs::remove_file(&temporary).await;
         tokio::fs::copy(source_path, &temporary)
@@ -1640,10 +1703,13 @@ async fn remux_to_mp4(source: &Path) -> AppResult<PathBuf> {
         ])
         .arg(&temporary)
         .kill_on_drop(true);
-    let status = command.status().await.change_context(AppError::Custom(format!(
-        "无法启动 FFmpeg（{}）；源录像已保留并等待重试",
-        ffmpeg.display()
-    )))?;
+    let status = command
+        .status()
+        .await
+        .change_context(AppError::Custom(format!(
+            "无法启动 FFmpeg（{}）；源录像已保留并等待重试",
+            ffmpeg.display()
+        )))?;
     if !status.success() {
         let _ = tokio::fs::remove_file(&temporary).await;
         return Err(
@@ -2152,6 +2218,37 @@ async fn session_can_finish(pool: &ConnectionPool, session_id: i64) -> AppResult
     Ok(matches!(status.as_str(), "recording_complete" | "complete") && pending == 0)
 }
 
+pub async fn cleanup_completed_credentials(pool: &ConnectionPool) -> AppResult<usize> {
+    let reconnect_window = env_u64("LIVE_REPLAY_RECONNECT_WINDOW_SECONDS", 600);
+    let modifier = format!("-{reconnect_window} seconds");
+    let rows = sqlx::query(
+        "SELECT id, session_key FROM live_sessions \
+         WHERE status = 'complete' AND ended_at IS NOT NULL AND session_key IS NOT NULL \
+           AND datetime(ended_at) <= datetime('now', ?) \
+           AND NOT EXISTS (SELECT 1 FROM recording_segments r WHERE r.session_id = live_sessions.id \
+                           AND r.status NOT IN ('deleted', 'retained'))",
+    )
+    .bind(&modifier)
+    .fetch_all(pool)
+    .await
+    .change_context(AppError::Unknown)?;
+
+    let mut removed = 0usize;
+    for row in rows {
+        let session_id: i64 = row.try_get("id").change_context(AppError::Unknown)?;
+        let session_key: String = row
+            .try_get("session_key")
+            .change_context(AppError::Unknown)?;
+        if filesystem_outbox_max_part(session_id).await > 0 {
+            continue;
+        }
+        if remove_credential_snapshot(&session_key).await {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 async fn mark_session_complete(pool: &ConnectionPool, session_id: i64) -> AppResult<()> {
     sqlx::query(
         "UPDATE live_sessions SET status = 'complete', last_error = NULL, \
@@ -2161,6 +2258,19 @@ async fn mark_session_complete(pool: &ConnectionPool, session_id: i64) -> AppRes
     .execute(pool)
     .await
     .change_context(AppError::Unknown)?;
+
+    let cleanup_pool = pool.clone();
+    let delay = env_u64("LIVE_REPLAY_RECONNECT_WINDOW_SECONDS", 600).saturating_add(5);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(delay)).await;
+        match cleanup_completed_credentials(&cleanup_pool).await {
+            Ok(removed) if removed > 0 => {
+                info!(removed, "cleaned completed replay credential snapshots")
+            }
+            Ok(_) => {}
+            Err(error) => warn!(error = ?error, "delayed replay credential cleanup failed"),
+        }
+    });
     Ok(())
 }
 

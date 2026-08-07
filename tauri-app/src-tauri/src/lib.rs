@@ -16,6 +16,8 @@ use tauri_plugin_shell::ShellExt;
 #[cfg(mobile)]
 mod mobile_bilibili;
 #[cfg(mobile)]
+mod mobile_bilibili_auth;
+#[cfg(mobile)]
 mod mobile_monitor;
 #[cfg(mobile)]
 mod mobile_recordings;
@@ -61,7 +63,7 @@ fn spawn_and_monitor_sidecar(app_handle: tauri::AppHandle) -> Result<(), String>
 
     if let Some(state) = app_handle.try_state::<Arc<Mutex<Option<CommandChild>>>>() {
         println!("[tauri] Sidecar pid: {}", child.pid());
-        *state.lock().map_err(|_| "Failed to lock sidecar state")? = Some(child);
+        *state.lock().map_err(|_| "Failed to access app state".to_string())? = Some(child);
     } else {
         return Err("Failed to access app state".to_string());
     }
@@ -206,6 +208,10 @@ pub fn run() {
         mobile_monitor::mobile_monitor_set_enabled,
         mobile_bilibili::mobile_bilibili_status,
         mobile_bilibili::mobile_bilibili_set_settings,
+        mobile_bilibili_auth::mobile_bilibili_auth_start,
+        mobile_bilibili_auth::mobile_bilibili_auth_complete,
+        mobile_bilibili_auth::mobile_bilibili_auth_status,
+        mobile_bilibili_auth::mobile_bilibili_logout,
         mobile_youtube::mobile_youtube_authorize,
         mobile_youtube::mobile_youtube_cached_auth,
         mobile_youtube::mobile_youtube_logout,

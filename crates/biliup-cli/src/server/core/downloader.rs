@@ -90,14 +90,26 @@ pub enum DownloaderRuntime {
 }
 
 impl DownloaderRuntime {
-    /// 从配置创建
+    /// 从不依赖直播上下文的配置创建下载器。
+    /// Streamlink / yt-dlp / ytarchive 需要直播源上下文，必须由 live::downloader_runtime 构造，
+    /// 这里明确拒绝它们，避免“选了 A 实际静默跑成 Stream Gears”。
     pub fn from_type(downloader_type: DownloaderType) -> Self {
         match downloader_type {
-            DownloaderType::Ffmpeg => Self::Ffmpeg(FfmpegDownloader::new(
+            DownloaderType::Ffmpeg | DownloaderType::FfmpegExternal => Self::Ffmpeg(
+                FfmpegDownloader::new(Vec::new(), DownloaderType::FfmpegExternal),
+            ),
+            DownloaderType::FfmpegInternal => Self::Ffmpeg(FfmpegDownloader::new(
                 Vec::new(),
-                DownloaderType::FfmpegExternal,
+                DownloaderType::FfmpegInternal,
             )),
-            _ => Self::StreamGears(StreamGears::new(None)),
+            DownloaderType::SyncDownloader | DownloaderType::StreamGears => {
+                Self::StreamGears(StreamGears::new(None))
+            }
+            DownloaderType::Streamlink | DownloaderType::YtDlp | DownloaderType::Ytarchive => {
+                unreachable!(
+                    "context-dependent downloader {downloader_type:?} must be constructed by live::downloader_runtime"
+                )
+            }
         }
     }
 

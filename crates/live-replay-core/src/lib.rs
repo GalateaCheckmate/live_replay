@@ -13,17 +13,16 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{
-    Arc, Mutex, OnceLock,
+    Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
 
 const PROBE_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const PROBE_TOTAL_TIMEOUT: Duration = Duration::from_secs(12);
-const RESOLVED_STREAM_CACHE_TTL: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CoreCredentials {
@@ -72,62 +71,11 @@ pub fn request_stop(flag: &StopFlag) {
     flag.store(true, Ordering::Release);
 }
 
-#[derive(Clone)]
-struct CachedResolvedStream {
-    stream: ResolvedStream,
-    remaining_uses: u8,
-    cached_at: Instant,
-}
-
-fn resolved_stream_cache() -> &'static Mutex<HashMap<String, CachedResolvedStream>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, CachedResolvedStream>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn take_cached_resolved_stream(url: &str) -> Option<ResolvedStream> {
-    let mut cache = resolved_stream_cache().lock().ok()?;
-    let entry = cache.get_mut(url)?;
-    if entry.cached_at.elapsed() > RESOLVED_STREAM_CACHE_TTL || entry.remaining_uses == 0 {
-        cache.remove(url);
-        return None;
-    }
-    let stream = entry.stream.clone();
-    entry.remaining_uses = entry.remaining_uses.saturating_sub(1);
-    if entry.remaining_uses == 0 {
-        cache.remove(url);
-    }
-    Some(stream)
-}
-
-/// Prime a very short-lived handoff cache so a successfully resolved stream can be passed through
-/// the monitor/start-recording layers without hitting the platform API again. This cache is only
-/// for the immediate recorder startup path; reconnects after the media connection drops still run
-/// a fresh probe.
-pub fn prime_resolved_stream(url: &str, stream: ResolvedStream, uses: u8) {
-    if uses == 0 {
-        return;
-    }
-    if let Ok(mut cache) = resolved_stream_cache().lock() {
-        cache.insert(
-            url.to_string(),
-            CachedResolvedStream {
-                stream,
-                remaining_uses: uses,
-                cached_at: Instant::now(),
-            },
-        );
-    }
-}
-
 pub async fn probe_stream(
     url: &str,
     display_name: &str,
     credentials: CoreCredentials,
 ) -> Result<ProbeResult, String> {
-    if let Some(stream) = take_cached_resolved_stream(url) {
-        return Ok(ProbeResult::Live { stream });
-    }
-
     let plugin = builtin_plugins()
         .into_iter()
         .find(|plugin| plugin.matches(url))
@@ -168,8 +116,8 @@ pub async fn probe_stream(
 
     match status {
         LiveStatus::Offline => Ok(ProbeResult::Offline),
-        LiveStatus::Live { stream } => {
-            let resolved = ResolvedStream {
+        LiveStatus::Live { stream } => Ok(ProbeResult::Live {
+            stream: ResolvedStream {
                 name: stream.name,
                 title: stream.title,
                 platform: stream.platform,
@@ -177,12 +125,8 @@ pub async fn probe_stream(
                 stream_url: stream.raw_stream_url,
                 suffix: stream.suffix,
                 headers: stream.stream_headers,
-            };
-            // One automatic reuse is enough for the normal start_recording -> recorder handoff.
-            // UI probe-and-start can explicitly raise this to two uses before entering that chain.
-            prime_resolved_stream(url, resolved.clone(), 1);
-            Ok(ProbeResult::Live { stream: resolved })
-        }
+            },
+        }),
     }
 }
 

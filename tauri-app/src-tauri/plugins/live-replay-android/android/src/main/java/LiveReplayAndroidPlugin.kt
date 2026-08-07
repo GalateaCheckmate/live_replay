@@ -2,6 +2,7 @@ package app.tauri.livereplayandroid
 
 import android.app.Activity
 import android.content.Intent
+import android.os.Build
 import androidx.activity.result.ActivityResult
 import app.tauri.annotation.ActivityCallback
 import app.tauri.annotation.Command
@@ -19,11 +20,18 @@ import com.google.android.gms.common.api.Scope
 import java.io.File
 
 private const val YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
+private const val BACKGROUND_ACTIVE_ACTION = "app.tauri.livereplay.SET_BACKGROUND_ACTIVE"
+private const val BACKGROUND_ACTIVE_EXTRA = "active"
 
 @InvokeArg
 class FinalizeMp4Args {
     var inputPath: String = ""
     var outputPath: String = ""
+}
+
+@InvokeArg
+class BackgroundActiveArgs {
+    var active: Boolean = false
 }
 
 @TauriPlugin
@@ -98,6 +106,26 @@ class LiveReplayAndroidPlugin(private val activity: Activity) : Plugin(activity)
             .addOnFailureListener { error ->
                 invoke.reject("退出 Google/YouTube 授权失败: ${error.message}")
             }
+    }
+
+    @Command
+    fun setBackgroundActive(invoke: Invoke) {
+        val args = invoke.parseArgs(BackgroundActiveArgs::class.java)
+        val serviceClass = "${activity.packageName}.LiveReplayForegroundService"
+        val intent = Intent(BACKGROUND_ACTIVE_ACTION).apply {
+            setClassName(activity.packageName, serviceClass)
+            putExtra(BACKGROUND_ACTIVE_EXTRA, args.active)
+        }
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                activity.startForegroundService(intent)
+            } else {
+                activity.startService(intent)
+            }
+            invoke.resolve()
+        } catch (error: Exception) {
+            invoke.reject("更新 Live Replay 后台保活状态失败: ${error.message}")
+        }
     }
 
     @Command

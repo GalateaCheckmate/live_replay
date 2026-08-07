@@ -3,6 +3,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 path = ROOT / "crates/biliup-cli/src/server/common/replay.rs"
 text = path.read_text(encoding="utf-8")
+
+import_old = "use tokio::process::Command;\n"
+import_new = "use tokio::io::AsyncReadExt;\nuse tokio::process::Command;\n"
+if import_old not in text:
+    raise SystemExit("tokio process import not found")
+text = text.replace(import_old, import_new, 1)
+
 old = '''async fn validate_media_file(path: &Path) -> AppResult<()> {
     let probe = ffprobe_program();
     let output = Command::new(&probe)
@@ -99,10 +106,15 @@ async fn basic_media_validation(path: &Path) -> AppResult<()> {
         .into());
     }
 
-    let bytes = tokio::fs::read(path)
+    let mut file = tokio::fs::File::open(path)
         .await
         .change_context(AppError::Unknown)?;
-    let head = &bytes[..bytes.len().min(16)];
+    let mut buffer = [0u8; 16];
+    let read = file
+        .read(&mut buffer)
+        .await
+        .change_context(AppError::Unknown)?;
+    let head = &buffer[..read];
     let extension = path
         .extension()
         .and_then(|value| value.to_str())

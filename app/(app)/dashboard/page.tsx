@@ -1,9 +1,10 @@
 'use client'
 
-import React, { useRef } from 'react'
+import React, { useRef, useState } from 'react'
 import useSWR from 'swr'
 import useSWRMutation from 'swr/mutation'
 import {
+  Avatar,
   Button,
   Card,
   Col,
@@ -17,8 +18,10 @@ import {
   Typography,
 } from '@douyinfe/semi-ui'
 import { FormApi } from '@douyinfe/semi-ui/lib/es/form'
-import { IconRefresh, IconSetting } from '@douyinfe/semi-icons'
+import { IconPlusCircle, IconRefresh, IconSetting } from '@douyinfe/semi-icons'
 import { fetcher, put } from '@/app/lib/api-streamer'
+import { useBiliUsers } from '@/app/lib/use-streamers'
+import UserList from '@/app/ui/UserList'
 
 interface DiskStatus {
   directory: string
@@ -36,7 +39,9 @@ const ReplaySettings: React.FC = () => {
   const { data: entity, error, isLoading, mutate: refreshConfig } = useSWR('/v1/replay/settings', fetcher)
   const { data: disk, mutate: refreshDisk } = useSWR<DiskStatus>('/v1/replay/storage', fetcher, { refreshInterval: 10000 })
   const { trigger } = useSWRMutation('/v1/replay/settings', put)
+  const { biliUsers, isLoading: biliUsersLoading } = useBiliUsers()
   const formRef = useRef<FormApi>()
+  const [accountManagerVisible, setAccountManagerVisible] = useState(false)
 
   if (isLoading) return <Spin size="large" />
   if (error) return <div style={{ padding: 24 }}>设置加载失败：{String(error)}</div>
@@ -84,6 +89,55 @@ const ReplaySettings: React.FC = () => {
 
       <Content style={{ padding: 24, backgroundColor: 'var(--semi-color-bg-0)', overflow: 'auto' }}>
         <div style={{ maxWidth: 980, margin: '0 auto' }}>
+          <Card
+            title="B站投稿账号"
+            style={{ marginBottom: 16 }}
+            headerExtraContent={
+              <Button
+                icon={<IconPlusCircle />}
+                theme="solid"
+                onClick={() => setAccountManagerVisible(true)}
+              >
+                添加 / 管理账号
+              </Button>
+            }
+          >
+            {biliUsersLoading ? (
+              <Spin />
+            ) : (biliUsers ?? []).length === 0 ? (
+              <div>
+                <Text strong>还没有投稿账号</Text><br />
+                <Text type="tertiary">先扫码登录 B 站账号，之后每个主播可以单独选择使用哪个账号投稿。</Text>
+              </div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+                  {(biliUsers ?? []).map(account => (
+                    <div
+                      key={account.id}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 10,
+                        padding: '8px 12px',
+                        border: '1px solid var(--semi-color-border)',
+                        borderRadius: 8,
+                        backgroundColor: 'var(--semi-color-bg-1)',
+                      }}
+                    >
+                      <Avatar size="small" src={account.face}>{account.name?.slice(0, 1)}</Avatar>
+                      <div style={{ display: 'flex', flexDirection: 'column' }}>
+                        <Text strong>{account.name}</Text>
+                        <Text type="tertiary" size="small">可用于自动投稿</Text>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <Text type="tertiary">账号只在这里统一添加和管理；主播设置中只选择投稿账号，避免重复登录。</Text>
+              </div>
+            )}
+          </Card>
+
           {disk && (
             <Card style={{ marginBottom: 16 }}>
               <Row gutter={16}>
@@ -237,6 +291,11 @@ const ReplaySettings: React.FC = () => {
           </Form>
         </div>
       </Content>
+
+      <UserList
+        visible={accountManagerVisible}
+        onCancel={() => setAccountManagerVisible(false)}
+      />
     </>
   )
 }

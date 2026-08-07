@@ -6,25 +6,23 @@ import useSWR from 'swr'
 import { Button, Card, Col, Form, Layout, Modal, Notification, Row, Switch, Tag, Typography } from '@douyinfe/semi-ui'
 import { IconPlusCircle, IconRefresh } from '@douyinfe/semi-icons'
 import { useSWRConfig } from 'swr'
-import useStreamers, { useBiliUsers, useTypeTree } from '../lib/use-streamers'
-import { API_BASE, fetcher } from '../lib/api-streamer'
+import { useBiliUsers, useTypeTree } from '../lib/use-streamers'
+import { API_BASE, fetcher, ReplayStreamerState, ReplayUserState } from '../lib/api-streamer'
 
 const DEFAULT_TITLE = '{streamer} 直播回放 %Y-%m-%d %H-%M'
 
-const statusText: Record<string, string> = {
-  Working: '正在录制',
-  Pending: '检测直播状态',
-  Idle: '等待开播',
-  Pause: '已关闭',
-  Finalizing: '正在收尾并封段',
+const stateText: Record<ReplayUserState, string> = {
+  waiting: '等待开播',
+  recording: '正在录制',
+  uploading: '正在上传',
+  error: '异常',
 }
 
-const statusColor: Record<string, 'red' | 'blue' | 'green' | 'grey' | 'orange'> = {
-  Working: 'red',
-  Pending: 'blue',
-  Idle: 'green',
-  Pause: 'grey',
-  Finalizing: 'orange',
+const stateColor: Record<ReplayUserState, 'green' | 'red' | 'blue' | 'orange'> = {
+  waiting: 'green',
+  recording: 'red',
+  uploading: 'blue',
+  error: 'orange',
 }
 
 interface DiskStatus {
@@ -40,16 +38,20 @@ interface DiskStatus {
 export default function Home() {
   const { Header, Content } = Layout
   const { Title, Text } = Typography
-  const { streamers, isLoading } = useStreamers()
   const { biliUsers } = useBiliUsers()
   const { mutate } = useSWRConfig()
+  const {
+    data: streamers,
+    isLoading,
+    mutate: refreshStreamers,
+  } = useSWR<ReplayStreamerState[]>('/v1/replay/streamers', fetcher, { refreshInterval: 3000 })
+  const { data: diskStatus, mutate: refreshDisk } = useSWR<DiskStatus>('/v1/disk-status', fetcher, { refreshInterval: 10000 })
   const [visible, setVisible] = useState(false)
   const [saving, setSaving] = useState(false)
   const [formApi, setFormApi] = useState<any>()
-  const [finalizing, setFinalizing] = useState<Set<number>>(new Set())
+  const [switching, setSwitching] = useState<Set<number>>(new Set())
   const [selectedAccount, setSelectedAccount] = useState<string>()
   const { typeTree, isLoading: typeTreeLoading, isError: typeTreeError } = useTypeTree(selectedAccount)
-  const { data: diskStatus, mutate: refreshDisk } = useSWR<DiskStatus>('/v1/disk-status', fetcher, { refreshInterval: 10000 })
 
   const accountOptions = (biliUsers ?? []).map(item => ({ label: item.name, value: item.value }))
 
@@ -126,10 +128,10 @@ export default function Home() {
         body: JSON.stringify(body),
       })
       if (!response.ok) throw new Error(await response.text())
-      Notification.success({ title: '添加成功', content: '已持续关注；开播后会自动录制并按当前设置投稿。' })
+      Notification.success({ title: '添加成功', content: '已进入等待开播；开播后会自动录制并进入投稿队列。' })
       setVisible(false)
       formApi?.reset()
-      await mutate('/v1/streamers')
+      await Promise.all([refreshStreamers(), mutate('/v1/streamers')])
     } catch (error: any) {
       Notification.error({ title: '添加失败', content: error?.message ?? String(error), duration: 0 })
     } finally {
@@ -137,42 +139,41 @@ export default function Home() {
     }
   }
 
-  const toggleStreamer = async (id: number) => {
-    const streamer = streamers?.find(item => item.id === id)
-    const isDisabling = streamer?.enabled !== false
-    if (isDisabling) setFinalizing(previous => new Set(previous).add(id))
+  const toggleStreamer = async (streamer: ReplayStreamerState) => {
+    setSwitching(previous => new Set(previous).add(streamer.id))
     try {
-      const response = await fetch(`${API_BASE}/v1/streamers/${id}/pause`, { method: 'PUT' })
-      if (!response.ok) {
-        Notification.error({ title: '切换失败', content: await response.text() })
-        return
-      }
-      await mutate('/v1/streamers')
+      const response = await fetch(`${API_BASE}/v1/streamers/${streamer.id}/pause`, { method: 'PUT' })
+      if (!response.ok) throw new Error(await response.text())
+      await Promise.all([refreshStreamers(), mutate('/v1/streamers')])
+    } catch (error: any) {
+      Notification.error({ title: '切换失败', content: error?.message ?? String(error) })
     } finally {
-      setFinalizing(previous => {
+      setSwitching(previous => {
         const next = new Set(previous)
-        next.delete(id)
+        next.delete(streamer.id)
         return next
       })
     }
   }
 
+  const refreshAll = () => Promise.all([refreshStreamers(), refreshDisk()])
   const diskAttention = diskStatus && diskStatus.state !== 'ok'
 
   return (
     <>
       <Header style={{ backgroundColor: 'var(--semi-color-bg-1)', padding: '0 24px' }}>
-        <div style={{ height: 64, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <div style={{ minHeight: 64, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
           <div>
-            <Title heading={4}>Live Replay</Title>
-            <Text type="tertiary">一个开关完成持续关注、自动录制和自动上传</Text>
+            <Title heading={4}>主播</Title>
+            <Text type="tertiary">持续关注开播状态；录制、分段和上传在后台自动完成</Text>
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
-            <Button icon={<IconRefresh />} onClick={() => Promise.all([mutate('/v1/streamers'), refreshDisk()])}>刷新</Button>
+            <Button icon={<IconRefresh />} onClick={refreshAll}>刷新</Button>
             <Button theme="solid" icon={<IconPlusCircle />} onClick={openAdd}>添加主播</Button>
           </div>
         </div>
       </Header>
+
       <Content style={{ padding: 24, backgroundColor: 'var(--semi-color-bg-0)' }}>
         {diskAttention && (
           <Card style={{ marginBottom: 16, borderColor: diskStatus.state === 'warning' ? 'var(--semi-color-warning)' : 'var(--semi-color-danger)' }}>
@@ -180,35 +181,49 @@ export default function Home() {
             <Text type="tertiary">录像目录：{diskStatus.directory}</Text>
           </Card>
         )}
+
         {!isLoading && (streamers?.length ?? 0) === 0 && (
           <Card style={{ maxWidth: 720, margin: '48px auto', textAlign: 'center' }}>
-            <Title heading={4}>还没有关注主播</Title>
-            <Text type="tertiary">粘贴直播间链接后，软件会一直等待开播并自动完成后续流程。</Text>
+            <Title heading={4}>还没有主播</Title>
+            <Text type="tertiary">添加直播间后，这里只会显示等待开播、正在录制、正在上传或异常。</Text>
             <div style={{ marginTop: 20 }}><Button theme="solid" onClick={openAdd}>添加第一个主播</Button></div>
           </Card>
         )}
+
         <Row gutter={[16, 16]}>
-          {(streamers ?? []).map(streamer => {
-            const isFinalizing = finalizing.has(streamer.id)
-            const status = isFinalizing ? 'Finalizing' : (streamer.enabled === false ? 'Pause' : (streamer.status || 'Idle'))
-            return (
-              <Col key={streamer.id} xs={24} sm={24} md={12} lg={8} xl={6}>
-                <Card shadows="hover" title={streamer.remark} headerExtraContent={
-                  <Switch checked={streamer.enabled !== false} disabled={isFinalizing} onChange={() => toggleStreamer(streamer.id)} />
-                }>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                    <div><Tag color={statusColor[status] ?? 'grey'}>{statusText[status] ?? status}</Tag></div>
-                    <Text ellipsis={{ showTooltip: true }} type="tertiary">{streamer.url}</Text>
-                    <Text>自动行为：录制 → 上传 → B站可播放 → 按主播设置处理本地视频</Text>
-                    <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
-                      <Link href="/replay"><Button size="small">查看上传队列</Button></Link>
-                      <Link href="/streamers"><Button size="small" theme="borderless">详细设置</Button></Link>
-                    </div>
+          {(streamers ?? []).map(streamer => (
+            <Col key={streamer.id} xs={24} sm={24} md={12} lg={8} xl={6}>
+              <Card
+                shadows="hover"
+                title={streamer.name}
+                headerExtraContent={
+                  <Switch
+                    checked={streamer.enabled}
+                    loading={switching.has(streamer.id)}
+                    onChange={() => toggleStreamer(streamer)}
+                  />
+                }
+              >
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                    <Tag color={stateColor[streamer.user_state]}>{stateText[streamer.user_state]}</Tag>
+                    {!streamer.enabled && <Text type="tertiary">自动录制已关闭</Text>}
                   </div>
-                </Card>
-              </Col>
-            )
-          })}
+                  <Text ellipsis={{ showTooltip: true }} type="tertiary">{streamer.url}</Text>
+                  {streamer.pending_upload_parts > 0 && (
+                    <Text>后台还有 {streamer.pending_upload_parts} 个分段待完成上传/确认</Text>
+                  )}
+                  {streamer.user_state === 'error' && (
+                    <Text type="danger">有任务需要处理，进入“场次与投稿”查看原因。</Text>
+                  )}
+                  <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
+                    <Link href="/replay"><Button size="small">场次与投稿</Button></Link>
+                    <Link href="/streamers"><Button size="small" theme="borderless">详细设置</Button></Link>
+                  </div>
+                </div>
+              </Card>
+            </Col>
+          ))}
         </Row>
       </Content>
 
@@ -255,7 +270,7 @@ export default function Home() {
 
           <Card style={{ margin: '12px 0' }}>
             <Text strong>投稿设置</Text><br />
-            <Text type="tertiary">下面都是默认预填值，不是强制规则；每个主播都可以单独修改。</Text>
+            <Text type="tertiary">一场直播对应一个投稿，分段会按顺序追加为分P。</Text>
           </Card>
 
           <Form.Input field="title" label="视频标题" rules={[{ required: true, message: '请填写视频标题格式' }]} />
@@ -269,7 +284,7 @@ export default function Home() {
             style={{ width: '100%' }}
           />
           {deltaForceTid === undefined && !typeTreeLoading && (
-            <Text type="warning">当前账号没有匹配到默认“三角洲行动”，请从上面的B站分区列表手动选择；不会阻止添加主播。</Text>
+            <Text type="warning">当前账号没有匹配到默认“三角洲行动”，请手动选择分区。</Text>
           )}
           <Form.Input field="tags_text" label="视频标签" placeholder="多个标签用逗号分隔，例如：游戏,直播回放" />
           <Form.Select

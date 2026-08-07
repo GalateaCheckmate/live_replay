@@ -84,43 +84,54 @@ if not defined LOCK_HASH (
     exit /b 1
 )
 
-rem v2 marker intentionally forces one exact refresh after the older ad-hoc npm repair logic.
 set "LOCK_CACHE=node_modules\.live-replay-package-lock-v2.sha256"
 
 if not exist "node_modules\" goto :deps_refresh
-if not exist "!LOCK_CACHE!" goto :deps_refresh
+if not exist "!LOCK_CACHE!" goto :deps_adopt_existing
 
 set "CACHED_HASH="
 set /p "CACHED_HASH="<"!LOCK_CACHE!"
 if /I not "!CACHED_HASH!"=="!LOCK_HASH!" goto :deps_refresh
 
-rem Cheap integrity probes. If any critical package vanished, rebuild exactly from the lock file.
-if not exist "node_modules\next\package.json" goto :deps_refresh
-if not exist "node_modules\@douyinfe\semi-ui\package.json" goto :deps_refresh
-if not exist "node_modules\react-resizable\package.json" goto :deps_refresh
-if not exist "node_modules\react-draggable\package.json" goto :deps_refresh
+call :validate_frontend_tree
+if errorlevel 1 goto :deps_refresh
 
 echo [DEPS] package-lock.json unchanged. Using cached node_modules.
 exit /b 0
 
+:deps_adopt_existing
+call :validate_frontend_tree
+if errorlevel 1 goto :deps_refresh
+>"!LOCK_CACHE!" echo !LOCK_HASH!
+echo [DEPS] Existing dependency tree is valid. Cache marker created; no reinstall needed.
+exit /b 0
+
 :deps_refresh
 echo [DEPS] Refreshing exact dependency tree from package-lock.json...
-echo [DEPS] npm cache will be preferred; this should only happen when the lock file changes or cache integrity fails.
+echo [DEPS] npm cache will be preferred; this only runs when the lock file changes or cache integrity fails.
 call npm.cmd ci --prefer-offline --no-audit --no-fund
 if errorlevel 1 exit /b 1
 
-if not exist "node_modules\next\package.json" goto :deps_invalid
-if not exist "node_modules\@douyinfe\semi-ui\package.json" goto :deps_invalid
-if not exist "node_modules\react-resizable\package.json" goto :deps_invalid
-if not exist "node_modules\react-draggable\package.json" goto :deps_invalid
+call :validate_frontend_tree
+if errorlevel 1 goto :deps_invalid
 
 >"!LOCK_CACHE!" echo !LOCK_HASH!
 echo [DEPS] Exact dependency tree restored and cache marker updated.
 exit /b 0
 
+:validate_frontend_tree
+if not exist "node_modules\next\package.json" exit /b 1
+if not exist "node_modules\@douyinfe\semi-ui\package.json" exit /b 1
+if not exist "node_modules\react-resizable\package.json" exit /b 1
+rem react-draggable is intentionally nested under react-resizable in package-lock.json.
+rem Ask Node's resolver instead of assuming it must exist at node_modules\react-draggable.
+node -e "const p=require('path'); require.resolve('react-draggable',{paths:[p.dirname(require.resolve('react-resizable'))]});" >nul 2>nul
+if errorlevel 1 exit /b 1
+exit /b 0
+
 :deps_invalid
-echo [FAIL] npm ci completed but a required frontend package is still missing.
-echo [FAIL] Do not run npm install manually. Send this output for diagnosis.
+echo [FAIL] npm ci completed but Node still cannot resolve a required frontend dependency.
+echo [FAIL] Send this output for diagnosis; do not run npm install manually.
 exit /b 1
 
 :node_missing

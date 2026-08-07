@@ -14,6 +14,8 @@ use tauri_plugin_shell::process::{CommandChild, CommandEvent, Encoding};
 use tauri_plugin_shell::ShellExt;
 
 #[cfg(mobile)]
+mod mobile_bilibili;
+#[cfg(mobile)]
 mod mobile_monitor;
 #[cfg(mobile)]
 mod mobile_recordings;
@@ -202,6 +204,8 @@ pub fn run() {
         mobile_monitor::mobile_monitor_add,
         mobile_monitor::mobile_monitor_remove,
         mobile_monitor::mobile_monitor_set_enabled,
+        mobile_bilibili::mobile_bilibili_status,
+        mobile_bilibili::mobile_bilibili_set_settings,
         mobile_youtube::mobile_youtube_authorize,
         mobile_youtube::mobile_youtube_cached_auth,
         mobile_youtube::mobile_youtube_logout,
@@ -226,8 +230,10 @@ pub fn run() {
             #[cfg(mobile)]
             {
                 mobile_monitor::start_monitor_worker(app.handle().clone());
+                // Keep the already-built YouTube worker alive for existing tasks, but new 15GB
+                // recording segments now feed Bilibili first. YouTube session merging comes later.
                 mobile_youtube::start_upload_worker(app.handle().clone());
-                println!("[tauri] Android monitor + multi-recorder + YouTube worker loaded.");
+                println!("[tauri] Android monitor + 15GB recorder + Bilibili queue + frozen YouTube worker loaded.");
             }
 
             Ok(())

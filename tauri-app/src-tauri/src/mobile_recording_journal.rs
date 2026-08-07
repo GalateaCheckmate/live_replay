@@ -19,6 +19,8 @@ pub struct RecordingJournalSession {
     pub room_url: String,
     pub streamer_name: String,
     pub live_session_id: String,
+    #[serde(default)]
+    pub session_started_at: i64,
     pub next_segment_index: u32,
     pub current_segment_started_at: i64,
     pub last_heartbeat_at: i64,
@@ -35,7 +37,9 @@ pub struct RecordingJournalStore {
 #[derive(Debug, Clone)]
 pub struct PreparedRecordingSession {
     pub live_session_id: String,
+    pub session_started_at: i64,
     pub next_segment_index: u32,
+    pub current_segment_started_at: i64,
     pub stale_session: Option<(String, i64)>,
 }
 
@@ -118,10 +122,15 @@ pub async fn prepare_session(
             if now.saturating_sub(existing.last_heartbeat_at) <= grace {
                 let session = &mut store.sessions[position];
                 session.streamer_name = streamer_name.to_string();
+                if session.session_started_at <= 0 {
+                    session.session_started_at = session.current_segment_started_at.max(1);
+                }
                 session.last_heartbeat_at = now;
                 return Ok(PreparedRecordingSession {
                     live_session_id: session.live_session_id.clone(),
+                    session_started_at: session.session_started_at,
                     next_segment_index: session.next_segment_index.max(1),
+                    current_segment_started_at: session.current_segment_started_at,
                     stale_session: None,
                 });
             }
@@ -134,13 +143,16 @@ pub async fn prepare_session(
             room_url: room_url.to_string(),
             streamer_name: streamer_name.to_string(),
             live_session_id: live_session_id.clone(),
+            session_started_at: now,
             next_segment_index: 1,
             current_segment_started_at: now,
             last_heartbeat_at: now,
         });
         Ok(PreparedRecordingSession {
             live_session_id,
+            session_started_at: now,
             next_segment_index: 1,
+            current_segment_started_at: now,
             stale_session,
         })
     })

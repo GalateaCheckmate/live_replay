@@ -12,9 +12,10 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{info, warn};
 
+/// Backwards-compatible fire-and-log wrapper used by existing desktop callers.
 pub async fn download(connection: Connection, file: LifecycleFile<'_>, segment: Segmentable) {
     let file_name = file.file_name.clone();
-    match parse_flv(connection, file, segment).await {
+    match download_checked(connection, file, segment).await {
         Ok(_) => {
             info!("Done... {}", file_name);
         }
@@ -24,18 +25,27 @@ pub async fn download(connection: Connection, file: LifecycleFile<'_>, segment: 
     }
 }
 
+/// Same FLV recorder as [`download`], but preserves the parser result for callers that must
+/// distinguish a clean EOF/split from a damaged or interrupted stream. Android Live Replay uses
+/// this so an uncertain final segment is never silently treated as upload-safe.
+pub async fn download_checked(
+    connection: Connection,
+    file: LifecycleFile<'_>,
+    segment: Segmentable,
+) -> crate::downloader::error::Result<()> {
+    parse_flv(connection, file, segment).await
+}
+
 pub(crate) async fn parse_flv(
     mut connection: Connection,
     file: LifecycleFile<'_>,
     mut segment: Segmentable,
 ) -> crate::downloader::error::Result<()> {
     let mut flv_tags_cache: Vec<(TagHeader, Bytes, Bytes)> = Vec::new();
-    // println!("parse_flv Segment: {:?}", segment);
     let _previous_tag_size = connection.read_frame(4).await?;
 
     let mut out = FlvFile::new(file)?;
     segment.set_size_position(9 + 4);
-    // let mut downloaded_size = 9 + 4;
     let mut on_meta_data = None;
     let mut aac_sequence_header = None;
     let mut h264_sequence_header: Option<(TagHeader, Bytes, Bytes)> = None;
@@ -44,17 +54,13 @@ pub(crate) async fn parse_flv(
     loop {
         let tag_header_bytes = connection.read_frame(11).await?;
         if tag_header_bytes.is_empty() {
-            // let mut rdr = Cursor::new(tag_header_bytes);
-            // println!("{}", rdr.read_u32::<BigEndian>().unwrap());
             break;
         }
 
         let (_, tag_header) = map_parse_err(tag_header(&tag_header_bytes), "tag header")?;
-        // write_tag_header(&mut out, &tag_header)?;
 
         let bytes = connection.read_frame(tag_header.data_size as usize).await?;
         let previous_tag_size = connection.read_frame(4).await?;
-        // out.write(&bytes)?;
         let (i, flv_tag_data) = map_parse_err(
             tag_data(tag_header.tag_type, tag_header.data_size as usize)(&bytes),
             "tag data",
@@ -67,8 +73,6 @@ pub(crate) async fn parse_flv(
                     if packet_header.packet_type == AACPacketType::SequenceHeader {
                         if aac_sequence_header.is_some() {
                             warn!("Unexpected aac sequence header tag. {tag_header:?}");
-                            // panic!("Unexpected aac_sequence_header tag.");
-                            // create_new = true;
                         }
                         aac_sequence_header =
                             Some((tag_header, bytes.clone(), previous_tag_size.clone()))
@@ -158,9 +162,7 @@ pub(crate) async fn parse_flv(
                     }
                     out.write_tag(tag_header, flv_tag_data, previous_tag_size_bytes)?;
                     segment.increase_size((11 + tag_header.data_size + 4) as u64);
-                    // downloaded_size += (11 + tag_header.data_size + 4) as u64;
                     prev_timestamp = tag_header.timestamp
-                    // println!("{downloaded_size}");
                 }
                 flv_tags_cache.clear();
 
@@ -170,13 +172,11 @@ pub(crate) async fn parse_flv(
 
                     let (meta_header, meta_bytes, previous_meta_tag_size) =
                         on_meta_data.as_ref().expect("on_meta_data does not exist");
-                    // onMetaData
                     flv_tags_cache.push((
                         *meta_header,
                         meta_bytes.clone(),
                         previous_meta_tag_size.clone(),
                     ));
-                    // AACSequenceHeader
                     let aac_sequence_header = aac_sequence_header
                         .as_ref()
                         .expect("aac_sequence_header does not exist");
@@ -186,7 +186,6 @@ pub(crate) async fn parse_flv(
                         aac_sequence_header.2.clone(),
                     ));
                     if !create_new {
-                        // H264SequenceHeader
                         flv_tags_cache.push(
                             h264_sequence_header
                                 .as_ref()
@@ -246,16 +245,12 @@ impl Connection {
         &mut self,
         chunk_size: usize,
     ) -> crate::downloader::error::Result<Bytes> {
-        // let mut buf = [0u8; 8 * 1024];
         loop {
             if chunk_size <= self.buffer.len() {
                 let bytes = Bytes::copy_from_slice(&self.buffer[..chunk_size]);
                 self.buffer.advance(chunk_size);
                 return Ok(bytes);
             }
-            // BytesMut::with_capacity(0).deref_mut()
-            // tokio::fs::File::open("").read()
-            // self.resp.chunk()
             let chunk_result = timeout(Duration::from_secs(30), self.resp.chunk()).await;
             if chunk_result.is_err() {
                 self.pressure.report_pressure();
@@ -270,16 +265,6 @@ impl Connection {
                     return Ok(self.buffer.split().freeze());
                 }
             }
-            // let n = match self.resp.read(&mut buf).await {
-            //     Ok(n) => n,
-            //     Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            //     Err(e) => return Err(e),
-            // };
-
-            // if n == 0 {
-            //     return Ok(self.buffer.split().freeze());
-            // }
-            // self.buffer.put_slice(&buf[..n]);
         }
     }
 }
@@ -302,7 +287,6 @@ mod tests {
         println!("remaining {}", bb.remaining());
         bb.put(&b"hello"[..]);
         bb.put(&b"hello"[..]);
-        println!("chunk {:?}", bb.chunk());
         println!("capacity {}", bb.capacity());
         println!("remaining {}", bb.remaining());
 
@@ -310,8 +294,6 @@ mod tests {
         buf.put(&b"hello world"[..]);
 
         let other = buf.split();
-        // buf.advance_mut()
-
         assert!(buf.is_empty());
         assert_eq!(0, buf.capacity());
         assert_eq!(11, other.capacity());
@@ -322,8 +304,6 @@ mod tests {
 
     #[test]
     fn it_works() -> Result<(), Box<dyn std::error::Error>> {
-        // download(
-        //     "test.flv")?;
         Ok(())
     }
 }

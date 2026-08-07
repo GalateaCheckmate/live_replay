@@ -1,5 +1,5 @@
 use super::mobile_recording_journal::{
-    RecordingJournalSession, complete_segment_handoff, finish_session, register_completed_segment,
+    RecordingJournalSession, complete_segment_handoff, finish_session, register_recovered_segment,
     snapshot,
 };
 use chrono::{Local, TimeZone};
@@ -105,8 +105,13 @@ async fn recover_discoverable_sources(app: &tauri::AppHandle) -> Result<(), Stri
         };
         match segment_from_recovered_source(&session, index, &extension, &source_path).await {
             Ok(segment) => {
-                if let Err(error) =
-                    register_completed_segment(app, &session.room_url, &segment).await
+                if let Err(error) = register_recovered_segment(
+                    app,
+                    &session.room_url,
+                    &segment,
+                    session.last_heartbeat_at,
+                )
+                .await
                 {
                     errors.push(format!("恢复 P{index} 写 journal 失败: {error}"));
                     continue;
@@ -220,8 +225,13 @@ async fn recover_raw_files(app: &tauri::AppHandle) -> Result<(), String> {
 
         match segment_from_recovered_source(&session, index, &extension, &source_path).await {
             Ok(segment) => {
-                if let Err(error) =
-                    register_completed_segment(app, &session.room_url, &segment).await
+                if let Err(error) = register_recovered_segment(
+                    app,
+                    &session.room_url,
+                    &segment,
+                    session.last_heartbeat_at,
+                )
+                .await
                 {
                     errors.push(format!("恢复 raw P{index} 写 journal 失败: {error}"));
                     continue;

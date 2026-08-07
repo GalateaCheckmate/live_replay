@@ -5,7 +5,6 @@ import Link from 'next/link'
 import useSWR from 'swr'
 import { Button, Card, Col, Form, Layout, Modal, Notification, Row, Switch, Tag, Typography } from '@douyinfe/semi-ui'
 import { IconPlusCircle, IconRefresh } from '@douyinfe/semi-icons'
-import { useSWRConfig } from 'swr'
 import { useBiliUsers, useTypeTree } from '../lib/use-streamers'
 import { API_BASE, fetcher, ReplayStreamerState, ReplayUserState } from '../lib/api-streamer'
 
@@ -35,11 +34,31 @@ interface DiskStatus {
   message: string
 }
 
+const formatDuration = (seconds?: number) => {
+  const value = Math.max(0, Math.floor(seconds ?? 0))
+  const h = Math.floor(value / 3600)
+  const m = Math.floor((value % 3600) / 60)
+  const s = value % 60
+  return [h, m, s].map(item => String(item).padStart(2, '0')).join(':')
+}
+
+const formatBytes = (bytes?: number) => {
+  const value = Math.max(0, bytes ?? 0)
+  if (value < 1024) return `${value} B`
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let current = value / 1024
+  let index = 0
+  while (current >= 1024 && index < units.length - 1) {
+    current /= 1024
+    index += 1
+  }
+  return `${current.toFixed(index >= 2 ? 2 : 1)} ${units[index]}`
+}
+
 export default function Home() {
   const { Header, Content } = Layout
   const { Title, Text } = Typography
   const { biliUsers } = useBiliUsers()
-  const { mutate } = useSWRConfig()
   const {
     data: streamers,
     isLoading,
@@ -122,7 +141,7 @@ export default function Home() {
 
     setSaving(true)
     try {
-      const response = await fetch(`${API_BASE}/v1/streamers/simple`, {
+      const response = await fetch(`${API_BASE}/v1/replay/streamers`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -131,7 +150,7 @@ export default function Home() {
       Notification.success({ title: '添加成功', content: '已进入等待开播；开播后会自动录制并进入投稿队列。' })
       setVisible(false)
       formApi?.reset()
-      await Promise.all([refreshStreamers(), mutate('/v1/streamers')])
+      await refreshStreamers()
     } catch (error: any) {
       Notification.error({ title: '添加失败', content: error?.message ?? String(error), duration: 0 })
     } finally {
@@ -139,12 +158,16 @@ export default function Home() {
     }
   }
 
-  const toggleStreamer = async (streamer: ReplayStreamerState) => {
+  const setStreamerEnabled = async (streamer: ReplayStreamerState) => {
     setSwitching(previous => new Set(previous).add(streamer.id))
     try {
-      const response = await fetch(`${API_BASE}/v1/streamers/${streamer.id}/pause`, { method: 'PUT' })
+      const response = await fetch(`${API_BASE}/v1/replay/streamers/${streamer.id}/enabled`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: !streamer.enabled }),
+      })
       if (!response.ok) throw new Error(await response.text())
-      await Promise.all([refreshStreamers(), mutate('/v1/streamers')])
+      await refreshStreamers()
     } catch (error: any) {
       Notification.error({ title: '切换失败', content: error?.message ?? String(error) })
     } finally {
@@ -200,7 +223,7 @@ export default function Home() {
                   <Switch
                     checked={streamer.enabled}
                     loading={switching.has(streamer.id)}
-                    onChange={() => toggleStreamer(streamer)}
+                    onChange={() => setStreamerEnabled(streamer)}
                   />
                 }
               >
@@ -210,6 +233,9 @@ export default function Home() {
                     {!streamer.enabled && <Text type="tertiary">自动录制已关闭</Text>}
                   </div>
                   <Text ellipsis={{ showTooltip: true }} type="tertiary">{streamer.url}</Text>
+                  {streamer.user_state === 'recording' && (
+                    <Text>已录制 {formatDuration(streamer.recording_elapsed_seconds)} · {formatBytes(streamer.recording_bytes)}</Text>
+                  )}
                   {streamer.pending_upload_parts > 0 && (
                     <Text>后台还有 {streamer.pending_upload_parts} 个分段待完成上传/确认</Text>
                   )}

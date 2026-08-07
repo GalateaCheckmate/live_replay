@@ -36,7 +36,9 @@ jobs:
           components: rustfmt
 
       - name: Apply fixes
-        run: python tools/apply_editable_defaults_manual_upload.py
+        run: |
+          python tools/apply_editable_defaults_manual_upload.py
+          python tools/fix_templatefields_partition_compat.py
 
       - name: Install frontend dependencies
         run: npm ci
@@ -56,6 +58,7 @@ jobs:
         shell: bash
         run: |
           rm -f tools/apply_editable_defaults_manual_upload.py
+          rm -f tools/fix_templatefields_partition_compat.py
           rm -f .github/workflows/apply-editable-defaults-manual-upload.yml
           rm -f .github/editable-defaults-trigger
 

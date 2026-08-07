@@ -17,12 +17,18 @@ concurrency:
 jobs:
   apply:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 50
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -32,11 +38,19 @@ jobs:
       - name: Apply fixes
         run: python tools/apply_runtime_safety_fixes.py
 
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
       - name: Format Rust
         run: cargo fmt --all
 
       - name: Compile workspace
-        run: cargo check --workspace --all-targets
+        env:
+          SQLX_OFFLINE: "true"
+        run: cargo check --workspace --all-targets --locked
 
       - name: Remove one-shot files
         shell: bash

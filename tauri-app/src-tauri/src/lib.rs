@@ -31,7 +31,7 @@ mod mobile_recordings;
 mod mobile_youtube;
 
 #[cfg(mobile)]
-use live_replay_core::{probe_stream, CoreCredentials, ProbeResult};
+use live_replay_core::{CoreCredentials, ProbeResult, prime_resolved_stream, probe_stream};
 
 #[tauri::command]
 fn greet(name: &str) -> String {
@@ -100,7 +100,7 @@ fn spawn_and_monitor_sidecar(app_handle: tauri::AppHandle) -> Result<(), String>
 fn shutdown_sidecar_impl(app_handle: &tauri::AppHandle) -> Result<String, String> {
     let state = app_handle
         .try_state::<Arc<Mutex<Option<CommandChild>>>>()
-        .ok_or_else(|| "Sidecar process state not found".to_string())?;
+        .ok_or_else(|| "Failed to access app state".to_string())?;
 
     let mut child_process = state
         .lock()
@@ -166,20 +166,39 @@ fn start_sidecar() -> Result<String, String> {
 #[cfg(mobile)]
 #[tauri::command]
 async fn mobile_probe_stream(
+    app: tauri::AppHandle,
     url: String,
     name: Option<String>,
     bilibili_cookie: Option<String>,
     douyin_cookie: Option<String>,
 ) -> Result<ProbeResult, String> {
-    probe_stream(
-        url.trim(),
-        name.as_deref().unwrap_or(""),
-        CoreCredentials {
-            bilibili_cookie,
-            douyin_cookie,
-        },
-    )
-    .await
+    let url = url.trim().to_string();
+    let display_name = name.unwrap_or_default();
+    let credentials = CoreCredentials {
+        bilibili_cookie,
+        douyin_cookie,
+    };
+    let result = probe_stream(&url, &display_name, credentials.clone()).await?;
+
+    if let ProbeResult::Live { stream } = &result {
+        // The user explicitly asked to detect a live room. Do not discard the resolved media URL
+        // and then probe the platform twice more. Reuse this exact resolution through the existing
+        // start_recording guard and recorder startup, and start recording before returning to UI.
+        prime_resolved_stream(&url, stream.clone(), 2);
+        mobile_recordings::start_recording(
+            app,
+            url,
+            if display_name.trim().is_empty() {
+                stream.name.clone()
+            } else {
+                display_name
+            },
+            credentials,
+        )
+        .await?;
+    }
+
+    Ok(result)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -241,11 +260,13 @@ pub fn run() {
 
             #[cfg(mobile)]
             {
-                // Upload workers can safely start immediately because their queues are persistent
-                // and idempotent. LiveMonitor waits for recording recovery so an old P is restored
-                // and its journal index advanced before any new recording is allowed to start.
+                // Persistent upload workers remain loaded, but this debugging pass does not add or
+                // change uploader behavior. Crucially, monitor startup is no longer blocked behind
+                // potentially slow crash recovery/remux work.
                 mobile_bilibili_worker::start_upload_worker(app.handle().clone());
                 mobile_youtube::start_upload_worker(app.handle().clone());
+                mobile_monitor::start_monitor_worker(app.handle().clone());
+
                 let recovery_app = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     if let Err(error) =
@@ -253,9 +274,8 @@ pub fn run() {
                     {
                         eprintln!("[recording-recovery] startup recovery completed with retained files: {error}");
                     }
-                    mobile_monitor::start_monitor_worker(recovery_app);
                 });
-                println!("[tauri] Android 15GB recorder recovery + Bilibili multi-P + frozen YouTube workers loaded.");
+                println!("[tauri] Android monitor starts immediately; recording recovery runs independently.");
             }
 
             Ok(())

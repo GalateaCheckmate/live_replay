@@ -34,6 +34,17 @@ interface DiskStatus {
   message: string
 }
 
+interface ReplayGlobalSettings {
+  segment_time?: string | null
+}
+
+const segmentMinutesFromConfig = (segmentTime?: string | null) => {
+  const match = String(segmentTime ?? '').trim().match(/^(\d+):([0-5]\d):([0-5]\d)$/)
+  if (!match) return 60
+  const seconds = Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3])
+  return Math.min(1440, Math.max(1, Math.ceil(seconds / 60)))
+}
+
 const formatDuration = (seconds?: number) => {
   const value = Math.max(0, Math.floor(seconds ?? 0))
   const h = Math.floor(value / 3600)
@@ -65,14 +76,20 @@ export default function Home() {
     mutate: refreshStreamers,
   } = useSWR<ReplayStreamerState[]>('/v1/replay/streamers', fetcher, { refreshInterval: 3000 })
   const { data: diskStatus, mutate: refreshDisk } = useSWR<DiskStatus>('/v1/replay/storage', fetcher, { refreshInterval: 10000 })
+  const { data: globalSettings } = useSWR<ReplayGlobalSettings>('/v1/replay/settings', fetcher)
   const [visible, setVisible] = useState(false)
   const [saving, setSaving] = useState(false)
+  const [refreshing, setRefreshing] = useState(false)
   const [formApi, setFormApi] = useState<any>()
   const [switching, setSwitching] = useState<Set<number>>(new Set())
   const [selectedAccount, setSelectedAccount] = useState<string>()
   const { typeTree, isLoading: typeTreeLoading, isError: typeTreeError } = useTypeTree(selectedAccount)
 
   const accountOptions = (biliUsers ?? []).map(item => ({ label: item.name, value: item.value }))
+  const defaultSegmentMinutes = useMemo(
+    () => segmentMinutesFromConfig(globalSettings?.segment_time),
+    [globalSettings?.segment_time],
+  )
 
   useEffect(() => {
     if (!selectedAccount && accountOptions[0]?.value) {
@@ -109,10 +126,11 @@ export default function Home() {
   const openAdd = () => {
     setVisible(true)
     const account = selectedAccount ?? accountOptions[0]?.value
-    if (account) {
-      setSelectedAccount(account)
-      queueMicrotask(() => formApi?.setValue('user_cookie', account))
-    }
+    if (account) setSelectedAccount(account)
+    queueMicrotask(() => {
+      if (account) formApi?.setValue('user_cookie', account)
+      formApi?.setValue('segment_minutes', defaultSegmentMinutes)
+    })
   }
 
   const createStreamer = async () => {
@@ -179,7 +197,24 @@ export default function Home() {
     }
   }
 
-  const refreshAll = () => Promise.all([refreshStreamers(), refreshDisk()])
+  const refreshAll = async () => {
+    setRefreshing(true)
+    try {
+      const response = await fetch(`${API_BASE}/v1/replay/refresh`, { method: 'POST' })
+      if (!response.ok) throw new Error(await response.text())
+      const result = await response.json().catch(() => ({ checked: 0 }))
+      await Promise.all([refreshStreamers(), refreshDisk()])
+      Notification.success({
+        title: '刷新完成',
+        content: `已重新检查 ${Number(result?.checked ?? 0)} 个等待中的主播。`,
+      })
+    } catch (error: any) {
+      Notification.error({ title: '刷新失败', content: error?.message ?? String(error) })
+    } finally {
+      setRefreshing(false)
+    }
+  }
+
   const diskAttention = diskStatus && diskStatus.state !== 'ok'
 
   return (
@@ -191,7 +226,7 @@ export default function Home() {
             <Text type="tertiary">自动监控开播状态，并完成录制与投稿</Text>
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
-            <Button icon={<IconRefresh />} onClick={refreshAll}>刷新</Button>
+            <Button icon={<IconRefresh />} loading={refreshing} onClick={refreshAll}>刷新</Button>
             <Button theme="solid" icon={<IconPlusCircle />} onClick={openAdd}>添加主播</Button>
           </div>
         </div>
@@ -270,7 +305,7 @@ export default function Home() {
             copyright: 2,
             is_only_self: 1,
             description: '',
-            segment_minutes: 60,
+            segment_minutes: defaultSegmentMinutes,
             delete_after_success: true,
           }}
         >
@@ -327,7 +362,14 @@ export default function Home() {
           />
           <Form.Input field="copyright_source" label="转载来源" placeholder="默认使用当前直播间链接；自制投稿时无需填写" />
           <Form.TextArea field="description" label="简介" placeholder="可选" autosize={{ minRows: 2, maxRows: 5 }} />
-          <Form.InputNumber field="segment_minutes" label="单段时长（分钟）" min={1} max={1440} style={{ width: '100%' }} />
+          <Form.InputNumber
+            field="segment_minutes"
+            label="单段时长（分钟）"
+            min={1}
+            max={1440}
+            extraText={`默认使用全局设置：${defaultSegmentMinutes} 分钟。`}
+            style={{ width: '100%' }}
+          />
           <Form.Switch field="delete_after_success" label="投稿确认可播放后自动删除本地录像" />
         </Form>
       </Modal>

@@ -2,9 +2,22 @@ name: Android APK
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - agent/android-live-replay-apk
+    paths:
+      - 'tauri-app/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/android-apk.yml'
 
 permissions:
   contents: read
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-apk:

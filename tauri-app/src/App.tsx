@@ -4,7 +4,10 @@ import "./App.css";
 
 function App() {
   const userAgent = useMemo(() => navigator.userAgent, []);
-  const isAndroid = useMemo(() => /Android/i.test(userAgent), [userAgent]);
+  const isAndroid = useMemo(
+    () => /Android|HarmonyOS|HUAWEI|ANA-/i.test(userAgent),
+    [userAgent],
+  );
   const isHuawei = useMemo(() => /HUAWEI|ANA-|HarmonyOS/i.test(userAgent), [userAgent]);
   const [status, setStatus] = useState("正在初始化 Android 壳...");
 

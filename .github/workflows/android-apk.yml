@@ -14,7 +14,7 @@ on:
       - '.github/workflows/android-apk.yml'
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: android-apk-${{ github.ref }}
@@ -32,9 +32,11 @@ jobs:
           - label: arm64-phone
             tauri_target: aarch64
             rust_target: aarch64-linux-android
+            apk_name: Live-Replay-Android-ARM64.apk
           - label: x86_64-emulator
             tauri_target: x86_64
             rust_target: x86_64-linux-android
+            apk_name: Live-Replay-Android-x86_64-Emulator.apk
 
     steps:
       - name: Checkout
@@ -85,16 +87,60 @@ jobs:
         working-directory: tauri-app
         run: npm run tauri -- android build --debug --apk --target ${{ matrix.tauri_target }}
 
-      - name: Collect APK
+      - name: Collect and rename APK
         shell: bash
         run: |
           mkdir -p dist/android
-          find tauri-app/src-tauri/gen/android -type f -name '*.apk' -print -exec cp {} dist/android/ \;
-          test -n "$(find dist/android -type f -name '*.apk' -print -quit)"
+          APK_PATH="$(find tauri-app/src-tauri/gen/android -type f -name '*.apk' -print -quit)"
+          test -n "$APK_PATH"
+          cp "$APK_PATH" "dist/android/${{ matrix.apk_name }}"
+          test -s "dist/android/${{ matrix.apk_name }}"
+          ls -lh "dist/android/${{ matrix.apk_name }}"
 
-      - name: Upload APK
+      # GitHub Actions artifacts are ZIP containers by design. Keep them only as an internal
+      # hand-off between jobs; the user-facing downloads are raw .apk Release assets below.
+      - name: Stage APK for release
         uses: actions/upload-artifact@v4
         with:
-          name: live-replay-android-${{ matrix.label }}-debug
-          path: dist/android/*.apk
+          name: release-${{ matrix.label }}
+          path: dist/android/${{ matrix.apk_name }}
           if-no-files-found: error
+          retention-days: 2
+
+  publish-apk:
+    name: publish-raw-apk
+    needs: build-apk
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download built APKs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify release APKs
+        shell: bash
+        run: |
+          test -s release-assets/Live-Replay-Android-ARM64.apk
+          test -s release-assets/Live-Replay-Android-x86_64-Emulator.apk
+          ls -lh release-assets/*.apk
+
+      - name: Publish raw APK files
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Keep one rolling pre-release so the newest APK is always obvious and downloadable
+          # directly as .apk instead of GitHub's ZIP-wrapped Actions artifact.
+          gh release delete android-latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create android-latest \
+            release-assets/Live-Replay-Android-ARM64.apk \
+            release-assets/Live-Replay-Android-x86_64-Emulator.apk \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Live Replay Android Latest" \
+            --prerelease \
+            --notes "自动构建的 Android 测试版。ARM64 用于安卓真机，x86_64 用于模拟器。Build: $GITHUB_RUN_NUMBER · Commit: $GITHUB_SHA"

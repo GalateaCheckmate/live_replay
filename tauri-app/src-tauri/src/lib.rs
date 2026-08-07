@@ -24,6 +24,8 @@ mod mobile_monitor;
 #[cfg(mobile)]
 mod mobile_recording_journal;
 #[cfg(mobile)]
+mod mobile_recording_recovery;
+#[cfg(mobile)]
 mod mobile_recordings;
 #[cfg(mobile)]
 mod mobile_youtube;
@@ -239,12 +241,21 @@ pub fn run() {
 
             #[cfg(mobile)]
             {
-                mobile_monitor::start_monitor_worker(app.handle().clone());
+                // Upload workers can safely start immediately because their queues are persistent
+                // and idempotent. LiveMonitor waits for recording recovery so an old P is restored
+                // and its journal index advanced before any new recording is allowed to start.
                 mobile_bilibili_worker::start_upload_worker(app.handle().clone());
-                // Keep the already-built YouTube worker alive for existing tasks, but new 15GB
-                // recording segments now feed Bilibili first. YouTube session merging comes later.
                 mobile_youtube::start_upload_worker(app.handle().clone());
-                println!("[tauri] Android monitor + 15GB recorder + Bilibili multi-P worker + frozen YouTube worker loaded.");
+                let recovery_app = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) =
+                        mobile_recording_recovery::recover_startup(&recovery_app).await
+                    {
+                        eprintln!("[recording-recovery] startup recovery completed with retained files: {error}");
+                    }
+                    mobile_monitor::start_monitor_worker(recovery_app);
+                });
+                println!("[tauri] Android 15GB recorder recovery + Bilibili multi-P + frozen YouTube workers loaded.");
             }
 
             Ok(())

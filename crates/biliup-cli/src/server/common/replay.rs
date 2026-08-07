@@ -245,6 +245,10 @@ async fn process_segment(
     let runtime = initialize_upload_runtime(ctx, upload_config).await?;
     let mut current = load_segment(ctx.pool(), segment.id).await?;
 
+    if current.remote_filename.is_none() {
+        validate_media_file(&current.file_path).await?;
+    }
+
     let remote_filename = if let Some(filename) = current.remote_filename.clone() {
         filename
     } else {
@@ -405,6 +409,40 @@ async fn process_segment(
     resume_cleanup(ctx, &session, &verified).await
 }
 
+fn parse_positive_duration(value: &str) -> Option<f64> {
+    let duration = value.trim().parse::<f64>().ok()?;
+    (duration.is_finite() && duration > 0.0).then_some(duration)
+}
+
+async fn validate_media_file(path: &Path) -> AppResult<()> {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .change_context(AppError::Custom(
+            "无法启动 ffprobe；录像已保留并等待重试".to_string(),
+        ))?;
+    if !output.status.success() {
+        return Err(
+            AppError::Custom(format!("录像文件无法正常解析，已保留：{}", path.display())).into(),
+        );
+    }
+    let duration = String::from_utf8_lossy(&output.stdout);
+    if parse_positive_duration(&duration).is_none() {
+        return Err(AppError::Custom(format!("录像时长无效，已保留：{}", path.display())).into());
+    }
+    Ok(())
+}
+
 async fn append_video(
     bilibili: &BiliBili,
     aid: u64,
@@ -512,16 +550,48 @@ async fn remote_part_playable(bilibili: &BiliBili, aid: u64, cid: u64) -> AppRes
     if value.get("code").and_then(|value| value.as_i64()) != Some(0) {
         return Ok(false);
     }
-    let data = value.get("data").unwrap_or(&serde_json::Value::Null);
-    let has_durl = data
+    let data = value
+        .get("data")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let media_url = data
         .get("durl")
         .and_then(|value| value.as_array())
-        .is_some_and(|items| !items.is_empty());
-    let has_dash = data
-        .pointer("/dash/video")
-        .and_then(|value| value.as_array())
-        .is_some_and(|items| !items.is_empty());
-    Ok(has_durl || has_dash)
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("url"))
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            data.pointer("/dash/video/0/baseUrl")
+                .and_then(|value| value.as_str())
+        })
+        .or_else(|| {
+            data.pointer("/dash/video/0/base_url")
+                .and_then(|value| value.as_str())
+        });
+    let Some(media_url) = media_url else {
+        return Ok(false);
+    };
+    let media_url = if media_url.starts_with("//") {
+        format!("https:{media_url}")
+    } else {
+        media_url.to_string()
+    };
+
+    // 不仅确认播放接口给出地址，还实际读取远端媒体的首个数据块。
+    // 只有 CDN 已经能返回有效媒体字节，才允许进入本地删除阶段。
+    let request = bilibili
+        .client
+        .get(media_url)
+        .header("Range", "bytes=0-1023")
+        .header("Referer", "https://www.bilibili.com/");
+    let mut response = match tokio::time::timeout(Duration::from_secs(20), request.send()).await {
+        Ok(Ok(response)) if response.status().is_success() => response,
+        _ => return Ok(false),
+    };
+    match tokio::time::timeout(Duration::from_secs(20), response.chunk()).await {
+        Ok(Ok(Some(chunk))) => Ok(!chunk.is_empty()),
+        _ => Ok(false),
+    }
 }
 
 async fn wait_for_remote_ready(
@@ -686,12 +756,11 @@ async fn ensure_session(
     if let Some(row) = sqlx::query(
         "SELECT id, aid, bvid, submit_state, delete_after_success, preserve_danmaku, \
                 upload_config_json, session_key FROM live_sessions \
-         WHERE live_streamer_id = ? AND live_title = ? \
+         WHERE live_streamer_id = ? \
            AND (ended_at IS NULL OR ended_at >= datetime('now', ?)) \
          ORDER BY id DESC LIMIT 1",
     )
     .bind(ctx.worker_id())
-    .bind(&ctx.streamer_info().title)
     .bind(&recent_modifier)
     .fetch_optional(ctx.pool())
     .await
@@ -2055,5 +2124,19 @@ mod tests {
     #[test]
     fn delete_is_opt_in() {
         assert!(!env_bool("LIVE_REPLAY_MISSING_TEST_FLAG", false));
+    }
+}
+
+#[cfg(test)]
+mod runtime_safety_duration_tests {
+    use super::parse_positive_duration;
+
+    #[test]
+    fn only_positive_finite_durations_are_uploadable() {
+        assert_eq!(parse_positive_duration("1.25"), Some(1.25));
+        assert_eq!(parse_positive_duration("0"), None);
+        assert_eq!(parse_positive_duration("-1"), None);
+        assert_eq!(parse_positive_duration("NaN"), None);
+        assert_eq!(parse_positive_duration("bad"), None);
     }
 }

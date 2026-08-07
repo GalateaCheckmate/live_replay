@@ -61,13 +61,21 @@ pub struct SegmentEventProcessor {
 
 impl SegmentEventProcessor {
     pub fn new(uploader: Sender<UploaderMessage>, ctx: Context) -> Self {
+        // 自动上传主播的尾段可能只有几秒。不能沿用原版的 20MB 过滤并直接删除；
+        // 有效性由安全队列中的 ffprobe 检查决定，失败时保留文件并显示错误。
+        let minimum_size = if ctx
+            .upload_config()
+            .as_ref()
+            .is_some_and(|config| !config.is_noop_uploader())
+        {
+            0
+        } else {
+            ctx.config().filtering_threshold * 1000 * 1000
+        };
         Self {
             channel: None,
             uploader,
-            file_validator: FileValidator::new(
-                ctx.config().filtering_threshold * 1000 * 1000,
-                true,
-            ),
+            file_validator: FileValidator::new(minimum_size, true),
             ctx,
         }
     }

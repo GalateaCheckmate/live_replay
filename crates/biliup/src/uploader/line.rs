@@ -4,9 +4,10 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use reqwest::{Body, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tracing::info;
@@ -19,8 +20,17 @@ use crate::uploader::line::upos::Upos;
 pub mod upos;
 
 static ACTIVE_RECORDINGS: AtomicUsize = AtomicUsize::new(0);
-static DOWNLOAD_PRESSURE_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
-static HEALTHY_DOWNLOAD_CHUNKS: AtomicUsize = AtomicUsize::new(0);
+static NEXT_DOWNLOAD_STREAM_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DownloadHealth {
+    last_pressure_ms: u64,
+}
+
+fn download_health() -> &'static StdMutex<HashMap<u64, DownloadHealth>> {
+    static HEALTH: OnceLock<StdMutex<HashMap<u64, DownloadHealth>>> = OnceLock::new();
+    HEALTH.get_or_init(|| StdMutex::new(HashMap::new()))
+}
 
 fn unix_millis() -> u64 {
     SystemTime::now()
@@ -29,27 +39,72 @@ fn unix_millis() -> u64 {
         .as_millis() as u64
 }
 
-/// 下载流每收到一个网络块就报告一次。连续恢复后自动解除降速。
-pub fn report_download_progress(bytes: usize) {
-    if bytes == 0 {
-        return;
+/// 每一路直播拥有独立压力状态；其他正常直播不能清除这一路的降速状态。
+pub struct DownloadPressureGuard {
+    id: u64,
+}
+
+impl DownloadPressureGuard {
+    pub fn new() -> Self {
+        let id = NEXT_DOWNLOAD_STREAM_ID.fetch_add(1, Ordering::Relaxed);
+        download_health()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(id, DownloadHealth::default());
+        Self { id }
     }
-    let healthy = HEALTHY_DOWNLOAD_CHUNKS.fetch_add(1, Ordering::Relaxed) + 1;
-    if healthy >= 8 {
-        DOWNLOAD_PRESSURE_UNTIL_MS.store(0, Ordering::Relaxed);
-        HEALTHY_DOWNLOAD_CHUNKS.store(8, Ordering::Relaxed);
+
+    pub fn report_progress(&self, bytes: usize) {
+        if bytes == 0 {
+            self.report_pressure();
+        }
+    }
+
+    pub fn report_pressure(&self) {
+        if let Some(health) = download_health()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(&self.id)
+        {
+            health.last_pressure_ms = unix_millis();
+        }
     }
 }
 
-/// 下载超时或断流时，立即压低全进程上传速度，把带宽优先让给直播下行。
-pub fn report_download_pressure() {
-    HEALTHY_DOWNLOAD_CHUNKS.store(0, Ordering::Relaxed);
-    DOWNLOAD_PRESSURE_UNTIL_MS.store(unix_millis().saturating_add(15_000), Ordering::Relaxed);
+impl Default for DownloadPressureGuard {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-fn download_under_pressure() -> bool {
-    let until = DOWNLOAD_PRESSURE_UNTIL_MS.load(Ordering::Relaxed);
-    until != 0 && unix_millis() < until
+impl Drop for DownloadPressureGuard {
+    fn drop(&mut self) {
+        download_health()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.id);
+    }
+}
+
+fn pressure_limit_for_age_ms(age_ms: u64) -> Option<f64> {
+    match age_ms {
+        0..=14_999 => Some(5.0),
+        15_000..=29_999 => Some(10.0),
+        30_000..=59_999 => Some(25.0),
+        60_000..=119_999 => Some(50.0),
+        _ => None,
+    }
+}
+
+fn current_pressure_limit_mbps() -> Option<f64> {
+    let latest_pressure = download_health()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .values()
+        .map(|health| health.last_pressure_ms)
+        .filter(|value| *value > 0)
+        .max()?;
+    pressure_limit_for_age_ms(unix_millis().saturating_sub(latest_pressure))
 }
 
 pub fn recording_started() {
@@ -67,10 +122,12 @@ pub fn is_recording_active() -> bool {
 }
 
 fn configured_rate_bytes_per_second() -> Option<u64> {
-    let (key, default_mbps) = if is_recording_active() && download_under_pressure() {
-        ("LIVE_REPLAY_PRESSURE_UPLOAD_LIMIT_MBPS", 5.0)
-    } else if is_recording_active() {
-        ("LIVE_REPLAY_RECORDING_UPLOAD_LIMIT_MBPS", 100.0)
+    let (key, default_mbps) = if is_recording_active() {
+        if let Some(pressure_limit) = current_pressure_limit_mbps() {
+            ("LIVE_REPLAY_PRESSURE_UPLOAD_LIMIT_MBPS", pressure_limit)
+        } else {
+            ("LIVE_REPLAY_RECORDING_UPLOAD_LIMIT_MBPS", 100.0)
+        }
     } else {
         ("LIVE_REPLAY_UPLOAD_LIMIT_MBPS", 0.0)
     };
@@ -425,5 +482,19 @@ pub fn alia() -> Line {
         query: "zone=cs&upcdn=alia&probe_version=20221109".into(),
         probe_url: "//upos-cs-upcdnalia.bilivideo.com/OK".into(),
         cost: 0,
+    }
+}
+
+#[cfg(test)]
+mod pressure_policy_tests {
+    use super::pressure_limit_for_age_ms;
+
+    #[test]
+    fn pressure_recovery_is_gradual() {
+        assert_eq!(pressure_limit_for_age_ms(0), Some(5.0));
+        assert_eq!(pressure_limit_for_age_ms(15_000), Some(10.0));
+        assert_eq!(pressure_limit_for_age_ms(30_000), Some(25.0));
+        assert_eq!(pressure_limit_for_age_ms(60_000), Some(50.0));
+        assert_eq!(pressure_limit_for_age_ms(120_000), None);
     }
 }

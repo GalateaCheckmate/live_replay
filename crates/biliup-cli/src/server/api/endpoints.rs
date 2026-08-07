@@ -4,7 +4,9 @@ use crate::server::config::Config;
 use crate::server::core::download_manager::DownloadManager;
 use crate::server::errors::{AppError, report_to_response};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
-use crate::server::infrastructure::context::{Stage, WorkerStatus};
+use crate::server::infrastructure::context::{
+    RecordingDiskStatus, Stage, WorkerStatus, recording_disk_status,
+};
 use crate::server::infrastructure::dto::LiveStreamerResponse;
 use crate::server::infrastructure::models::live_streamer::{InsertLiveStreamer, LiveStreamer};
 use crate::server::infrastructure::models::upload_streamer::{
@@ -36,6 +38,10 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+
+pub async fn get_disk_status_endpoint() -> Json<RecordingDiskStatus> {
+    Json(recording_disk_status())
+}
 
 pub async fn get_streamers_endpoint(
     State(pool): State<ConnectionPool>,
@@ -75,7 +81,7 @@ pub struct SimpleStreamerRequest {
     pub url: String,
     pub remark: String,
     pub user_cookie: String,
-    pub tid: Option<u16>,
+    pub tid: u16,
 }
 
 pub async fn post_simple_streamer_endpoint(
@@ -100,7 +106,7 @@ pub async fn post_simple_streamer_endpoint(
             id: None,
             template_name: format!("live-replay:{}:{}", remark, Utc::now().timestamp_millis()),
             title: Some("{streamer} 直播回放 %Y-%m-%d %H-%M".to_string()),
-            tid: Some(payload.tid.unwrap_or(65)),
+            tid: Some(payload.tid),
             copyright: Some(2),
             copyright_source: Some(url.clone()),
             cover_path: None,

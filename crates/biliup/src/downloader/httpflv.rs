@@ -230,6 +230,7 @@ pub fn map_parse_err<'a, T>(
 pub struct Connection {
     resp: Response,
     buffer: BytesMut,
+    pressure: crate::uploader::line::DownloadPressureGuard,
 }
 
 impl Connection {
@@ -237,6 +238,7 @@ impl Connection {
         Connection {
             resp,
             buffer: BytesMut::with_capacity(8 * 1024),
+            pressure: crate::uploader::line::DownloadPressureGuard::new(),
         }
     }
 
@@ -256,15 +258,15 @@ impl Connection {
             // self.resp.chunk()
             let chunk_result = timeout(Duration::from_secs(30), self.resp.chunk()).await;
             if chunk_result.is_err() {
-                crate::uploader::line::report_download_pressure();
+                self.pressure.report_pressure();
             }
             match chunk_result? {
                 Ok(Some(chunk)) => {
-                    crate::uploader::line::report_download_progress(chunk.len());
+                    self.pressure.report_progress(chunk.len());
                     self.buffer.put(chunk);
                 }
                 _ => {
-                    crate::uploader::line::report_download_pressure();
+                    self.pressure.report_pressure();
                     return Ok(self.buffer.split().freeze());
                 }
             }

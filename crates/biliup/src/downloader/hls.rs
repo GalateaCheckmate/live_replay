@@ -1,10 +1,12 @@
 use crate::downloader::error::{Error, Result};
 use crate::downloader::util::{LifecycleFile, Segmentable};
+use crate::uploader::line::DownloadPressureGuard;
 use m3u8_rs::Playlist;
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::time::Duration;
+use tokio::time::timeout;
 use tracing::{debug, info, warn};
 use url::Url;
 
@@ -17,10 +19,18 @@ pub async fn download(
     mut splitting: Segmentable,
 ) -> Result<()> {
     info!("Downloading {}...", url);
-    let resp = client.retryable(url).await?;
+    let pressure = DownloadPressureGuard::new();
+    let resp = client.retryable(url).await.map_err(|error| {
+        pressure.report_pressure();
+        error
+    })?;
     info!("{}", resp.status());
     // let mut resp = resp.bytes_stream();
-    let bytes = resp.bytes().await?;
+    let bytes = resp.bytes().await.map_err(|error| {
+        pressure.report_pressure();
+        error
+    })?;
+    pressure.report_progress(bytes.len());
     let mut ts_file = TsFile::new(file)?;
 
     let mut media_url = Url::parse(url)?;
@@ -51,7 +61,11 @@ pub async fn download(
             media_url = media_url.join(&best.uri)?;
             info!("media url: {media_url}");
             let resp = client.retryable(media_url.as_str()).await?;
-            let bs = resp.bytes().await?;
+            let bs = resp.bytes().await.map_err(|error| {
+                pressure.report_pressure();
+                error
+            })?;
+            pressure.report_progress(bs.len());
             // println!("{:?}", bs);
             match m3u8_rs::parse_media_playlist(&bs) {
                 Ok((_, pl)) => pl,
@@ -94,6 +108,7 @@ pub async fn download(
                     media_url.join(&segment.uri)?,
                     client,
                     &mut ts_file.buf_writer,
+                    &pressure,
                 )
                 .await?;
                 splitting.increase_size(length);
@@ -106,8 +121,18 @@ pub async fn download(
             }
             seq += 1;
         }
-        let resp = client.retryable(media_url.as_str()).await?;
-        let bs = resp.bytes().await?;
+        let resp = client
+            .retryable(media_url.as_str())
+            .await
+            .map_err(|error| {
+                pressure.report_pressure();
+                error
+            })?;
+        let bs = resp.bytes().await.map_err(|error| {
+            pressure.report_pressure();
+            error
+        })?;
+        pressure.report_progress(bs.len());
         if let Ok((_, playlist)) = m3u8_rs::parse_media_playlist(&bs) {
             pl = playlist;
         }
@@ -116,18 +141,36 @@ pub async fn download(
     Ok(())
 }
 
-async fn download_to_file(url: Url, client: &StatelessClient, out: &mut impl Write) -> Result<u64> {
+async fn download_to_file(
+    url: Url,
+    client: &StatelessClient,
+    out: &mut impl Write,
+    pressure: &DownloadPressureGuard,
+) -> Result<u64> {
     debug!("url: {url}");
-    let mut response = client.retryable(url.as_str()).await?;
+    let mut response = client.retryable(url.as_str()).await.map_err(|error| {
+        pressure.report_pressure();
+        error
+    })?;
     let mut length: u64 = 0;
-    while let Some(chunk) = response.chunk().await? {
-        length += chunk.len() as u64;
-        out.write_all(&chunk)?;
+    loop {
+        match timeout(Duration::from_secs(30), response.chunk()).await {
+            Ok(Ok(Some(chunk))) => {
+                pressure.report_progress(chunk.len());
+                length += chunk.len() as u64;
+                out.write_all(&chunk)?;
+            }
+            Ok(Ok(None)) => break,
+            Ok(Err(error)) => {
+                pressure.report_pressure();
+                return Err(error.into());
+            }
+            Err(_) => {
+                pressure.report_pressure();
+                return Err(Error::Custom(format!("HLS segment read timed out: {url}")));
+            }
+        }
     }
-    // let mut out = File::options()
-    //     .append(true)
-    //     .open(format!("{file_name}.ts"))?;
-    // let length = response.copy_to(out)?;
     Ok(length)
 }
 

@@ -54,9 +54,9 @@ fn live_options(config: &Config) -> LiveOptions {
             anonymous_origin: config.bili_anonymous_origin.unwrap_or(false),
             live_api: config.bili_liveapi.clone(),
             fallback_api: config.bili_fallback_api.clone(),
-            danmaku: config.bilibili_danmaku.unwrap_or(false),
-            danmaku_raw: config.bilibili_danmaku_raw.unwrap_or(false),
-            danmaku_detail: config.bilibili_danmaku_detail.unwrap_or(false),
+            danmaku: false,
+            danmaku_raw: false,
+            danmaku_detail: false,
         },
         cc: CcOptions {
             protocol: config
@@ -75,7 +75,7 @@ fn live_options(config: &Config) -> LiveOptions {
                 .unwrap_or_else(|| "flv".to_string()),
             double_screen: config.douyin_double_screen.unwrap_or(false),
             true_origin: config.douyin_true_origin.unwrap_or(false),
-            danmaku: config.douyin_danmaku.unwrap_or(false),
+            danmaku: false,
         },
         douyu: DouyuOptions {
             cdn: config
@@ -85,7 +85,7 @@ fn live_options(config: &Config) -> LiveOptions {
             force_hs: config.douyu_force_hs.unwrap_or(false),
             rate: config.douyu_rate.unwrap_or(0),
             disable_interactive_game: config.douyu_disable_interactive_game.unwrap_or(false),
-            danmaku: config.douyu_danmaku.unwrap_or(false),
+            danmaku: false,
         },
         huya: HuyaOptions {
             cdn: config.huya_cdn.clone().unwrap_or_default(),
@@ -101,7 +101,7 @@ fn live_options(config: &Config) -> LiveOptions {
                 .huya_codec
                 .clone()
                 .unwrap_or_else(|| "264".to_string()),
-            danmaku: config.huya_danmaku.unwrap_or(false),
+            danmaku: false,
         },
         kilakila: KilakilaOptions {
             protocol: config
@@ -115,10 +115,10 @@ fn live_options(config: &Config) -> LiveOptions {
         twitcasting: TwitcastingOptions {
             password: config.twitcasting_password.clone(),
             quality: config.twitcasting_quality.clone(),
-            danmaku: config.twitcasting_danmaku.unwrap_or(false),
+            danmaku: false,
         },
         twitch: TwitchOptions {
-            danmaku: config.twitch_danmaku.unwrap_or(false),
+            danmaku: false,
             disable_ads: config.twitch_disable_ads.unwrap_or(true),
         },
         youtube: YoutubeOptions {
@@ -130,10 +130,7 @@ fn live_options(config: &Config) -> LiveOptions {
             prefer_acodec: config.youtube_prefer_acodec.clone(),
             max_resolution: config.youtube_max_resolution,
             max_videosize: config.youtube_max_videosize.clone(),
-            danmaku: config
-                .youtube_danmaku
-                .or(config.ytb_danmaku)
-                .unwrap_or(false),
+            danmaku: false,
         },
     }
 }

@@ -519,6 +519,18 @@ impl Config {
         {
             self.segment_time = None;
         }
+        // Live Replay 当前完全不录制弹幕。读取旧数据库、导入配置和保存设置时
+        // 都会归一化为关闭，避免旧值在升级后重新生效。
+        self.douyu_danmaku = Some(false);
+        self.huya_danmaku = Some(false);
+        self.douyin_danmaku = Some(false);
+        self.bilibili_danmaku = Some(false);
+        self.bilibili_danmaku_detail = Some(false);
+        self.bilibili_danmaku_raw = Some(false);
+        self.youtube_danmaku = Some(false);
+        self.ytb_danmaku = Some(false);
+        self.twitch_danmaku = Some(false);
+        self.twitcasting_danmaku = Some(false);
     }
 
     pub fn load<P: AsRef<Path>>(path: P) -> AppResult<Self> {

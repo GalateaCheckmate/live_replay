@@ -11,9 +11,12 @@ use crate::server::infrastructure::models::upload_streamer::UploadStreamer;
 use biliup::client::StatelessClient;
 use biliup::downloader::live::LiveStream;
 use core::fmt;
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, RwLock};
+use std::thread;
+use std::time::Duration;
 use struct_patch::Patch;
 use tracing::{error, info, warn};
 
@@ -21,6 +24,90 @@ const DEFAULT_SEGMENT_TIME: &str = "01:00:00";
 const DEFAULT_DISK_WARNING_GB: u64 = 30;
 const DEFAULT_DISK_STOP_GB: u64 = 10;
 const GIB: u64 = 1024 * 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordingDiskStatus {
+    pub directory: String,
+    pub free_bytes: Option<u64>,
+    pub free_gb: Option<f64>,
+    pub warning_gb: u64,
+    pub stop_gb: u64,
+    pub state: String,
+    pub message: String,
+}
+
+pub fn default_recording_output_dir() -> PathBuf {
+    if let Ok(value) = std::env::var("LIVE_REPLAY_OUTPUT_DIR")
+        && !value.trim().is_empty()
+    {
+        return ensure_directory(PathBuf::from(value));
+    }
+
+    #[cfg(windows)]
+    {
+        let d_drive = Path::new(r"D:\");
+        if d_drive.exists() {
+            return ensure_directory(PathBuf::from(r"D:\LiveReplay\Recordings"));
+        }
+    }
+
+    ensure_directory(PathBuf::from("recordings"))
+}
+
+pub fn recording_disk_status() -> RecordingDiskStatus {
+    let directory = default_recording_output_dir();
+    let stop_gb = env_u64("LIVE_REPLAY_DISK_STOP_GB", DEFAULT_DISK_STOP_GB).max(1);
+    let warning_gb = env_u64("LIVE_REPLAY_DISK_WARNING_GB", DEFAULT_DISK_WARNING_GB).max(stop_gb);
+    let mut free_bytes = None;
+    for attempt in 0..3 {
+        free_bytes = free_space_bytes(&directory);
+        if free_bytes.is_some() {
+            break;
+        }
+        if attempt < 2 {
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+    let free_gb = free_bytes.map(|value| value as f64 / GIB as f64);
+    let (state, message) = match free_bytes {
+        None => (
+            "unknown",
+            format!(
+                "无法确认录像目录 {} 的剩余空间；已暂停开始新录制",
+                directory.display()
+            ),
+        ),
+        Some(value) if value < stop_gb.saturating_mul(GIB) => (
+            "blocked",
+            format!(
+                "录像目录仅剩 {:.1} GB，低于停止阈值 {} GB",
+                free_gb.unwrap_or_default(),
+                stop_gb
+            ),
+        ),
+        Some(value) if value < warning_gb.saturating_mul(GIB) => (
+            "warning",
+            format!(
+                "录像目录仅剩 {:.1} GB，低于提醒阈值 {} GB",
+                free_gb.unwrap_or_default(),
+                warning_gb
+            ),
+        ),
+        Some(_) => (
+            "ok",
+            format!("录像目录剩余 {:.1} GB", free_gb.unwrap_or_default()),
+        ),
+    };
+    RecordingDiskStatus {
+        directory: directory.display().to_string(),
+        free_bytes,
+        free_gb,
+        warning_gb,
+        stop_gb,
+        state: state.to_string(),
+        message,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Context {
@@ -106,49 +193,24 @@ impl Context {
     }
 
     pub fn recording_output_dir(&self) -> PathBuf {
-        if let Ok(value) = std::env::var("LIVE_REPLAY_OUTPUT_DIR")
-            && !value.trim().is_empty()
-        {
-            return ensure_directory(PathBuf::from(value));
-        }
-
-        #[cfg(windows)]
-        {
-            let d_drive = Path::new(r"D:\");
-            if d_drive.exists() {
-                return ensure_directory(PathBuf::from(r"D:\LiveReplay\Recordings"));
-            }
-        }
-
-        ensure_directory(PathBuf::from("recordings"))
+        default_recording_output_dir()
     }
 
     pub fn ensure_recording_space(&self) -> AppResult<()> {
-        let directory = self.recording_output_dir();
-        let Some(free_bytes) = free_space_bytes(&directory) else {
-            warn!(directory = ?directory, "unable to read free disk space; recording is allowed");
-            return Ok(());
-        };
-
-        let stop_gb = env_u64("LIVE_REPLAY_DISK_STOP_GB", DEFAULT_DISK_STOP_GB).max(1);
-        let warning_gb =
-            env_u64("LIVE_REPLAY_DISK_WARNING_GB", DEFAULT_DISK_WARNING_GB).max(stop_gb);
-        let free_gb = free_bytes as f64 / GIB as f64;
-
-        if free_bytes < stop_gb.saturating_mul(GIB) {
-            return Err(AppError::Custom(format!(
-                "录像目录 {} 仅剩 {:.1} GB，低于停止阈值 {} GB；不会继续创建新分段",
-                directory.display(),
-                free_gb,
-                stop_gb
-            ))
-            .into());
+        let status = recording_disk_status();
+        match status.state.as_str() {
+            "ok" => Ok(()),
+            "warning" => {
+                warn!(
+                    directory = status.directory,
+                    free_gb = status.free_gb,
+                    warning_gb = status.warning_gb,
+                    "recording disk space is below warning threshold"
+                );
+                Ok(())
+            }
+            _ => Err(AppError::Custom(status.message).into()),
         }
-
-        if free_bytes < warning_gb.saturating_mul(GIB) {
-            warn!(directory = ?directory, free_gb, warning_gb, "recording disk space is below warning threshold");
-        }
-        Ok(())
     }
 
     pub fn download_config(&self, stream: &LiveStream) -> DownloadConfig {
@@ -306,6 +368,7 @@ impl Worker {
         if let Some(cfg_p) = self.live_streamer.override_cfg.clone() {
             cfg.apply(cfg_p)
         }
+        cfg.normalize_segment_limits();
         cfg
     }
 

@@ -16,6 +16,8 @@ use tauri_plugin_shell::process::{CommandChild, CommandEvent, Encoding};
 use tauri_plugin_shell::ShellExt;
 
 #[cfg(mobile)]
+mod mobile_monitor;
+#[cfg(mobile)]
 mod mobile_youtube;
 
 #[cfg(mobile)]
@@ -363,6 +365,10 @@ pub fn run() {
         mobile_core_status,
         mobile_start_recording,
         mobile_stop_recording,
+        mobile_monitor::mobile_monitor_status,
+        mobile_monitor::mobile_monitor_add,
+        mobile_monitor::mobile_monitor_remove,
+        mobile_monitor::mobile_monitor_set_enabled,
         mobile_youtube::mobile_youtube_authorize,
         mobile_youtube::mobile_youtube_cached_auth,
         mobile_youtube::mobile_youtube_logout,
@@ -387,8 +393,9 @@ pub fn run() {
             #[cfg(mobile)]
             {
                 app.manage(MobileCoreState::default());
+                mobile_monitor::start_monitor_worker(app.handle().clone());
                 mobile_youtube::start_upload_worker(app.handle().clone());
-                println!("[tauri] Android Live Replay + YouTube worker loaded.");
+                println!("[tauri] Android Live Replay monitor + YouTube worker loaded.");
             }
 
             Ok(())

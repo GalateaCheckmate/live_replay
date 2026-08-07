@@ -1,12 +1,13 @@
-use live_replay_core::{
-    new_stop_flag, probe_stream, record_direct_stream, request_stop, CoreCredentials, ProbeResult,
-    StopFlag,
-};
+use live_replay_core::recording::{RecordingPlan, RecordingSegment, record_live_session};
+use live_replay_core::{CoreCredentials, ProbeResult, StopFlag, new_stop_flag, probe_stream, request_stop};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use tauri::Manager;
+use tauri_plugin_live_replay_android::{FinalizeMp4Request, LiveReplayAndroidExt};
+use tokio::fs;
+use tokio::sync::mpsc;
 
 const MIN_START_FREE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const WARN_FREE_BYTES: u64 = 30 * 1024 * 1024 * 1024;
@@ -154,10 +155,13 @@ pub async fn start_recording(
         ));
     }
 
-    let resolved = match probe_stream(&url, &display_name, credentials).await? {
+    // Keep monitor semantics precise: an offline target must stay "waiting", not become a fake
+    // active recording session. record_live_session will re-probe again inside the long-lived task
+    // so refreshed stream URLs are used after reconnects.
+    match probe_stream(&url, &display_name, credentials.clone()).await? {
         ProbeResult::Offline => return Err("主播当前未开播。".to_string()),
-        ProbeResult::Live { stream } => stream,
-    };
+        ProbeResult::Live { .. } => {}
+    }
 
     if is_recording(&url)? {
         return status(&app);
@@ -186,33 +190,143 @@ pub async fn start_recording(
     let worker_url = url.clone();
     let worker_name = display_name.clone();
     tauri::async_runtime::spawn(async move {
-        let result = match record_direct_stream(resolved, &output_dir, stop_flag).await {
-            Ok(recording) => {
-                super::mobile_youtube::finalize_recording_and_enqueue(
+        let (segment_tx, mut segment_rx) = mpsc::unbounded_channel::<RecordingSegment>();
+        let segment_app = worker_app.clone();
+        let segment_worker = tauri::async_runtime::spawn(async move {
+            while let Some(segment) = segment_rx.recv().await {
+                match finalize_segment_mp4(&segment_app, &segment).await {
+                    Ok(final_mp4) => {
+                        if let Err(error) = super::mobile_bilibili::enqueue_finalized_segment(
+                            &segment_app,
+                            &segment,
+                            &final_mp4,
+                        )
+                        .await
+                        {
+                            set_last_error(format!(
+                                "P{} 已生成但加入 B站队列失败，本地文件保留: {error}",
+                                segment.segment_index
+                            ));
+                        } else {
+                            set_last_file(final_mp4);
+                        }
+                    }
+                    Err(error) => {
+                        set_last_error(format!(
+                            "P{} MP4 收尾失败，源录像保留: {error}",
+                            segment.segment_index
+                        ));
+                    }
+                }
+            }
+        });
+
+        let plan = RecordingPlan::new(
+            worker_url.clone(),
+            worker_name,
+            credentials,
+            output_dir,
+        );
+        let result = record_live_session(plan, stop_flag, Some(segment_tx)).await;
+
+        match result {
+            Ok(session) => {
+                // Dropping the recorder sender lets the consumer finish the final segment before
+                // the session is marked recording-complete.
+                let _ = segment_worker.await;
+                if let Err(error) = super::mobile_bilibili::mark_session_recording_complete(
                     &worker_app,
-                    recording,
-                    &worker_name,
+                    &session.live_session_id,
+                    session.ended_at,
                 )
                 .await
+                {
+                    set_last_error(format!("保存 B站 session 完成状态失败: {error}"));
+                }
+                if let Some(error) = session.last_error {
+                    set_last_error(error);
+                }
             }
-            Err(error) => Err(error),
-        };
+            Err(error) => {
+                let _ = segment_worker.await;
+                set_last_error(error);
+            }
+        }
 
         if let Ok(mut state) = runtime().lock() {
             state.recordings.remove(&worker_url);
-            match result {
-                Ok(final_mp4) => {
-                    state.last_file = Some(final_mp4);
-                    state.last_error = None;
-                }
-                Err(error) => {
-                    state.last_error = Some(error);
-                }
-            }
         }
     });
 
     status(&app)
+}
+
+async fn finalize_segment_mp4(
+    app: &tauri::AppHandle,
+    segment: &RecordingSegment,
+) -> Result<String, String> {
+    let source = PathBuf::from(&segment.source_path);
+    let final_mp4 = PathBuf::from(&segment.final_mp4_path);
+    verify_nonempty_file(&source).await?;
+
+    let produced = if source == final_mp4 {
+        source
+    } else {
+        if fs::metadata(&final_mp4).await.is_ok() {
+            return Err(format!("最终 MP4 已存在，拒绝覆盖: {}", final_mp4.display()));
+        }
+        let result = app.live_replay_android().finalize_mp4(FinalizeMp4Request {
+            input_path: source.to_string_lossy().into_owned(),
+            output_path: final_mp4.to_string_lossy().into_owned(),
+        })?;
+        PathBuf::from(result.output_path)
+    };
+
+    verify_nonempty_file(&produced).await?;
+    sync_file(&produced).await?;
+
+    // Removing the source container is only local remux cleanup. The finalized MP4 remains on the
+    // device and is never deleted by this path; remote-success deletion belongs to each uploader.
+    if source != produced {
+        if let Err(error) = fs::remove_file(&source).await {
+            eprintln!("[recording] MP4 is safe; source container kept: {error}");
+        }
+    }
+    Ok(produced.to_string_lossy().into_owned())
+}
+
+async fn verify_nonempty_file(path: &Path) -> Result<(), String> {
+    let metadata = fs::metadata(path)
+        .await
+        .map_err(|error| format!("录像文件不存在 {}: {error}", path.display()))?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err(format!("录像文件为空: {}", path.display()));
+    }
+    Ok(())
+}
+
+async fn sync_file(path: &Path) -> Result<(), String> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .await
+        .map_err(|error| format!("打开 MP4 同步失败: {error}"))?;
+    file.sync_all()
+        .await
+        .map_err(|error| format!("同步 MP4 失败: {error}"))
+}
+
+fn set_last_file(path: String) {
+    if let Ok(mut state) = runtime().lock() {
+        state.last_file = Some(path);
+        state.last_error = None;
+    }
+}
+
+fn set_last_error(error: String) {
+    if let Ok(mut state) = runtime().lock() {
+        state.last_error = Some(error);
+    }
 }
 
 #[tauri::command]

@@ -3,7 +3,9 @@ import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
 function App() {
-  const isAndroid = useMemo(() => /Android/i.test(navigator.userAgent), []);
+  const userAgent = useMemo(() => navigator.userAgent, []);
+  const isAndroid = useMemo(() => /Android/i.test(userAgent), [userAgent]);
+  const isHuawei = useMemo(() => /HUAWEI|ANA-|HarmonyOS/i.test(userAgent), [userAgent]);
   const [status, setStatus] = useState("正在初始化 Android 壳...");
 
   useEffect(() => {
@@ -12,8 +14,12 @@ function App() {
       return;
     }
 
-    setStatus("Android 壳已启动，Windows sidecar 已隔离。下一步接入原生录制核心。");
-  }, [isAndroid]);
+    setStatus(
+      isHuawei
+        ? "已进入华为 / HarmonyOS 适配模式。当前 APK 为 ARM64，并启用后台录制所需基础权限。"
+        : "Android 壳已启动，Windows sidecar 已隔离。下一步接入原生录制核心。",
+    );
+  }, [isAndroid, isHuawei]);
 
   async function probeCore() {
     try {
@@ -34,7 +40,7 @@ function App() {
         <span className="eyebrow">LIVE REPLAY · ANDROID</span>
         <h1>手机录制端</h1>
         <p className="subtitle">
-          第一阶段先保证 APK 壳可启动、可安装，并彻底去掉 Windows 专属依赖。
+          当前优先适配 Huawei P40 · HarmonyOS 4.2，目标是锁屏后仍能持续录制和上传。
         </p>
       </section>
 
@@ -48,21 +54,32 @@ function App() {
 
       <section className="grid">
         <article>
-          <strong>录制核心</strong>
-          <span>待接入 Rust / Android 原生运行层</span>
+          <strong>CPU 架构</strong>
+          <span>ARM64 / aarch64，针对 P40 麒麟平台构建</span>
         </article>
         <article>
           <strong>后台常驻</strong>
-          <span>下一阶段接 Foreground Service</span>
+          <span>已预留 WakeLock 与 Foreground Service 权限</span>
         </article>
         <article>
-          <strong>B 站上传</strong>
-          <span>复用现有 Rust 上传逻辑</span>
+          <strong>网络</strong>
+          <span>允许锁屏持续联网，并兼容仍使用 HTTP 的直播源</span>
         </article>
         <article>
-          <strong>存储</strong>
-          <span>下一阶段适配 Android 私有目录与空间保护</span>
+          <strong>系统基线</strong>
+          <span>最低 Android API 29，减少旧系统兼容负担</span>
         </article>
+      </section>
+
+      <section className="huawei-card">
+        <strong>HarmonyOS 4.2 长期录制设置</strong>
+        <ol>
+          <li>应用启动管理：关闭自动管理，并允许后台活动。</li>
+          <li>电池优化：把 Live Replay 设为“不允许优化”。</li>
+          <li>更多电池设置：开启“休眠时始终保持网络连接”。</li>
+          <li>最近任务中下拉 Live Replay 卡片并加锁。</li>
+          <li>录制期间不要开启省电模式或超级省电。</li>
+        </ol>
       </section>
 
       <button type="button" onClick={probeCore}>

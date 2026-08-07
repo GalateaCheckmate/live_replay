@@ -34,6 +34,12 @@ pub struct FinalizeMp4Result {
     pub bytes: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackgroundActiveRequest {
+    active: bool,
+}
+
 pub struct LiveReplayAndroid<R: Runtime>(PluginHandle<R>);
 
 impl<R: Runtime> LiveReplayAndroid<R> {
@@ -52,6 +58,12 @@ impl<R: Runtime> LiveReplayAndroid<R> {
     pub fn logout_youtube(&self) -> Result<(), String> {
         self.0
             .run_mobile_plugin::<()>("logoutYoutube", EmptyPayload::default())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn set_background_active(&self, active: bool) -> Result<(), String> {
+        self.0
+            .run_mobile_plugin::<()>("setBackgroundActive", BackgroundActiveRequest { active })
             .map_err(|error| error.to_string())
     }
 

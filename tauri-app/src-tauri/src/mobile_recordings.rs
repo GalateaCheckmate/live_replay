@@ -3,14 +3,16 @@ use live_replay_core::{CoreCredentials, ProbeResult, StopFlag, new_stop_flag, pr
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::Manager;
 use tauri_plugin_live_replay_android::{FinalizeMp4Request, LiveReplayAndroidExt};
 use tokio::fs;
 use tokio::sync::mpsc;
+use tokio::time::{Duration, sleep};
 
 const MIN_START_FREE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const WARN_FREE_BYTES: u64 = 30 * 1024 * 1024 * 1024;
+const JOURNAL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 
 #[derive(Default)]
 struct MultiRecordingRuntime {
@@ -167,8 +169,21 @@ pub async fn start_recording(
         return status(&app);
     }
 
+    let prepared = super::mobile_recording_journal::prepare_session(&app, &url, &display_name).await?;
+    if let Some((stale_session_id, stale_ended_at)) = &prepared.stale_session {
+        if let Err(error) = super::mobile_bilibili::mark_session_recording_complete(
+            &app,
+            stale_session_id,
+            *stale_ended_at,
+        )
+        .await
+        {
+            return Err(format!("关闭旧 liveSession 失败，为避免拆稿已停止新录制: {error}"));
+        }
+    }
+
     let stop_flag = new_stop_flag();
-    let started_at = chrono::Utc::now().timestamp();
+    let started_at = prepared.session_started_at;
     {
         let mut state = runtime()
             .lock()
@@ -194,6 +209,20 @@ pub async fn start_recording(
         let segment_app = worker_app.clone();
         let segment_worker = tauri::async_runtime::spawn(async move {
             while let Some(segment) = segment_rx.recv().await {
+                if let Err(error) = super::mobile_recording_journal::register_completed_segment(
+                    &segment_app,
+                    &segment.room_url,
+                    &segment,
+                )
+                .await
+                {
+                    set_last_error(format!(
+                        "P{} 已安全切出但 journal 持久化失败，停止后处理且保留源文件: {error}",
+                        segment.segment_index
+                    ));
+                    continue;
+                }
+
                 match finalize_segment_mp4(&segment_app, &segment).await {
                     Ok(final_mp4) => {
                         if let Err(error) = super::mobile_bilibili::enqueue_finalized_segment(
@@ -204,7 +233,21 @@ pub async fn start_recording(
                         .await
                         {
                             set_last_error(format!(
-                                "P{} 已生成但加入 B站队列失败，本地文件保留: {error}",
+                                "P{} 已生成但加入 B站队列失败，本地文件及 journal 均保留: {error}",
+                                segment.segment_index
+                            ));
+                        } else if let Err(error) =
+                            super::mobile_recording_journal::complete_segment_handoff(
+                                &segment_app,
+                                &segment.live_session_id,
+                                segment.segment_index,
+                            )
+                            .await
+                        {
+                            // Bilibili queue de-duplicates by session/index, so retaining this
+                            // pending journal entry is safe and recoverable on the next startup.
+                            set_last_error(format!(
+                                "P{} 已进入 B站队列，但清理 journal 标记失败，将在重启后安全复核: {error}",
                                 segment.segment_index
                             ));
                         } else {
@@ -213,7 +256,7 @@ pub async fn start_recording(
                     }
                     Err(error) => {
                         set_last_error(format!(
-                            "P{} MP4 收尾失败，源录像保留: {error}",
+                            "P{} MP4 收尾失败，源录像和 journal 均保留: {error}",
                             segment.segment_index
                         ));
                     }
@@ -221,27 +264,59 @@ pub async fn start_recording(
             }
         });
 
-        let plan = RecordingPlan::new(
+        let heartbeat_app = worker_app.clone();
+        let heartbeat_url = worker_url.clone();
+        let heartbeat_worker = tauri::async_runtime::spawn(async move {
+            loop {
+                sleep(JOURNAL_HEARTBEAT_INTERVAL).await;
+                if let Err(error) =
+                    super::mobile_recording_journal::heartbeat(&heartbeat_app, &heartbeat_url).await
+                {
+                    eprintln!("[recording] journal heartbeat failed: {error}");
+                }
+            }
+        });
+
+        let mut plan = RecordingPlan::new(
             worker_url.clone(),
             worker_name,
             credentials,
             output_dir,
         );
+        plan.live_session_id = Some(prepared.live_session_id.clone());
+        plan.session_started_at = Some(prepared.session_started_at);
+        plan.next_segment_index = prepared.next_segment_index;
+        plan.segment_started_at = Some(prepared.current_segment_started_at);
         let result = record_live_session(plan, stop_flag, Some(segment_tx)).await;
+        heartbeat_worker.abort();
 
         match result {
             Ok(session) => {
                 // Dropping the recorder sender lets the consumer finish the final segment before
                 // the session is marked recording-complete.
                 let _ = segment_worker.await;
-                if let Err(error) = super::mobile_bilibili::mark_session_recording_complete(
+                match super::mobile_bilibili::mark_session_recording_complete(
                     &worker_app,
                     &session.live_session_id,
                     session.ended_at,
                 )
                 .await
                 {
-                    set_last_error(format!("保存 B站 session 完成状态失败: {error}"));
+                    Ok(()) => {
+                        if let Err(error) =
+                            super::mobile_recording_journal::finish_session(&worker_app, &worker_url)
+                                .await
+                        {
+                            set_last_error(format!(
+                                "B站 session 已标记结束，但清理 recording journal 失败: {error}"
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        set_last_error(format!(
+                            "保存 B站 session 完成状态失败，recording journal 保留: {error}"
+                        ));
+                    }
                 }
                 if let Some(error) = session.last_error {
                     set_last_error(error);
@@ -249,6 +324,7 @@ pub async fn start_recording(
             }
             Err(error) => {
                 let _ = segment_worker.await;
+                // Keep the journal so a restarted process can resume the same liveSession.
                 set_last_error(error);
             }
         }
@@ -261,20 +337,25 @@ pub async fn start_recording(
     status(&app)
 }
 
-async fn finalize_segment_mp4(
+pub(crate) async fn finalize_segment_mp4(
     app: &tauri::AppHandle,
     segment: &RecordingSegment,
 ) -> Result<String, String> {
     let source = PathBuf::from(&segment.source_path);
     let final_mp4 = PathBuf::from(&segment.final_mp4_path);
-    verify_nonempty_file(&source).await?;
 
+    // Crash-safe idempotency: if remux completed before the process died, trust only a verified,
+    // non-empty, fsynced MP4 and continue hand-off without requiring the already-removed source.
+    if fs::metadata(&final_mp4).await.is_ok() {
+        verify_nonempty_file(&final_mp4).await?;
+        sync_file(&final_mp4).await?;
+        return Ok(final_mp4.to_string_lossy().into_owned());
+    }
+
+    verify_nonempty_file(&source).await?;
     let produced = if source == final_mp4 {
         source.clone()
     } else {
-        if fs::metadata(&final_mp4).await.is_ok() {
-            return Err(format!("最终 MP4 已存在，拒绝覆盖: {}", final_mp4.display()));
-        }
         let result = app.live_replay_android().finalize_mp4(FinalizeMp4Request {
             input_path: source.to_string_lossy().into_owned(),
             output_path: final_mp4.to_string_lossy().into_owned(),

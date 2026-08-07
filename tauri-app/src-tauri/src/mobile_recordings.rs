@@ -5,7 +5,7 @@ use live_replay_core::{
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use tauri::Manager;
 use tauri_plugin_live_replay_android::{FinalizeMp4Request, LiveReplayAndroidExt};
 use tokio::fs;
@@ -133,9 +133,6 @@ pub async fn mobile_start_recording_multi(
     .await
 }
 
-/// Legacy/manual start entry: perform at most one platform probe, then pass the exact resolved
-/// media stream into the recorder. Monitor/UI live-check paths should call
-/// `start_recording_resolved` instead so their already-resolved stream is never thrown away.
 pub async fn start_recording(
     app: tauri::AppHandle,
     url: String,
@@ -157,8 +154,6 @@ pub async fn start_recording(
     start_recording_resolved(app, url, display_name, credentials, resolved).await
 }
 
-/// Start from a stream that has already been resolved by a successful live check. There is no
-/// platform probe on this path before the first media connection/file write.
 pub async fn start_recording_resolved(
     app: tauri::AppHandle,
     url: String,
@@ -196,7 +191,8 @@ async fn start_recording_inner(
         ));
     }
 
-    let prepared = super::mobile_recording_journal::prepare_session(&app, &url, &display_name).await?;
+    let prepared =
+        super::mobile_recording_journal::prepare_session(&app, &url, &display_name).await?;
     if let Some((stale_session_id, stale_ended_at)) = &prepared.stale_session {
         if let Err(error) = super::mobile_bilibili::mark_session_recording_complete(
             &app,
@@ -205,7 +201,9 @@ async fn start_recording_inner(
         )
         .await
         {
-            return Err(format!("关闭旧 liveSession 失败，为避免拆稿已停止新录制: {error}"));
+            return Err(format!(
+                "关闭旧 liveSession 失败，为避免拆稿已停止新录制: {error}"
+            ));
         }
     }
 
@@ -271,8 +269,6 @@ async fn start_recording_inner(
                             )
                             .await
                         {
-                            // Bilibili queue de-duplicates by session/index, so retaining this
-                            // pending journal entry is safe and recoverable on the next startup.
                             set_last_error(format!(
                                 "P{} 已进入 B站队列，但清理 journal 标记失败，将在重启后安全复核: {error}",
                                 segment.segment_index
@@ -320,8 +316,6 @@ async fn start_recording_inner(
 
         match result {
             Ok(session) => {
-                // Dropping the recorder sender lets the consumer finish the final segment before
-                // the session is marked recording-complete.
                 let _ = segment_worker.await;
                 match super::mobile_bilibili::mark_session_recording_complete(
                     &worker_app,
@@ -352,7 +346,6 @@ async fn start_recording_inner(
             }
             Err(error) => {
                 let _ = segment_worker.await;
-                // Keep the journal so a restarted process can resume the same liveSession.
                 set_last_error(error);
             }
         }
@@ -372,36 +365,69 @@ pub(crate) async fn finalize_segment_mp4(
     let source = PathBuf::from(&segment.source_path);
     let final_mp4 = PathBuf::from(&segment.final_mp4_path);
 
-    // Crash-safe idempotency: if remux completed before the process died, trust only a verified,
-    // non-empty, fsynced MP4 and continue hand-off without requiring the already-removed source.
+    if source == final_mp4 {
+        verify_nonempty_file(&source).await?;
+        sync_file(&source).await?;
+        return Ok(source.to_string_lossy().into_owned());
+    }
+
+    let source_exists = fs::metadata(&source).await.is_ok();
     if fs::metadata(&final_mp4).await.is_ok() {
-        verify_nonempty_file(&final_mp4).await?;
-        sync_file(&final_mp4).await?;
-        return Ok(final_mp4.to_string_lossy().into_owned());
+        if !source_exists {
+            // Files created by this version only become visible at final_mp4 after an atomic
+            // rename from .remuxing. Legacy installs may also reach this path after source cleanup.
+            verify_nonempty_file(&final_mp4).await?;
+            sync_file(&final_mp4).await?;
+            return Ok(final_mp4.to_string_lossy().into_owned());
+        }
+
+        // Older builds wrote FFmpeg output directly to the final filename. If the source still
+        // exists we cannot prove that MP4 survived a crash, so preserve it for inspection and
+        // rebuild from the durable source instead of ever uploading an ambiguous partial file.
+        let quarantine = PathBuf::from(format!(
+            "{}.unverified-{}",
+            final_mp4.to_string_lossy(),
+            chrono::Utc::now().timestamp_millis()
+        ));
+        fs::rename(&final_mp4, &quarantine)
+            .await
+            .map_err(|error| format!("隔离旧版未确认 MP4 失败: {error}"))?;
     }
 
     verify_nonempty_file(&source).await?;
-    let produced = if source == final_mp4 {
-        source.clone()
-    } else {
-        let result = app.live_replay_android().finalize_mp4(FinalizeMp4Request {
-            input_path: source.to_string_lossy().into_owned(),
-            output_path: final_mp4.to_string_lossy().into_owned(),
-        })?;
-        PathBuf::from(result.output_path)
-    };
-
-    verify_nonempty_file(&produced).await?;
-    sync_file(&produced).await?;
-
-    // Removing the source container is only local remux cleanup. The finalized MP4 remains on the
-    // device and is never deleted by this path; remote-success deletion belongs to each uploader.
-    if source != produced {
-        if let Err(error) = fs::remove_file(&source).await {
-            eprintln!("[recording] MP4 is safe; source container kept: {error}");
-        }
+    let temp_mp4 = PathBuf::from(format!("{}.remuxing", final_mp4.to_string_lossy()));
+    if fs::metadata(&temp_mp4).await.is_ok() {
+        fs::remove_file(&temp_mp4)
+            .await
+            .map_err(|error| format!("清理上次未完成 MP4 临时文件失败: {error}"))?;
     }
-    Ok(produced.to_string_lossy().into_owned())
+
+    let result = app
+        .live_replay_android()
+        .finalize_mp4(FinalizeMp4Request {
+            input_path: source.to_string_lossy().into_owned(),
+            output_path: temp_mp4.to_string_lossy().into_owned(),
+        })?;
+    let produced = PathBuf::from(result.output_path);
+    if produced != temp_mp4 {
+        return Err(format!(
+            "Android MP4 finalize 返回了意外路径: {}",
+            produced.display()
+        ));
+    }
+    verify_nonempty_file(&temp_mp4).await?;
+    sync_file(&temp_mp4).await?;
+
+    fs::rename(&temp_mp4, &final_mp4)
+        .await
+        .map_err(|error| format!("原子提交最终 MP4 失败: {error}"))?;
+    sync_parent_dir(&final_mp4);
+    verify_nonempty_file(&final_mp4).await?;
+
+    if let Err(error) = fs::remove_file(&source).await {
+        eprintln!("[recording] MP4 is safe; source container kept: {error}");
+    }
+    Ok(final_mp4.to_string_lossy().into_owned())
 }
 
 async fn verify_nonempty_file(path: &Path) -> Result<(), String> {
@@ -425,6 +451,14 @@ async fn sync_file(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("同步 MP4 失败: {error}"))
 }
 
+fn sync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(directory) = std::fs::File::open(parent) {
+            let _ = directory.sync_all();
+        }
+    }
+}
+
 fn set_last_file(path: String) {
     if let Ok(mut state) = runtime().lock() {
         state.last_file = Some(path);
@@ -439,22 +473,36 @@ fn set_last_error(error: String) {
 }
 
 #[tauri::command]
-pub fn mobile_stop_recording_multi(
+pub async fn mobile_stop_recording_multi(
     app: tauri::AppHandle,
     room_url: Option<String>,
 ) -> Result<MultiRecordingStatus, String> {
-    {
+    let stopped_urls = {
         let state = runtime()
             .lock()
             .map_err(|_| "Android 多路录制状态锁异常".to_string())?;
         if let Some(room_url) = room_url.as_deref() {
             if let Some(recording) = state.recordings.get(room_url) {
                 request_stop(&recording.stop_flag);
+                vec![recording.room_url.clone()]
+            } else {
+                Vec::new()
             }
         } else {
+            let urls = state.recordings.keys().cloned().collect::<Vec<_>>();
             for recording in state.recordings.values() {
                 request_stop(&recording.stop_flag);
             }
+            urls
+        }
+    };
+
+    // Stopping a recording is scoped to the current live session. Keep the monitor enabled, but do
+    // not immediately restart the same broadcast. Once an offline probe is observed, monitoring
+    // automatically arms itself for the next live session.
+    for url in stopped_urls {
+        if let Err(error) = super::mobile_monitor::suppress_until_offline(&app, &url).await {
+            set_last_error(format!("停止录像成功，但保存本场抑制状态失败: {error}"));
         }
     }
     status(&app)

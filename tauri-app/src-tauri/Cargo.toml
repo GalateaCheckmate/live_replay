@@ -22,6 +22,7 @@ tokio = { version = "1", features = ["fs", "sync", "time"] }
 fs2 = "0.4.3"
 tauri-plugin-shell = "2"
 live-replay-core = { path = "../../crates/live-replay-core" }
+biliup = { path = "../../crates/biliup" }
 
 [target.'cfg(target_os = "android")'.dependencies]
 tauri-plugin-live-replay-android = { path = "plugins/live-replay-android" }

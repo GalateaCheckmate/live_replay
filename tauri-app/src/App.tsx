@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
@@ -40,6 +40,7 @@ type MonitorTarget = {
   url: string;
   name: string;
   enabled: boolean;
+  suppress_until_offline?: boolean;
   last_state: string;
   last_error?: string | null;
   last_checked_at?: number | null;
@@ -214,33 +215,41 @@ function App() {
   const [bilibiliQr, setBilibiliQr] = useState<BilibiliQrStart | null>(null);
   const [youtube, setYoutube] = useState<YoutubeStatus>(emptyYoutube);
   const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
+  const refreshInFlightRef = useRef(false);
 
-  async function refreshCoreStatus() {
+  function setBusyState(value: boolean) {
+    busyRef.current = value;
+    setBusy(value);
+  }
+
+  async function refreshCoreStatus(updateMessage = false) {
     try {
       const next = await invoke<CoreStatus>("mobile_recordings_status");
       setCore(next);
+      if (!updateMessage) return;
       if (next.last_error) setMessage(next.last_error);
       else if (next.active) setMessage(`正在同时录制 ${next.active_count} 路直播 · 单段约 15GB 自动安全切换`);
       else if (next.low_space_warning) setMessage(`可用存储空间较低：${formatBytes(next.available_bytes)}`);
       else setMessage("后台监控与录制服务已就绪");
     } catch (error) {
-      setMessage(String(error));
+      if (updateMessage) setMessage(String(error));
     }
   }
 
-  async function refreshMonitor() {
+  async function refreshMonitor(updateMessage = false) {
     try {
       setMonitor(await invoke<MonitorStore>("mobile_monitor_status"));
     } catch (error) {
-      setMessage(String(error));
+      if (updateMessage) setMessage(String(error));
     }
   }
 
-  async function refreshBilibili() {
+  async function refreshBilibili(updateMessage = false) {
     try {
       setBilibili(await invoke<BilibiliStore>("mobile_bilibili_status"));
     } catch (error) {
-      setMessage(String(error));
+      if (updateMessage) setMessage(String(error));
     }
   }
 
@@ -252,20 +261,32 @@ function App() {
     }
   }
 
-  async function refreshYoutube() {
+  async function refreshYoutube(updateMessage = false) {
     try {
       setYoutube(await invoke<YoutubeStatus>("mobile_youtube_status"));
     } catch (error) {
-      setMessage(String(error));
+      if (updateMessage) setMessage(String(error));
     }
   }
 
-  async function refreshLocalState() {
-    await Promise.allSettled([refreshCoreStatus(), refreshMonitor(), refreshBilibili(), refreshYoutube()]);
+  async function refreshLocalState(updateMessage = false) {
+    if (refreshInFlightRef.current) return;
+    if (!updateMessage && busyRef.current) return;
+    refreshInFlightRef.current = true;
+    try {
+      await Promise.allSettled([
+        refreshCoreStatus(updateMessage),
+        refreshMonitor(updateMessage),
+        refreshBilibili(updateMessage),
+        refreshYoutube(updateMessage),
+      ]);
+    } finally {
+      refreshInFlightRef.current = false;
+    }
   }
 
-  async function refreshAll() {
-    await Promise.allSettled([refreshLocalState(), refreshBilibiliAuth()]);
+  async function refreshAll(updateMessage = true) {
+    await Promise.allSettled([refreshLocalState(updateMessage), refreshBilibiliAuth()]);
   }
 
   useEffect(() => {
@@ -273,8 +294,10 @@ function App() {
       window.location.replace("http://localhost:19159");
       return;
     }
-    refreshAll();
-    const timer = window.setInterval(refreshLocalState, 3000);
+    void refreshAll(true);
+    const timer = window.setInterval(() => {
+      void refreshLocalState(false);
+    }, 3000);
     return () => window.clearInterval(timer);
   }, [isAndroid]);
 
@@ -283,9 +306,9 @@ function App() {
       setMessage("请输入 B站或抖音直播间地址");
       return;
     }
-    setBusy(true);
+    setBusyState(true);
     setProbe(null);
-    setMessage("正在解析直播间...");
+    setMessage("正在解析直播间并准备录制...");
     try {
       const result = await withTimeout(
         invoke<ProbeResult>("mobile_probe_stream", {
@@ -298,11 +321,15 @@ function App() {
         "直播检测超过 35 秒，已恢复界面。请检查模拟器网络后重试。",
       );
       setProbe(result);
-      setMessage(result.status === "live" ? `已解析 ${result.stream.platform}：${result.stream.title || result.stream.name}` : "主播当前未开播");
+      setMessage(
+        result.status === "live"
+          ? `检测到开播，已启动录制：${result.stream.title || result.stream.name}`
+          : "主播当前未开播",
+      );
     } catch (error) {
       setMessage(String(error));
     } finally {
-      setBusy(false);
+      setBusyState(false);
     }
   }
 
@@ -311,18 +338,21 @@ function App() {
       setMessage("请输入直播间地址");
       return;
     }
-    setBusy(true);
+    setBusyState(true);
+    setMessage("正在加入监控并立即检查直播状态...");
     try {
       const next = await invoke<MonitorStore>("mobile_monitor_add", { url: url.trim(), name: name.trim() || null });
       setMonitor(next);
-      setMessage("已加入监控。检测到开播后自动录制，并在单段接近 15GB 时安全切换下一段。");
+      const added = next.targets.find((target) => target.url === url.trim());
+      setMessage(added?.last_error || added?.last_state || "已加入监控。检测到开播后自动录制。");
       setUrl("");
       setName("");
       setProbe(null);
+      void refreshLocalState(false);
     } catch (error) {
       setMessage(String(error));
     } finally {
-      setBusy(false);
+      setBusyState(false);
     }
   }
 
@@ -343,20 +373,23 @@ function App() {
   }
 
   async function stopRecording(roomUrl?: string) {
-    setBusy(true);
+    setBusyState(true);
     setMessage(roomUrl ? "正在停止该路录制并安全收尾当前分段..." : "正在停止全部录制并安全收尾当前分段...");
     try {
       setCore(await invoke<CoreStatus>("mobile_stop_recording_multi", { roomUrl: roomUrl || null }));
-      window.setTimeout(refreshLocalState, 1000);
+      setMessage(roomUrl ? "已请求停止本场录制；本场下播前不会自动重新开始。" : "已请求停止全部当前录制；各主播下播后自动重新布防。" );
+      window.setTimeout(() => {
+        void refreshLocalState(false);
+      }, 1000);
     } catch (error) {
       setMessage(String(error));
     } finally {
-      setBusy(false);
+      setBusyState(false);
     }
   }
 
   async function startBilibiliLogin() {
-    setBusy(true);
+    setBusyState(true);
     try {
       const qr = await invoke<BilibiliQrStart>("mobile_bilibili_auth_start");
       setBilibiliQr(qr);
@@ -364,12 +397,12 @@ function App() {
     } catch (error) {
       setMessage(String(error));
     } finally {
-      setBusy(false);
+      setBusyState(false);
     }
   }
 
   async function completeBilibiliLogin() {
-    setBusy(true);
+    setBusyState(true);
     setMessage("正在等待 B站扫码确认...");
     try {
       const auth = await withTimeout(
@@ -380,16 +413,16 @@ function App() {
       setBilibiliAuth(auth);
       setBilibiliQr(null);
       setMessage(`B站已登录：${auth.name || `UID ${auth.mid || ""}`}`);
-      await refreshBilibili();
+      await refreshBilibili(false);
     } catch (error) {
       setMessage(String(error));
     } finally {
-      setBusy(false);
+      setBusyState(false);
     }
   }
 
   async function logoutBilibili() {
-    setBusy(true);
+    setBusyState(true);
     try {
       await invoke("mobile_bilibili_logout");
       setBilibiliAuth(emptyBilibiliAuth);
@@ -398,7 +431,7 @@ function App() {
     } catch (error) {
       setMessage(String(error));
     } finally {
-      setBusy(false);
+      setBusyState(false);
     }
   }
 
@@ -411,29 +444,29 @@ function App() {
   }
 
   async function authorizeYoutube() {
-    setBusy(true);
+    setBusyState(true);
     try {
       const auth = await invoke<YoutubeAuthResult>("mobile_youtube_authorize");
       if (!auth.authorized) throw new Error("YouTube 授权未完成");
       setMessage(`YouTube 已登录：${auth.account_label || "Google Account"}`);
-      await refreshYoutube();
+      await refreshYoutube(false);
     } catch (error) {
       setMessage(String(error));
     } finally {
-      setBusy(false);
+      setBusyState(false);
     }
   }
 
   async function logoutYoutube() {
-    setBusy(true);
+    setBusyState(true);
     try {
       await invoke("mobile_youtube_logout");
       setMessage("YouTube 已退出；已有录像和未完成上传任务均会保留。");
-      await refreshYoutube();
+      await refreshYoutube(false);
     } catch (error) {
       setMessage(String(error));
     } finally {
-      setBusy(false);
+      setBusyState(false);
     }
   }
 
@@ -481,7 +514,7 @@ function App() {
           <strong>{core.active ? `正在录制 ${core.active_count} 路` : "服务状态"}</strong>
           <span>{message}</span>
         </div>
-        <button className="text-button" type="button" onClick={refreshAll}>刷新</button>
+        <button className="text-button" type="button" onClick={() => void refreshAll(true)}>刷新</button>
       </section>
 
       {tab === "record" && (

@@ -20,9 +20,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-/// Live Replay 以文件大小作为统一的录制分段标准。
-/// 使用十进制 15 GB，给后续封装和平台侧限制留出余量。
-pub const LIVE_REPLAY_SEGMENT_BYTES: u64 = 15_000_000_000;
 const DOWNLOAD_FAILURE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 下载器配置
@@ -56,11 +53,6 @@ impl DownloadConfig {
     /// 返回完整的输出文件路径
     fn generate_output_filename(&self, suffix: &str) -> PathBuf {
         self.output_dir.join(self.recorder.generate_path(suffix))
-    }
-
-    fn apply_live_replay_segment_policy(&mut self) {
-        self.segment_time = None;
-        self.file_size = Some(LIVE_REPLAY_SEGMENT_BYTES);
     }
 }
 
@@ -112,12 +104,8 @@ impl DownloaderRuntime {
     pub async fn download<'a>(
         &self,
         callback: Box<dyn FnMut(SegmentEvent) + Send + Sync + 'a>,
-        mut download_config: DownloadConfig,
+        download_config: DownloadConfig,
     ) -> AppResult<DownloadStatus> {
-        // 所有 Live Replay 录制引擎都从这里拿到同一套分段策略，避免某个引擎
-        // 继续沿用旧的按时长分段配置。
-        download_config.apply_live_replay_segment_policy();
-
         let started = tokio::time::Instant::now();
         let result = match self {
             Self::Ffmpeg(d) => d.download(callback, download_config).await,
@@ -126,8 +114,8 @@ impl DownloaderRuntime {
             Self::YtDlp(d) => d.download(callback, download_config).await,
         };
 
-        // 正常的外部分段需要立刻开始下一段，不能人为等待。只有流结束或失败时
-        // 才设置最小冷却时间，避免源站异常时反复创建进程、占满 CPU 和日志。
+        // 正常分段需要立刻开始下一段。只有流结束或失败时设置最小冷却，
+        // 避免源站异常时反复创建进程、占满 CPU 和日志。
         let needs_cooldown = matches!(
             &result,
             Err(_) | Ok(DownloadStatus::StreamEnded) | Ok(DownloadStatus::Error(_))
@@ -282,22 +270,5 @@ fn parse_duration(duration: &str) -> u64 {
         hours * 3600 + minutes * 60 + seconds
     } else {
         0
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn live_replay_uses_15gb_size_segments() {
-        let mut config = DownloadConfig::default();
-        config.segment_time = Some("01:00:00".to_string());
-        config.file_size = Some(1024);
-
-        config.apply_live_replay_segment_policy();
-
-        assert_eq!(config.segment_time, None);
-        assert_eq!(config.file_size, Some(15_000_000_000));
     }
 }

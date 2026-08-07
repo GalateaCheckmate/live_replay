@@ -3,7 +3,7 @@ use biliup::client::StatelessClient;
 use biliup::downloader::hls;
 use biliup::downloader::httpflv::{self, Connection};
 use biliup::downloader::util::{LifecycleFile, Segmentable};
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, TimeZone};
 use reqwest::header::{ACCEPT_ENCODING, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -61,6 +61,12 @@ pub struct RecordingPlan {
     pub credentials: CoreCredentials,
     pub output_dir: PathBuf,
     pub live_session_id: Option<String>,
+    /// Original liveSession start time. Set when resuming after a process restart.
+    pub session_started_at: Option<i64>,
+    /// First segment number emitted by this process. Normally 1; restored sessions continue N+1.
+    pub next_segment_index: u32,
+    /// Start timestamp for the segment currently being resumed/continued.
+    pub segment_started_at: Option<i64>,
     pub segment_target_bytes: u64,
 }
 
@@ -77,6 +83,9 @@ impl RecordingPlan {
             credentials,
             output_dir: output_dir.into(),
             live_session_id: None,
+            session_started_at: None,
+            next_segment_index: 1,
+            segment_started_at: None,
             segment_target_bytes: SEGMENT_TARGET_BYTES,
         }
     }
@@ -191,7 +200,14 @@ pub async fn record_live_session(
         plan.segment_target_bytes = SEGMENT_TARGET_BYTES;
     }
 
-    let session_started = Local::now();
+    let session_started = plan
+        .session_started_at
+        .and_then(|timestamp| Local.timestamp_opt(timestamp, 0).single())
+        .unwrap_or_else(Local::now);
+    let segment_started = plan
+        .segment_started_at
+        .and_then(|timestamp| Local.timestamp_opt(timestamp, 0).single())
+        .unwrap_or(session_started);
     let live_session_id = plan
         .live_session_id
         .clone()
@@ -250,8 +266,8 @@ pub async fn record_live_session(
                 platform: resolved.platform.clone(),
                 room_url: plan.room_url.clone(),
                 output_dir: plan.output_dir.clone(),
-                next_index: 1,
-                segment_started: session_started,
+                next_index: plan.next_segment_index.max(1),
+                segment_started,
                 segments: Vec::new(),
                 errors: Vec::new(),
                 tx: segment_tx.clone(),

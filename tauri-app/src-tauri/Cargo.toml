@@ -5,12 +5,7 @@ description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [lib]
-# The `_lib` suffix may seem redundant but it is necessary
-# to make the lib name unique and wouldn't conflict with the bin name.
-# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "tauri_app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
@@ -25,5 +20,8 @@ serde_json = "1"
 tauri-plugin-shell = "2"
 live-replay-core = { path = "../../crates/live-replay-core" }
 
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+tauri-plugin-live-replay-android = { path = "plugins/live-replay-android" }
+
 [workspace]
-# 这个空的 workspace 表告诉 Cargo，此 crate 是一个独立的 workspace，不要再向上查找了
+members = ["plugins/live-replay-android"]

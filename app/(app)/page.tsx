@@ -64,7 +64,7 @@ export default function Home() {
     isLoading,
     mutate: refreshStreamers,
   } = useSWR<ReplayStreamerState[]>('/v1/replay/streamers', fetcher, { refreshInterval: 3000 })
-  const { data: diskStatus, mutate: refreshDisk } = useSWR<DiskStatus>('/v1/disk-status', fetcher, { refreshInterval: 10000 })
+  const { data: diskStatus, mutate: refreshDisk } = useSWR<DiskStatus>('/v1/replay/storage', fetcher, { refreshInterval: 10000 })
   const [visible, setVisible] = useState(false)
   const [saving, setSaving] = useState(false)
   const [formApi, setFormApi] = useState<any>()

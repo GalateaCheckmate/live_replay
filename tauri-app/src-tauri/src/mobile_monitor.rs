@@ -150,8 +150,8 @@ where
     Ok(result)
 }
 
-async fn sync_background_active(app: &tauri::AppHandle) -> Result<(), String> {
-    let active = {
+pub(crate) async fn sync_background_active(app: &tauri::AppHandle) -> Result<(), String> {
+    let monitor_active = {
         let _guard = gate().lock().await;
         read_store(&store_path(app)?)
             .await?
@@ -159,6 +159,8 @@ async fn sync_background_active(app: &tauri::AppHandle) -> Result<(), String> {
             .iter()
             .any(|target| target.enabled)
     };
+    let recording_active = super::mobile_recordings::status(app)?.active;
+    let active = monitor_active || recording_active;
     #[cfg(target_os = "android")]
     {
         app.live_replay_android().set_background_active(active)?;

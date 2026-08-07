@@ -60,6 +60,10 @@ pub struct RecordingPlan {
     pub display_name: String,
     pub credentials: CoreCredentials,
     pub output_dir: PathBuf,
+    /// Stream already resolved by the caller. It is consumed exactly once for the first media
+    /// connection so a successful live check can transition to recording without another probe.
+    /// Reconnects after that first media connection still perform fresh probes.
+    pub initial_stream: Option<ResolvedStream>,
     pub live_session_id: Option<String>,
     /// Original liveSession start time. Set when resuming after a process restart.
     pub session_started_at: Option<i64>,
@@ -82,6 +86,7 @@ impl RecordingPlan {
             display_name: display_name.into(),
             credentials,
             output_dir: output_dir.into(),
+            initial_stream: None,
             live_session_id: None,
             session_started_at: None,
             next_segment_index: 1,
@@ -231,6 +236,7 @@ pub async fn record_live_session(
         .clone()
         .unwrap_or_else(|| new_session_id(&plan.display_name, session_started));
 
+    let mut initial_stream = plan.initial_stream.take();
     let mut emitter: Option<Arc<Mutex<SegmentEmitterState>>> = None;
     let mut platform = String::new();
     let mut offline_since: Option<Instant> = None;
@@ -241,34 +247,42 @@ pub async fn record_live_session(
             break;
         }
 
-        let resolved = match probe_stream(
-            &plan.room_url,
-            &plan.display_name,
-            plan.credentials.clone(),
-        )
-        .await
-        {
-            Ok(ProbeResult::Live { stream }) => {
-                offline_since = None;
-                last_error = None;
-                stream
-            }
-            Ok(ProbeResult::Offline) => {
-                let since = offline_since.get_or_insert_with(Instant::now);
-                if since.elapsed() >= LIVE_OFFLINE_GRACE {
-                    break;
+        let resolved = if let Some(stream) = initial_stream.take() {
+            // The caller already proved this room is live and resolved the media URL. Consume it
+            // directly; do not hit the platform API again before the first byte is recorded.
+            offline_since = None;
+            last_error = None;
+            stream
+        } else {
+            match probe_stream(
+                &plan.room_url,
+                &plan.display_name,
+                plan.credentials.clone(),
+            )
+            .await
+            {
+                Ok(ProbeResult::Live { stream }) => {
+                    offline_since = None;
+                    last_error = None;
+                    stream
                 }
-                sleep(RECHECK_INTERVAL).await;
-                continue;
-            }
-            Err(error) => {
-                last_error = Some(error);
-                let since = offline_since.get_or_insert_with(Instant::now);
-                if since.elapsed() >= LIVE_OFFLINE_GRACE {
-                    break;
+                Ok(ProbeResult::Offline) => {
+                    let since = offline_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= LIVE_OFFLINE_GRACE {
+                        break;
+                    }
+                    sleep(RECHECK_INTERVAL).await;
+                    continue;
                 }
-                sleep(RECHECK_INTERVAL).await;
-                continue;
+                Err(error) => {
+                    last_error = Some(error);
+                    let since = offline_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= LIVE_OFFLINE_GRACE {
+                        break;
+                    }
+                    sleep(RECHECK_INTERVAL).await;
+                    continue;
+                }
             }
         };
 

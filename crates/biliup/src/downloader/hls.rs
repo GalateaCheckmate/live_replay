@@ -25,7 +25,6 @@ pub async fn download(
         error
     })?;
     info!("{}", resp.status());
-    // let mut resp = resp.bytes_stream();
     let bytes = resp.bytes().await.map_err(|error| {
         pressure.report_pressure();
         error
@@ -37,11 +36,6 @@ pub async fn download(
     let mut pl = match m3u8_rs::parse_playlist(&bytes) {
         Ok((_i, Playlist::MasterPlaylist(pl))) => {
             info!("Master playlist:\n{:#?}", pl);
-            // Pick the highest-bandwidth playable variant. The first variant is not
-            // necessarily the best quality (e.g. Twitch orders transcodes ahead of the
-            // source), so prefer the highest-bandwidth stream that carries a resolution.
-            // Skip I-frame (trick-play) streams, which are not full playable renditions.
-            // Fall back to the highest-bandwidth non-I-frame variant, then the first one.
             let best = pl
                 .variants
                 .iter()
@@ -66,7 +60,6 @@ pub async fn download(
                 error
             })?;
             pressure.report_progress(bs.len());
-            // println!("{:?}", bs);
             match m3u8_rs::parse_media_playlist(&bs) {
                 Ok((_, pl)) => pl,
                 Err(e) => {
@@ -101,7 +94,6 @@ pub async fn download(
                 if segment.discontinuity {
                     warn!("#EXT-X-DISCONTINUITY");
                     ts_file.create_new()?;
-                    // splitting = Segment::from_seg(splitting);
                     splitting.reset();
                 }
                 let length = download_to_file(
@@ -188,11 +180,18 @@ impl<'a> TsFile<'a> {
         })
     }
 
+    /// Ensure a completed TS segment is durable before LifecycleFile fires its completion hook.
     pub fn create_new(&mut self) -> std::io::Result<()> {
+        self.sync_current()?;
         self.file.rename();
         let path = self.file.create()?;
         self.buf_writer = Self::create(path)?;
         Ok(())
+    }
+
+    fn sync_current(&mut self) -> std::io::Result<()> {
+        self.buf_writer.flush()?;
+        self.buf_writer.get_ref().sync_all()
     }
 
     fn create<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<BufWriter<File>> {
@@ -213,6 +212,10 @@ impl<'a> TsFile<'a> {
 
 impl Drop for TsFile<'_> {
     fn drop(&mut self) {
+        if let Err(error) = self.sync_current() {
+            warn!("failed to sync TS before final rename: {error}");
+            return;
+        }
         self.file.rename()
     }
 }
@@ -233,8 +236,6 @@ mod tests {
 
     #[test]
     fn it_works() -> Result<(), Box<dyn std::error::Error>> {
-        // download(
-        //     "test.ts")?;
         Ok(())
     }
 }

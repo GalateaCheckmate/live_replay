@@ -16,6 +16,9 @@ use tauri_plugin_shell::process::{CommandChild, CommandEvent, Encoding};
 use tauri_plugin_shell::ShellExt;
 
 #[cfg(mobile)]
+mod mobile_youtube;
+
+#[cfg(mobile)]
 use live_replay_core::{
     CoreCredentials, ProbeResult, StopFlag, new_stop_flag, probe_stream, record_direct_stream,
     request_stop,
@@ -286,8 +289,15 @@ async fn mobile_start_recording(
     }
 
     let worker_app = app_handle.clone();
+    let worker_name = display_name.clone();
     tauri::async_runtime::spawn(async move {
-        let result = record_direct_stream(resolved, &output_dir, stop_flag).await;
+        let result = match record_direct_stream(resolved, &output_dir, stop_flag).await {
+            Ok(recording) => {
+                mobile_youtube::finalize_recording_and_enqueue(&worker_app, recording, &worker_name)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
         {
             let state = worker_app.state::<MobileCoreState>();
             if let Ok(mut runtime) = state.runtime.lock() {
@@ -295,8 +305,8 @@ async fn mobile_start_recording(
                 runtime.current_file = None;
                 runtime.stop_flag = None;
                 match result {
-                    Ok(recording) => {
-                        runtime.last_file = Some(recording.file_path);
+                    Ok(final_mp4) => {
+                        runtime.last_file = Some(final_mp4);
                         runtime.last_error = None;
                     }
                     Err(error) => {
@@ -331,6 +341,9 @@ fn mobile_stop_recording(app_handle: tauri::AppHandle) -> Result<MobileCoreStatu
 pub fn run() {
     let builder = tauri::Builder::default().plugin(tauri_plugin_opener::init());
 
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(tauri_plugin_live_replay_android::init());
+
     #[cfg(desktop)]
     let builder = builder.plugin(tauri_plugin_shell::init());
 
@@ -349,7 +362,14 @@ pub fn run() {
         mobile_probe_stream,
         mobile_core_status,
         mobile_start_recording,
-        mobile_stop_recording
+        mobile_stop_recording,
+        mobile_youtube::mobile_youtube_authorize,
+        mobile_youtube::mobile_youtube_cached_auth,
+        mobile_youtube::mobile_youtube_logout,
+        mobile_youtube::mobile_youtube_status,
+        mobile_youtube::mobile_youtube_set_settings,
+        mobile_youtube::mobile_youtube_enqueue_mp4,
+        mobile_youtube::mobile_youtube_retry_task
     ]);
 
     builder
@@ -367,7 +387,8 @@ pub fn run() {
             #[cfg(mobile)]
             {
                 app.manage(MobileCoreState::default());
-                println!("[tauri] Android native Live Replay core loaded.");
+                mobile_youtube::start_upload_worker(app.handle().clone());
+                println!("[tauri] Android Live Replay + YouTube worker loaded.");
             }
 
             Ok(())

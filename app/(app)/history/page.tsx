@@ -4,7 +4,7 @@ import { IconUserCardVideo, IconVideoListStroked } from '@douyinfe/semi-icons'
 import { Table } from '@douyinfe/semi-ui'
 import { SortOrder } from '@douyinfe/semi-ui/lib/es/table'
 import useSWR from 'swr'
-import { fetcher, FileList } from '@/app/lib/api-streamer'
+import { API_BASE, fetcher, FileList } from '@/app/lib/api-streamer'
 import { useState } from 'react'
 import dynamic from 'next/dynamic'
 import { humDate } from '@/app/lib/utils'
@@ -13,19 +13,22 @@ const Players = dynamic(() => import('@/app/ui/Player'), {
   ssr: false,
 })
 
+const encodeRecordingPath = (path: string) => path
+  .split('/')
+  .filter(Boolean)
+  .map(part => encodeURIComponent(part))
+  .join('/')
+
 export default function Home() {
-  const { Header, Footer, Sider, Content } = Layout
-  const { data: data, error, isLoading } = useSWR<FileList[]>('/v1/videos', fetcher)
+  const { Header, Content } = Layout
+  const { data } = useSWR<FileList[]>('/v1/videos', fetcher, { refreshInterval: 5000 })
   const { Text } = Typography
-  const [fileName, setFileName] = useState<string>()
+  const [filePath, setFilePath] = useState<string>()
   const columns = [
     {
       title: '标题',
       dataIndex: 'name',
-      render: (text: any, record: any, index: any) => {
-        return <Text strong>{text}</Text>
-      },
-      // onFilter: (value, record) => record.name.includes(value)
+      render: (text: string) => <Text strong>{text}</Text>,
     },
     {
       title: '大小',
@@ -36,41 +39,31 @@ export default function Home() {
       title: '更新日期',
       dataIndex: 'updateTime',
       defaultSortOrder: 'descend' as SortOrder,
-      sorter: (a: any, b: any) => (a.updateTime - b.updateTime > 0 ? 1 : -1),
+      sorter: (a: FileList, b: FileList) => a.updateTime - b.updateTime,
       render: (time: number) => humDate(time),
     },
     {
       title: '',
       dataIndex: 'operate',
-      render: (text: any, record: any, index: number) => {
-        return (
-          <IconUserCardVideo
-            style={{ cursor: 'pointer' }}
-            onClick={() => showDialog(record.name)}
-          />
-        )
-      },
+      render: (_: unknown, record: FileList) => (
+        <IconUserCardVideo
+          style={{ cursor: 'pointer' }}
+          onClick={() => showDialog(record.path || record.name)}
+        />
+      ),
     },
   ]
   const [visible, setVisible] = useState(false)
-  const showDialog = (name: string) => {
+  const showDialog = (path: string) => {
     setVisible(true)
-    setFileName(name)
-    // setTimeout(()=>{
-    //     let player = new Player({
-    //           id: 'mse',
-    //           url: (process.env.NEXT_PUBLIC_API_SERVER ?? '') + '/static/' + name,
-    //           height: '100%',
-    //           // plugins: [FlvPlugin],
-    //           plugins: [FlvJsPlugin],
-    //           width: '100%',
-    //         });
-    // }, 500)
+    setFilePath(path)
   }
   const handleCancel = () => {
     setVisible(false)
-    console.log('Cancel button clicked')
+    setFilePath(undefined)
   }
+  const playbackUrl = filePath ? `${API_BASE}/static/${encodeRecordingPath(filePath)}` : ''
+
   return (
     <>
       <Header style={{ backgroundColor: 'var(--semi-color-bg-1)' }}>
@@ -84,17 +77,16 @@ export default function Home() {
                   borderRadius: 'var(--semi-border-radius-large)',
                   color: 'var(--semi-color-bg-0)',
                   display: 'flex',
-                  // justifyContent: 'center',
                   padding: '6px',
                 }}
               >
                 <IconVideoListStroked size="large" />
               </div>
-              <h4 style={{ marginLeft: '12px' }}>历史记录</h4>
+              <h4 style={{ marginLeft: '12px' }}>本地录像</h4>
             </>
           }
           mode="horizontal"
-        ></Nav>
+        />
       </Header>
       <Content
         style={{
@@ -104,7 +96,7 @@ export default function Home() {
         }}
       >
         <main>
-          <Table size="small" columns={columns} dataSource={data} />
+          <Table size="small" columns={columns} dataSource={data ?? []} rowKey="key" />
         </main>
         <Modal
           visible={visible}
@@ -115,10 +107,7 @@ export default function Home() {
           bodyStyle={{ height: 500 }}
           footer={null}
         >
-          <Players
-            url={(process.env.NEXT_PUBLIC_API_SERVER ?? '') + '/static/' + fileName}
-          ></Players>
-          <div id="mse"></div>
+          {playbackUrl && <Players url={playbackUrl} />}
         </Modal>
       </Content>
     </>

@@ -6,8 +6,8 @@ cd /d "%~dp0"
 title Live Replay - Local Full
 
 echo ============================================================
-echo [Live Replay] Local Full Validation
-echo [Mode] Cached frontend + Rust tests + Release build
+echo [Live Replay] Local Full Validation + Portable Package
+echo [Mode] Cached frontend + Rust tests + Release build + package
 echo ============================================================
 echo.
 
@@ -47,23 +47,23 @@ echo [WARN] Validation will continue. Switch to Node.js 20 only if compatibility
 echo.
 :node_version_ok
 
-echo [1/4] Checking frontend dependency cache...
+echo [1/5] Checking frontend dependency cache...
 call :ensure_frontend_dependencies
 if errorlevel 1 goto :failed
 
 echo.
-echo [2/4] Building Next.js frontend...
+echo [2/5] Building Next.js frontend...
 call npm.cmd run build
 if errorlevel 1 goto :failed
 
 echo.
-echo [3/4] Incremental Rust workspace tests...
+echo [3/5] Incremental Rust workspace tests...
 set "SQLX_OFFLINE=true"
 cargo test --workspace --locked
 if errorlevel 1 goto :failed
 
 echo.
-echo [4/4] Incremental Windows Release build...
+echo [4/5] Incremental Windows Release build...
 cargo build --release --locked --bin biliup
 if errorlevel 1 goto :failed
 
@@ -73,11 +73,16 @@ if not exist "%CD%\target\release\biliup.exe" (
 )
 
 echo.
+echo [5/5] Assembling and validating portable package...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%CD%\scripts\local-full-package.ps1" -RepoRoot "%CD%"
+if errorlevel 1 goto :failed
+
+echo.
 echo ============================================================
 echo [PASS] Live Replay Local Full passed.
-echo [OUTPUT] %CD%\target\release\biliup.exe
-echo [CACHE] node_modules and Cargo target/release are kept for next run.
-echo [NOTE] Portable packaging with FFmpeg is separate for now.
+echo [FOLDER] %CD%\dist\live-replay
+echo [ZIP]    %CD%\dist\live-replay-windows.zip
+echo [CACHE]  node_modules, Cargo target, and FFmpeg cache are kept.
 echo ============================================================
 echo.
 pause
@@ -169,7 +174,7 @@ goto :failed
 :failed
 echo.
 echo ============================================================
-echo [FAIL] Local Full validation failed.
+echo [FAIL] Local Full validation or packaging failed.
 echo Please send the first error shown above.
 echo ============================================================
 echo.

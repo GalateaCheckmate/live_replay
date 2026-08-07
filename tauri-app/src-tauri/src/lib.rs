@@ -2,8 +2,6 @@
 use std::env;
 #[cfg(desktop)]
 use std::sync::{Arc, Mutex};
-#[cfg(mobile)]
-use std::sync::Mutex;
 
 use tauri::{Manager, RunEvent};
 #[cfg(desktop)]
@@ -18,62 +16,16 @@ use tauri_plugin_shell::ShellExt;
 #[cfg(mobile)]
 mod mobile_monitor;
 #[cfg(mobile)]
+mod mobile_recordings;
+#[cfg(mobile)]
 mod mobile_youtube;
 
 #[cfg(mobile)]
-use live_replay_core::{
-    CoreCredentials, ProbeResult, StopFlag, new_stop_flag, probe_stream, record_direct_stream,
-    request_stop,
-};
-#[cfg(mobile)]
-use serde::Serialize;
+use live_replay_core::{probe_stream, CoreCredentials, ProbeResult};
 
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
-}
-
-#[cfg(mobile)]
-#[derive(Default)]
-struct MobileCoreState {
-    runtime: Mutex<MobileRuntimeState>,
-}
-
-#[cfg(mobile)]
-#[derive(Default)]
-struct MobileRuntimeState {
-    active: bool,
-    room_url: Option<String>,
-    display_name: Option<String>,
-    current_file: Option<String>,
-    last_file: Option<String>,
-    last_error: Option<String>,
-    stop_flag: Option<StopFlag>,
-}
-
-#[cfg(mobile)]
-#[derive(Debug, Clone, Serialize)]
-struct MobileCoreStatus {
-    active: bool,
-    room_url: Option<String>,
-    display_name: Option<String>,
-    current_file: Option<String>,
-    last_file: Option<String>,
-    last_error: Option<String>,
-}
-
-#[cfg(mobile)]
-impl From<&MobileRuntimeState> for MobileCoreStatus {
-    fn from(value: &MobileRuntimeState) -> Self {
-        Self {
-            active: value.active,
-            room_url: value.room_url.clone(),
-            display_name: value.display_name.clone(),
-            current_file: value.current_file.clone(),
-            last_file: value.last_file.clone(),
-            last_error: value.last_error.clone(),
-        }
-    }
 }
 
 #[cfg(desktop)]
@@ -220,125 +172,6 @@ async fn mobile_probe_stream(
     .await
 }
 
-#[cfg(mobile)]
-#[tauri::command]
-fn mobile_core_status(app_handle: tauri::AppHandle) -> Result<MobileCoreStatus, String> {
-    let state = app_handle.state::<MobileCoreState>();
-    let runtime = state
-        .runtime
-        .lock()
-        .map_err(|_| "Android core 状态锁异常".to_string())?;
-    Ok(MobileCoreStatus::from(&*runtime))
-}
-
-#[cfg(mobile)]
-#[tauri::command]
-async fn mobile_start_recording(
-    app_handle: tauri::AppHandle,
-    url: String,
-    name: Option<String>,
-    bilibili_cookie: Option<String>,
-    douyin_cookie: Option<String>,
-) -> Result<MobileCoreStatus, String> {
-    {
-        let state = app_handle.state::<MobileCoreState>();
-        let runtime = state
-            .runtime
-            .lock()
-            .map_err(|_| "Android core 状态锁异常".to_string())?;
-        if runtime.active {
-            return Err("当前已经有录制任务在运行。".to_string());
-        }
-    }
-
-    let display_name = name.unwrap_or_else(|| "Live Replay".to_string());
-    let resolved = match probe_stream(
-        url.trim(),
-        &display_name,
-        CoreCredentials {
-            bilibili_cookie,
-            douyin_cookie,
-        },
-    )
-    .await?
-    {
-        ProbeResult::Offline => return Err("主播当前未开播。".to_string()),
-        ProbeResult::Live { stream } => stream,
-    };
-
-    let output_dir = app_handle
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("无法获取 Android App 数据目录: {error}"))?
-        .join("recordings");
-    let stop_flag = new_stop_flag();
-
-    {
-        let state = app_handle.state::<MobileCoreState>();
-        let mut runtime = state
-            .runtime
-            .lock()
-            .map_err(|_| "Android core 状态锁异常".to_string())?;
-        if runtime.active {
-            return Err("当前已经有录制任务在运行。".to_string());
-        }
-        runtime.active = true;
-        runtime.room_url = Some(url.trim().to_string());
-        runtime.display_name = Some(display_name.clone());
-        runtime.current_file = Some(output_dir.to_string_lossy().into_owned());
-        runtime.last_error = None;
-        runtime.stop_flag = Some(stop_flag.clone());
-    }
-
-    let worker_app = app_handle.clone();
-    let worker_name = display_name.clone();
-    tauri::async_runtime::spawn(async move {
-        let result = match record_direct_stream(resolved, &output_dir, stop_flag).await {
-            Ok(recording) => {
-                mobile_youtube::finalize_recording_and_enqueue(&worker_app, recording, &worker_name)
-                    .await
-            }
-            Err(error) => Err(error),
-        };
-        {
-            let state = worker_app.state::<MobileCoreState>();
-            if let Ok(mut runtime) = state.runtime.lock() {
-                runtime.active = false;
-                runtime.current_file = None;
-                runtime.stop_flag = None;
-                match result {
-                    Ok(final_mp4) => {
-                        runtime.last_file = Some(final_mp4);
-                        runtime.last_error = None;
-                    }
-                    Err(error) => {
-                        runtime.last_error = Some(error);
-                    }
-                }
-            };
-        }
-    });
-
-    mobile_core_status(app_handle)
-}
-
-#[cfg(mobile)]
-#[tauri::command]
-fn mobile_stop_recording(app_handle: tauri::AppHandle) -> Result<MobileCoreStatus, String> {
-    let state = app_handle.state::<MobileCoreState>();
-    {
-        let runtime = state
-            .runtime
-            .lock()
-            .map_err(|_| "Android core 状态锁异常".to_string())?;
-        let Some(flag) = runtime.stop_flag.as_ref() else {
-            return Ok(MobileCoreStatus::from(&*runtime));
-        };
-        request_stop(flag);
-    }
-    mobile_core_status(app_handle)
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default().plugin(tauri_plugin_opener::init());
@@ -362,9 +195,9 @@ pub fn run() {
         start_sidecar,
         shutdown_sidecar,
         mobile_probe_stream,
-        mobile_core_status,
-        mobile_start_recording,
-        mobile_stop_recording,
+        mobile_recordings::mobile_recordings_status,
+        mobile_recordings::mobile_start_recording_multi,
+        mobile_recordings::mobile_stop_recording_multi,
         mobile_monitor::mobile_monitor_status,
         mobile_monitor::mobile_monitor_add,
         mobile_monitor::mobile_monitor_remove,
@@ -392,10 +225,9 @@ pub fn run() {
 
             #[cfg(mobile)]
             {
-                app.manage(MobileCoreState::default());
                 mobile_monitor::start_monitor_worker(app.handle().clone());
                 mobile_youtube::start_upload_worker(app.handle().clone());
-                println!("[tauri] Android Live Replay monitor + YouTube worker loaded.");
+                println!("[tauri] Android monitor + multi-recorder + YouTube worker loaded.");
             }
 
             Ok(())
@@ -410,14 +242,7 @@ pub fn run() {
                 }
 
                 #[cfg(mobile)]
-                {
-                    let state = app_handle.state::<MobileCoreState>();
-                    if let Ok(runtime) = state.runtime.lock() {
-                        if let Some(flag) = runtime.stop_flag.as_ref() {
-                            request_stop(flag);
-                        }
-                    };
-                }
+                mobile_recordings::request_stop_all();
             }
         });
 }

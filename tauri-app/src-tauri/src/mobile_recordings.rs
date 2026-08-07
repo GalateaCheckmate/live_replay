@@ -270,7 +270,7 @@ async fn finalize_segment_mp4(
     verify_nonempty_file(&source).await?;
 
     let produced = if source == final_mp4 {
-        source
+        source.clone()
     } else {
         if fs::metadata(&final_mp4).await.is_ok() {
             return Err(format!("最终 MP4 已存在，拒绝覆盖: {}", final_mp4.display()));

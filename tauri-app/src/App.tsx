@@ -5,11 +5,10 @@ import "./App.css";
 function App() {
   const userAgent = useMemo(() => navigator.userAgent, []);
   const isAndroid = useMemo(
-    () => /Android|HarmonyOS|HUAWEI|ANA-/i.test(userAgent),
+    () => /Android|HarmonyOS|HUAWEI|ANA-|ALN-/i.test(userAgent),
     [userAgent],
   );
-  const isHuawei = useMemo(() => /HUAWEI|ANA-|HarmonyOS/i.test(userAgent), [userAgent]);
-  const [status, setStatus] = useState("正在初始化 Android 壳...");
+  const [status, setStatus] = useState("正在初始化移动端运行环境...");
 
   useEffect(() => {
     if (!isAndroid) {
@@ -17,14 +16,10 @@ function App() {
       return;
     }
 
-    setStatus(
-      isHuawei
-        ? "已进入华为 / HarmonyOS 适配模式。当前 APK 为 ARM64，并启用后台录制所需基础权限。"
-        : "Android 壳已启动，Windows sidecar 已隔离。下一步接入原生录制核心。",
-    );
-  }, [isAndroid, isHuawei]);
+    setStatus("Android 运行环境已就绪，录制核心正在接入。 ");
+  }, [isAndroid]);
 
-  async function probeCore() {
+  async function refreshCoreStatus() {
     try {
       const message = await invoke<string>("start_sidecar");
       setStatus(message);
@@ -34,60 +29,93 @@ function App() {
   }
 
   if (!isAndroid) {
-    return <main className="container">正在连接 Live Replay 本地服务...</main>;
+    return <main className="desktop-bridge">正在连接 Live Replay 本地服务...</main>;
   }
 
   return (
-    <main className="container android-shell">
-      <section className="hero-card">
-        <span className="eyebrow">LIVE REPLAY · ANDROID</span>
-        <h1>手机录制端</h1>
-        <p className="subtitle">
-          当前优先适配 Huawei P40 · HarmonyOS 4.2，目标是锁屏后仍能持续录制和上传。
-        </p>
+    <main className="app-shell">
+      <header className="topbar">
+        <div>
+          <span className="brand">LIVE REPLAY</span>
+          <h1>录制中心</h1>
+        </div>
+        <button className="icon-button" type="button" aria-label="设置" disabled>
+          ⚙
+        </button>
+      </header>
+
+      <section className="runtime-card">
+        <div className="runtime-indicator" />
+        <div className="runtime-copy">
+          <strong>服务状态</strong>
+          <span>{status}</span>
+        </div>
+        <button className="text-button" type="button" onClick={refreshCoreStatus}>
+          刷新
+        </button>
       </section>
 
-      <section className="status-card">
-        <div className="status-dot" />
-        <div>
-          <strong>当前状态</strong>
-          <p>{status}</p>
+      <section className="stats-grid" aria-label="任务概览">
+        <article>
+          <span>监控中</span>
+          <strong>0</strong>
+        </article>
+        <article>
+          <span>录制中</span>
+          <strong>0</strong>
+        </article>
+        <article>
+          <span>待上传</span>
+          <strong>0</strong>
+        </article>
+      </section>
+
+      <button className="primary-action" type="button" disabled>
+        ＋ 添加主播
+      </button>
+
+      <section className="panel">
+        <div className="section-heading">
+          <div>
+            <h2>录制任务</h2>
+            <p>已添加的主播会显示在这里</p>
+          </div>
+        </div>
+        <div className="empty-state">
+          <div className="empty-icon">◉</div>
+          <strong>暂无任务</strong>
+          <span>移动端录制核心接入完成后，即可在这里添加并管理直播录制。</span>
         </div>
       </section>
 
-      <section className="grid">
-        <article>
-          <strong>CPU 架构</strong>
-          <span>ARM64 / aarch64，针对 P40 麒麟平台构建</span>
-        </article>
-        <article>
-          <strong>后台常驻</strong>
-          <span>已预留 WakeLock 与 Foreground Service 权限</span>
-        </article>
-        <article>
-          <strong>网络</strong>
-          <span>允许锁屏持续联网，并兼容仍使用 HTTP 的直播源</span>
-        </article>
-        <article>
-          <strong>系统基线</strong>
-          <span>最低 Android API 29，减少旧系统兼容负担</span>
-        </article>
+      <section className="panel compact-panel">
+        <div className="section-heading">
+          <div>
+            <h2>后台运行</h2>
+            <p>前台服务与 WakeLock 基础支持已启用</p>
+          </div>
+          <span className="status-pill">已配置</span>
+        </div>
       </section>
 
-      <section className="huawei-card">
-        <strong>HarmonyOS 4.2 长期录制设置</strong>
-        <ol>
-          <li>应用启动管理：关闭自动管理，并允许后台活动。</li>
-          <li>电池优化：把 Live Replay 设为“不允许优化”。</li>
-          <li>更多电池设置：开启“休眠时始终保持网络连接”。</li>
-          <li>最近任务中下拉 Live Replay 卡片并加锁。</li>
-          <li>录制期间不要开启省电模式或超级省电。</li>
-        </ol>
-      </section>
-
-      <button type="button" onClick={probeCore}>
-        检查 Android 核心状态
-      </button>
+      <nav className="bottom-nav" aria-label="主导航">
+        <button className="nav-item active" type="button">
+          <span>●</span>
+          <small>录制</small>
+        </button>
+        <button className="nav-item" type="button" disabled>
+          <span>⇧</span>
+          <small>上传</small>
+        </button>
+        <button className="nav-item" type="button" disabled>
+          <span>≡</span>
+          <small>记录</small>
+        </button>
+        <button className="nav-item" type="button" disabled>
+          <span>⚙</span>
+          <small>设置</small>
+        </button>
+      </nav>
     </main>
   );
 }

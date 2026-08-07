@@ -1,5 +1,5 @@
 @echo off
-setlocal EnableExtensions
+setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul
 cd /d "%~dp0"
 
@@ -7,7 +7,7 @@ title Live Replay - 本地 Full 验证
 
 echo ============================================================
 echo [Live Replay] 本地 Full 验证
-echo [Live Replay] 前端构建 + Rust 全测试 + Release 编译
+echo [Live Replay] 增量依赖 + 前端构建 + Rust 全测试 + Release 编译
 echo ============================================================
 echo.
 
@@ -28,6 +28,7 @@ where node >nul 2>nul || goto :node_missing
 where npm.cmd >nul 2>nul || goto :npm_missing
 where rustc >nul 2>nul || goto :rust_missing
 where cargo >nul 2>nul || goto :cargo_missing
+where powershell >nul 2>nul || goto :powershell_missing
 
 echo.
 echo [环境] Node:
@@ -43,12 +44,12 @@ echo.
 for /f %%N in ('node -p "process.versions.node.split('.')[0]"') do set "NODE_MAJOR=%%N"
 if "%NODE_MAJOR%"=="20" goto :node_version_ok
 echo [提醒] GitHub Full 当前使用 Node.js 20；本机是 Node.js %NODE_MAJOR%。
-echo [提醒] 先继续验证；若前端出现兼容问题，再切换到 Node.js 20。
+echo [提醒] 当前先继续验证；只有遇到前端兼容问题时才需要切换 Node.js 20。
 echo.
 :node_version_ok
 
-echo [1/4] 安装前端依赖 npm ci...
-call npm.cmd ci
+echo [1/4] 检查前端依赖缓存...
+call :ensure_frontend_dependencies
 if errorlevel 1 goto :failed
 
 echo.
@@ -57,13 +58,13 @@ call npm.cmd run build
 if errorlevel 1 goto :failed
 
 echo.
-echo [3/4] 运行 Rust Workspace 全部测试...
+echo [3/4] 增量运行 Rust Workspace 全部测试...
 set "SQLX_OFFLINE=true"
 cargo test --workspace --locked
 if errorlevel 1 goto :failed
 
 echo.
-echo [4/4] 编译 Windows Release EXE...
+echo [4/4] 增量编译 Windows Release EXE...
 cargo build --release --locked --bin biliup
 if errorlevel 1 goto :failed
 
@@ -76,10 +77,61 @@ echo.
 echo ============================================================
 echo [成功] Live Replay 本地 Full 验证全部通过。
 echo [产物] %CD%\target\release\biliup.exe
-echo [说明] 这是源码编译产物；GitHub Full 的便携包还会额外打包 ffmpeg.exe / ffprobe.exe。
+echo [缓存] node_modules 和 Cargo target/release 都会保留供下次增量验证。
+echo [说明] GitHub Full 便携包还会额外打包 ffmpeg.exe / ffprobe.exe。
 echo ============================================================
 echo.
 pause
+exit /b 0
+
+:ensure_frontend_dependencies
+if not exist "package-lock.json" (
+    echo [失败] 没有找到 package-lock.json。
+    exit /b 1
+)
+
+set "LOCK_HASH="
+for /f %%H in ('powershell -NoProfile -NonInteractive -Command "(Get-FileHash -Algorithm SHA256 'package-lock.json').Hash"') do set "LOCK_HASH=%%H"
+if not defined LOCK_HASH (
+    echo [失败] 无法计算 package-lock.json 哈希。
+    exit /b 1
+)
+
+set "LOCK_CACHE=node_modules\.live-replay-package-lock.sha256"
+
+if not exist "node_modules\" goto :deps_clean_install
+
+if not exist "!LOCK_CACHE!" (
+    echo [依赖] 已有 node_modules，首次建立本地依赖缓存标记...
+    call npm.cmd ls --depth=0 --silent >nul 2>nul
+    if errorlevel 1 goto :deps_sync
+    >"!LOCK_CACHE!" echo !LOCK_HASH!
+    echo [依赖] 当前依赖可用，本次不重新下载。
+    exit /b 0
+)
+
+set "CACHED_HASH="
+set /p "CACHED_HASH="<"!LOCK_CACHE!"
+if /I "!CACHED_HASH!"=="!LOCK_HASH!" (
+    echo [依赖] package-lock.json 未变化，跳过 npm 安装。
+    exit /b 0
+)
+
+echo [依赖] package-lock.json 已变化，只同步新增/变化的依赖。
+goto :deps_sync
+
+:deps_clean_install
+echo [依赖] 首次运行，执行 npm ci...
+call npm.cmd ci
+if errorlevel 1 exit /b 1
+>"!LOCK_CACHE!" echo !LOCK_HASH!
+exit /b 0
+
+:deps_sync
+call npm.cmd install --prefer-offline --no-audit --no-fund
+if errorlevel 1 exit /b 1
+for /f %%H in ('powershell -NoProfile -NonInteractive -Command "(Get-FileHash -Algorithm SHA256 'package-lock.json').Hash"') do set "LOCK_HASH=%%H"
+>"!LOCK_CACHE!" echo !LOCK_HASH!
 exit /b 0
 
 :node_missing
@@ -96,6 +148,10 @@ goto :failed
 
 :cargo_missing
 echo [失败] 未找到 cargo。请先安装 Rust stable。
+goto :failed
+
+:powershell_missing
+echo [失败] 未找到 PowerShell，无法检查依赖缓存。
 goto :failed
 
 :failed

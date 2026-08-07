@@ -202,28 +202,31 @@ impl FfmpegDownloader {
             .kill_on_drop(true);
 
         let child = cmd.spawn().change_context(AppError::Unknown)?;
-
         let status = spawn_log(child, &self.process_handle).await?;
-        // 退出时，重命名文件
         let part_file = format!("{}.part", output_file.display());
-        tokio::fs::rename(&part_file, &output_file)
-            .await
-            .change_context(AppError::Custom(String::from("退出时，重命名文件")))?;
-        // let (tx, rx) = bounded(16);
-        // 分段回调
-        // 触发分段回调
 
-        callback(SegmentEvent::Segment(SegmentInfo {
-            prev_file_path: output_file,
-            danmaku_file_path: None,
-            segment_index: 0,
-            next_file_path: None,
-        }));
-        // 根据退出码判断状态
         match status.code() {
-            Some(0) => Ok(DownloadStatus::SegmentCompleted),
-            Some(255) => Ok(DownloadStatus::StreamEnded),
-            err => Ok(DownloadStatus::Error(format!("FFmpeg error: {err:?}"))),
+            Some(0) => {
+                // 只有 FFmpeg 正常退出，临时文件才允许晋升为正式录像并进入后续上传流程。
+                tokio::fs::rename(&part_file, &output_file)
+                    .await
+                    .change_context(AppError::Custom(String::from("退出时，重命名文件")))?;
+                callback(SegmentEvent::Segment(SegmentInfo {
+                    prev_file_path: output_file,
+                    danmaku_file_path: None,
+                    segment_index: 0,
+                    next_file_path: None,
+                }));
+                Ok(DownloadStatus::SegmentCompleted)
+            }
+            Some(255) => {
+                info!(file = %part_file, "FFmpeg stream ended without a clean exit; preserving partial recording");
+                Ok(DownloadStatus::StreamEnded)
+            }
+            err => {
+                info!(file = %part_file, exit_code = ?err, "FFmpeg failed; preserving partial recording");
+                Ok(DownloadStatus::Error(format!("FFmpeg error: {err:?}")))
+            }
         }
     }
 

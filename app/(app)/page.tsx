@@ -367,9 +367,9 @@ export default function Home() {
             label="单段时长（分钟）"
             min={1}
             max={1440}
-            extraText={`默认使用全局设置：${defaultSegmentMinutes} 分钟。`}
             style={{ width: '100%' }}
           />
+          <Text type="tertiary">默认使用全局设置：{defaultSegmentMinutes} 分钟。</Text>
           <Form.Switch field="delete_after_success" label="投稿确认可播放后自动删除本地录像" />
         </Form>
       </Modal>

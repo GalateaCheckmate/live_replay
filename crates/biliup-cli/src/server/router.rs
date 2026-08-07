@@ -14,6 +14,7 @@ use crate::server::api::replay_endpoints::{
     bind_replay_submission, get_replay_jobs, get_replay_sessions, reset_replay_submission,
     retry_replay_job,
 };
+use crate::server::api::replay_state_endpoints::get_replay_streamer_states;
 use crate::server::infrastructure::service_register::ServiceRegister;
 use axum::Router;
 use axum::body::Body;
@@ -51,6 +52,7 @@ pub fn router(service_register: ServiceRegister) -> Router<()> {
             delete(delete_template_endpoint).get(get_upload_streamer_endpoint),
         )
         .route("/v1/upload/streamers", post(add_upload_streamer_endpoint))
+        .route("/v1/replay/streamers", get(get_replay_streamer_states))
         .route("/v1/replay/sessions", get(get_replay_sessions))
         .route("/v1/replay/jobs", get(get_replay_jobs))
         .route("/v1/replay/jobs/{id}/retry", post(retry_replay_job))

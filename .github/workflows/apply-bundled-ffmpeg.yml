@@ -27,10 +27,8 @@ jobs:
       - name: Apply bundled FFmpeg changes
         run: python tools/apply_bundled_ffmpeg.py
 
-      - name: Remove one-shot updater
-        run: |
-          rm tools/apply_bundled_ffmpeg.py
-          rm .github/workflows/apply-bundled-ffmpeg.yml
+      - name: Remove one-shot updater script
+        run: rm tools/apply_bundled_ffmpeg.py
 
       - name: Commit source update
         run: |

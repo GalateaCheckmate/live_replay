@@ -44,7 +44,13 @@ pub enum ProbeResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordingResult {
+    /// Complete source-container recording (FLV/TS/MP4). Never time segmented.
     pub file_path: String,
+    /// Required final MP4 path. When the source is already MP4 this equals file_path.
+    pub final_mp4_path: String,
+    pub youtube_title: String,
+    pub started_at: i64,
+    pub ended_at: i64,
     pub bytes_written: u64,
     pub stopped_by_user: bool,
 }
@@ -81,6 +87,8 @@ pub async fn probe_stream(
     live_credentials.bilibili_cookie = credentials.bilibili_cookie;
     live_credentials.douyin_cookie = credentials.douyin_cookie;
 
+    // Keep the existing platform defaults. Android records the chosen source as one continuous
+    // file, then performs a single lossless container finalize to MP4 after the livestream ends.
     let request = LiveRequest {
         client,
         url: url.to_string(),
@@ -113,6 +121,12 @@ pub async fn probe_stream(
     }
 }
 
+/// Records one livestream into exactly one source-container file.
+///
+/// There is intentionally no segment timer, size limit, Part/分P concept or upload-time slicing.
+/// The `.part` file remains the sole active recording until EOF/user stop, then it is atomically
+/// renamed to a whole-session file. Android subsequently losslessly remuxes this file to the one
+/// required MP4.
 pub async fn record_direct_stream(
     stream: ResolvedStream,
     output_dir: impl AsRef<Path>,
@@ -120,7 +134,10 @@ pub async fn record_direct_stream(
 ) -> Result<RecordingResult, String> {
     let ext = normalized_extension(&stream);
     if ext == "m3u8" {
-        return Err("当前 Android 内核第一阶段暂不直接写入 HLS/m3u8；请使用 FLV/直链直播源。".to_string());
+        return Err(
+            "当前直写录制器不能把 m3u8 播放列表本身当录像文件；该直播源需要交给 Android 媒体录制器。"
+                .to_string(),
+        );
     }
 
     let output_dir = output_dir.as_ref();
@@ -133,9 +150,18 @@ pub async fn record_direct_stream(
     } else {
         &stream.name
     });
-    let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
-    let final_path = output_dir.join(format!("{base_name}_{timestamp}.{ext}"));
-    let part_path = PathBuf::from(format!("{}.part", final_path.display()));
+    let started = Local::now();
+    let started_at = started.timestamp();
+    let working_name = format!(
+        ".{base_name}｜{}｜{}-录制中.{ext}.part",
+        started.format("%Y-%m-%d"),
+        started.format("%H：%M")
+    );
+    let part_path = output_dir.join(working_name);
+
+    if fs::metadata(&part_path).await.is_ok() {
+        return Err(format!("发现同名未完成录像，拒绝覆盖: {}", part_path.display()));
+    }
 
     let headers = to_header_map(&stream.headers)?;
     let client = reqwest::Client::builder()
@@ -165,7 +191,11 @@ pub async fn record_direct_stream(
         if stop_flag.load(Ordering::Acquire) {
             break;
         }
-        let chunk = chunk.map_err(|error| format!("读取直播流失败: {error}"))?;
+        let chunk = chunk.map_err(|error| {
+            format!(
+                "读取直播流失败: {error}。未完成 .part 录像将保留，不会进入上传或删除流程。"
+            )
+        })?;
         file.write_all(&chunk)
             .await
             .map_err(|error| format!("写入录制文件失败: {error}"))?;
@@ -175,6 +205,9 @@ pub async fn record_direct_stream(
     file.flush()
         .await
         .map_err(|error| format!("刷新录制文件失败: {error}"))?;
+    file.sync_all()
+        .await
+        .map_err(|error| format!("同步录制文件失败: {error}"))?;
     drop(file);
 
     if bytes_written == 0 {
@@ -182,12 +215,46 @@ pub async fn record_direct_stream(
         return Err("直播源没有返回任何媒体数据。".to_string());
     }
 
-    fs::rename(&part_path, &final_path)
+    let ended = Local::now();
+    let ended_at = ended.timestamp();
+    let local_stem = format!(
+        "{base_name}｜{}｜{}-{}",
+        started.format("%Y-%m-%d"),
+        started.format("%H：%M"),
+        ended.format("%H：%M")
+    );
+    let youtube_title = format!(
+        "{base_name}｜{}｜{}-{}",
+        started.format("%Y-%m-%d"),
+        started.format("%H:%M"),
+        ended.format("%H:%M")
+    );
+    let source_path = output_dir.join(format!("{local_stem}.{ext}"));
+    let final_mp4_path = output_dir.join(format!("{local_stem}.mp4"));
+
+    if fs::metadata(&source_path).await.is_ok() && source_path != part_path {
+        return Err(format!(
+            "完整录像目标已存在，拒绝覆盖；未完成文件保留在 {}",
+            part_path.display()
+        ));
+    }
+    if ext != "mp4" && fs::metadata(&final_mp4_path).await.is_ok() {
+        return Err(format!(
+            "最终 MP4 目标已存在，拒绝覆盖；未完成文件保留在 {}",
+            part_path.display()
+        ));
+    }
+
+    fs::rename(&part_path, &source_path)
         .await
-        .map_err(|error| format!("完成录制文件失败: {error}"))?;
+        .map_err(|error| format!("完成整场录像文件失败: {error}"))?;
 
     Ok(RecordingResult {
-        file_path: final_path.to_string_lossy().into_owned(),
+        file_path: source_path.to_string_lossy().into_owned(),
+        final_mp4_path: final_mp4_path.to_string_lossy().into_owned(),
+        youtube_title,
+        started_at,
+        ended_at,
         bytes_written,
         stopped_by_user: stop_flag.load(Ordering::Acquire),
     })

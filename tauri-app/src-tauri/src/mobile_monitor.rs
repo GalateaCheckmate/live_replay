@@ -1,11 +1,13 @@
 use live_replay_core::{CoreCredentials, ProbeResult, probe_stream};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tauri::Manager;
 use tokio::fs;
 use tokio::sync::Mutex;
+use tokio::task::JoinSet;
 use tokio::time::{Duration, sleep};
 
 static TARGET_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -21,6 +23,8 @@ pub struct MonitorTarget {
     pub url: String,
     pub name: String,
     pub enabled: bool,
+    #[serde(default)]
+    pub suppress_until_offline: bool,
     pub last_state: String,
     pub last_error: Option<String>,
     pub last_checked_at: Option<i64>,
@@ -39,12 +43,53 @@ fn store_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| format!("无法获取监控状态目录: {error}"))
 }
 
+fn backup_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.bak", path.to_string_lossy()))
+}
+
+async fn decode_store(path: &Path) -> Result<MonitorStore, String> {
+    let bytes = fs::read(path)
+        .await
+        .map_err(|error| format!("读取主播监控状态文件失败 {}: {error}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("解析主播监控状态失败 {}: {error}", path.display()))
+}
+
 async fn read_store(path: &Path) -> Result<MonitorStore, String> {
-    match fs::read(path).await {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map_err(|error| format!("读取主播监控状态失败: {error}")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(MonitorStore::default()),
-        Err(error) => Err(format!("读取主播监控状态文件失败: {error}")),
+    match decode_store(path).await {
+        Ok(store) => Ok(store),
+        Err(primary_error) => {
+            let primary_missing = fs::metadata(path)
+                .await
+                .err()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+            let backup = backup_path(path);
+            match decode_store(&backup).await {
+                Ok(store) => Ok(store),
+                Err(backup_error) if primary_missing => {
+                    let backup_missing = fs::metadata(&backup)
+                        .await
+                        .err()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+                    if backup_missing {
+                        Ok(MonitorStore::default())
+                    } else {
+                        Err(backup_error)
+                    }
+                }
+                Err(backup_error) => Err(format!(
+                    "主播监控状态主文件与备份均不可用；主文件: {primary_error}; 备份: {backup_error}"
+                )),
+            }
+        }
+    }
+}
+
+fn sync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(directory) = std::fs::File::open(parent) {
+            let _ = directory.sync_all();
+        }
     }
 }
 
@@ -57,19 +102,39 @@ async fn save_store(path: &Path, store: &MonitorStore) -> Result<(), String> {
     let temp = PathBuf::from(format!("{}.tmp", path.to_string_lossy()));
     let bytes = serde_json::to_vec_pretty(store)
         .map_err(|error| format!("序列化主播监控状态失败: {error}"))?;
-    fs::write(&temp, bytes)
-        .await
-        .map_err(|error| format!("写入监控临时状态失败: {error}"))?;
-    if fs::metadata(path).await.is_ok() {
-        let backup = PathBuf::from(format!("{}.bak", path.to_string_lossy()));
-        let _ = fs::copy(path, backup).await;
-        fs::remove_file(path)
-            .await
-            .map_err(|error| format!("替换监控状态文件失败: {error}"))?;
+    {
+        let mut file = std::fs::File::create(&temp)
+            .map_err(|error| format!("创建监控临时状态失败: {error}"))?;
+        file.write_all(&bytes)
+            .map_err(|error| format!("写入监控临时状态失败: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("同步监控临时状态失败: {error}"))?;
     }
+
+    if fs::metadata(path).await.is_ok() {
+        let backup = backup_path(path);
+        let backup_temp = PathBuf::from(format!("{}.tmp", backup.to_string_lossy()));
+        fs::copy(path, &backup_temp)
+            .await
+            .map_err(|error| format!("创建监控状态备份失败: {error}"))?;
+        if let Ok(file) = std::fs::OpenOptions::new().read(true).open(&backup_temp) {
+            file.sync_all()
+                .map_err(|error| format!("同步监控状态备份失败: {error}"))?;
+        }
+        if fs::metadata(&backup).await.is_ok() {
+            let _ = fs::remove_file(&backup).await;
+        }
+        fs::rename(&backup_temp, &backup)
+            .await
+            .map_err(|error| format!("提交监控状态备份失败: {error}"))?;
+    }
+
+    // Android/Linux rename over an existing file is atomic; never delete the live state first.
     fs::rename(&temp, path)
         .await
-        .map_err(|error| format!("提交监控状态文件失败: {error}"))
+        .map_err(|error| format!("提交监控状态文件失败: {error}"))?;
+    sync_parent_dir(path);
+    Ok(())
 }
 
 async fn mutate_store<F, T>(app: &tauri::AppHandle, mutate: F) -> Result<T, String>
@@ -129,6 +194,7 @@ pub async fn mobile_monitor_add(
                 display_name
             },
             enabled: true,
+            suppress_until_offline: false,
             last_state: "正在检测".to_string(),
             last_error: None,
             last_checked_at: None,
@@ -138,8 +204,6 @@ pub async fn mobile_monitor_add(
     })
     .await?;
 
-    // Adding a target is explicit user intent: do one detection immediately instead of waiting
-    // for the periodic monitor interval.
     monitor_target_once(&app, &target).await?;
     mobile_monitor_status(app).await
 }
@@ -173,6 +237,7 @@ pub async fn mobile_monitor_set_enabled(
             .find(|target| target.id == target_id)
             .ok_or_else(|| "监控任务不存在。".to_string())?;
         target.enabled = enabled;
+        target.suppress_until_offline = false;
         target.last_state = if enabled { "正在检测" } else { "已暂停" }.to_string();
         target.last_error = None;
         Ok(target.clone())
@@ -183,6 +248,35 @@ pub async fn mobile_monitor_set_enabled(
         monitor_target_once(&app, &target).await?;
     }
     mobile_monitor_status(app).await
+}
+
+pub async fn suppress_until_offline(app: &tauri::AppHandle, room_url: &str) -> Result<(), String> {
+    mutate_store(app, |store| {
+        if let Some(target) = store.targets.iter_mut().find(|target| target.url == room_url) {
+            target.suppress_until_offline = true;
+            target.last_state = "本场已停止，等待下播".to_string();
+            target.last_error = None;
+            target.last_checked_at = Some(chrono::Utc::now().timestamp());
+        }
+        Ok(())
+    })
+    .await
+}
+
+async fn clear_suppression_after_offline(
+    app: &tauri::AppHandle,
+    id: &str,
+) -> Result<(), String> {
+    mutate_store(app, |store| {
+        if let Some(target) = store.targets.iter_mut().find(|target| target.id == id) {
+            target.suppress_until_offline = false;
+            target.last_state = "等待开播".to_string();
+            target.last_error = None;
+            target.last_checked_at = Some(chrono::Utc::now().timestamp());
+        }
+        Ok(())
+    })
+    .await
 }
 
 async fn update_target_state(
@@ -205,7 +299,11 @@ async fn update_target_state(
 async fn enabled_targets(app: &tauri::AppHandle) -> Result<Vec<MonitorTarget>, String> {
     let _guard = gate().lock().await;
     let store = read_store(&store_path(app)?).await?;
-    Ok(store.targets.into_iter().filter(|target| target.enabled).collect())
+    Ok(store
+        .targets
+        .into_iter()
+        .filter(|target| target.enabled)
+        .collect())
 }
 
 async fn monitor_target_once(app: &tauri::AppHandle, target: &MonitorTarget) -> Result<(), String> {
@@ -213,15 +311,31 @@ async fn monitor_target_once(app: &tauri::AppHandle, target: &MonitorTarget) -> 
         return update_target_state(app, &target.id, "正在录制", None).await;
     }
 
-    update_target_state(app, &target.id, "正在检测", None).await?;
+    update_target_state(
+        app,
+        &target.id,
+        if target.suppress_until_offline {
+            "本场已停止，检查是否下播"
+        } else {
+            "正在检测"
+        },
+        None,
+    )
+    .await?;
+
     let credentials = CoreCredentials::default();
     match probe_stream(&target.url, &target.name, credentials.clone()).await {
         Ok(ProbeResult::Offline) => {
-            update_target_state(app, &target.id, "等待开播", None).await
+            if target.suppress_until_offline {
+                clear_suppression_after_offline(app, &target.id).await
+            } else {
+                update_target_state(app, &target.id, "等待开播", None).await
+            }
+        }
+        Ok(ProbeResult::Live { stream: _ }) if target.suppress_until_offline => {
+            update_target_state(app, &target.id, "本场已停止，等待下播", None).await
         }
         Ok(ProbeResult::Live { stream }) => {
-            // This is the only platform probe before recording starts. Pass the exact resolved
-            // stream directly to the recorder; do not discard it and probe again.
             match super::mobile_recordings::start_recording_resolved(
                 app.clone(),
                 target.url.clone(),
@@ -242,15 +356,30 @@ async fn monitor_target_once(app: &tauri::AppHandle, target: &MonitorTarget) -> 
 }
 
 async fn monitor_tick(app: &tauri::AppHandle) -> Result<(), String> {
-    for target in enabled_targets(app).await? {
-        monitor_target_once(app, &target).await?;
+    let targets = enabled_targets(app).await?;
+    let mut set = JoinSet::new();
+    for target in targets {
+        let worker_app = app.clone();
+        set.spawn(async move { monitor_target_once(&worker_app, &target).await });
     }
-    Ok(())
+
+    let mut errors = Vec::new();
+    while let Some(result) = set.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => errors.push(error),
+            Err(error) => errors.push(format!("监控任务异常退出: {error}")),
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 pub fn start_monitor_worker(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
-        // First pass is immediate; 20 seconds only separates subsequent checks.
         loop {
             if let Err(error) = monitor_tick(&app).await {
                 eprintln!("[monitor] worker error: {error}");

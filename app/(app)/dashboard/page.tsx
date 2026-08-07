@@ -48,11 +48,13 @@ const ReplaySettings: React.FC = () => {
 
   const save = async (values: any) => {
     try {
-      // 只简化 UI，不破坏旧数据。页面未展示的兼容字段原样保留，后续真正删除
-      // biliup 配置字段时再通过显式 migration 处理。
-      const payload = { ...entity, ...values }
-      if (payload.file_size === '') payload.file_size = null
-      if (payload.segment_time === '') payload.segment_time = null
+      const payload = {
+        ...entity,
+        ...values,
+        // Live Replay 使用固定的安全分段策略。保留字段仅用于兼容旧配置格式。
+        file_size: 15_000_000_000,
+        segment_time: null,
+      }
       await trigger(payload)
       Toast.success('设置已保存')
       await Promise.all([refreshConfig(), refreshDisk()])
@@ -75,7 +77,7 @@ const ReplaySettings: React.FC = () => {
               <div style={{ backgroundColor: '#6b6c75ff', borderRadius: 8, color: 'white', display: 'flex', padding: 6 }}>
                 <IconSetting size="large" />
               </div>
-              <h4 style={{ marginLeft: 12 }}>Live Replay 设置</h4>
+              <h4 style={{ marginLeft: 12 }}>设置</h4>
             </>
           }
           footer={
@@ -98,7 +100,7 @@ const ReplaySettings: React.FC = () => {
                 theme="solid"
                 onClick={() => setAccountManagerVisible(true)}
               >
-                添加 / 管理账号
+                管理账号
               </Button>
             }
           >
@@ -107,7 +109,7 @@ const ReplaySettings: React.FC = () => {
             ) : (biliUsers ?? []).length === 0 ? (
               <div>
                 <Text strong>还没有投稿账号</Text><br />
-                <Text type="tertiary">先扫码登录 B 站账号，之后每个主播可以单独选择使用哪个账号投稿。</Text>
+                <Text type="tertiary">添加 B 站账号后，可为每个主播选择对应的投稿账号。</Text>
               </div>
             ) : (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
@@ -133,7 +135,7 @@ const ReplaySettings: React.FC = () => {
                     </div>
                   ))}
                 </div>
-                <Text type="tertiary">账号只在这里统一添加和管理；主播设置中只选择投稿账号，避免重复登录。</Text>
+                <Text type="tertiary">账号添加一次即可在多个主播之间使用。</Text>
               </div>
             )}
           </Card>
@@ -144,7 +146,7 @@ const ReplaySettings: React.FC = () => {
                 <Col span={16}>
                   <Title heading={5}>存储</Title>
                   <Text>{disk.message}</Text><br />
-                  <Text type="tertiary">当前录像目录：{disk.directory}</Text>
+                  <Text type="tertiary">录像目录：{disk.directory}</Text>
                 </Col>
                 <Col span={8} style={{ textAlign: 'right' }}>
                   <Title heading={4}>{disk.free_gb === undefined ? '-' : `${disk.free_gb.toFixed(1)} GB`}</Title>
@@ -156,6 +158,9 @@ const ReplaySettings: React.FC = () => {
 
           <Form initValues={entity} getFormApi={api => (formRef.current = api)} onSubmit={save}>
             <Card title="录制" style={{ marginBottom: 16 }}>
+              <Typography.Paragraph type="tertiary" style={{ marginBottom: 16 }}>
+                录像文件达到约 15 GB 时会自动分段。每场直播仍作为一个完整场次处理。
+              </Typography.Paragraph>
               <Form.Select
                 field="downloader"
                 label="录制引擎"
@@ -167,27 +172,10 @@ const ReplaySettings: React.FC = () => {
                 style={{ width: '100%' }}
               />
               <Form.Input
-                field="segment_time"
-                label="默认分段时长"
-                placeholder="01:00:00"
-                extraText="格式：时:分:秒。单个主播创建时设置的分段时长会覆盖这里。"
-                rules={[
-                  { pattern: /^[^：]*$/, message: '请使用英文冒号' },
-                  { pattern: /^$|^[0-9]{2,4}:[0-5][0-9]:[0-5][0-9]$/, message: '格式应为 01:00:00' },
-                ]}
-              />
-              <Form.Input
                 field="filename_prefix"
                 label="默认文件名"
                 placeholder="{streamer}%Y-%m-%dT%H_%M_%S"
-                extraText="建议保留 {streamer}，方便异常恢复时辨认文件。"
-              />
-              <Form.InputNumber
-                field="filtering_threshold"
-                label="碎片过滤阈值"
-                suffix="MB"
-                min={0}
-                style={{ width: '100%' }}
+                extraText="支持 {streamer}、{title} 和日期时间格式。"
               />
               <Form.InputNumber
                 field="event_loop_interval"
@@ -224,7 +212,7 @@ const ReplaySettings: React.FC = () => {
                 min={1}
                 max={8}
                 style={{ width: '100%' }}
-                extraText="录制与上传已经解耦；这里仅控制上传本身的并发。"
+                extraText="较高并发可能提升上传速度，也会占用更多带宽。"
               />
               <Form.Select
                 field="submit_api"
@@ -281,12 +269,7 @@ const ReplaySettings: React.FC = () => {
             </Card>
 
             <Card>
-              <Text type="tertiary">
-                旧平台插件和开发者字段已经从普通界面隐藏。尚未迁移的兼容字段仍保存在配置文件中，不会因为保存本页而被删除。
-              </Text>
-              <div style={{ marginTop: 16 }}>
-                <Button theme="solid" onClick={() => formRef.current?.submitForm()}>保存设置</Button>
-              </div>
+              <Button theme="solid" onClick={() => formRef.current?.submitForm()}>保存设置</Button>
             </Card>
           </Form>
         </div>

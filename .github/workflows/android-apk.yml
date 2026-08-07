@@ -16,9 +16,11 @@ on:
 permissions:
   contents: write
 
+# Each commit owns its own CI lane. New feature commits no longer cancel older builds,
+# so one failure can be diagnosed while later work continues compiling in parallel.
 concurrency:
-  group: android-apk-${{ github.ref }}
-  cancel-in-progress: true
+  group: android-apk-${{ github.sha }}
+  cancel-in-progress: false
 
 jobs:
   build-apk:
@@ -102,7 +104,7 @@ jobs:
       - name: Stage APK for release
         uses: actions/upload-artifact@v4
         with:
-          name: release-${{ matrix.label }}
+          name: release-${{ matrix.label }}-${{ github.sha }}
           path: dist/android/${{ matrix.apk_name }}
           if-no-files-found: error
           retention-days: 2
@@ -114,14 +116,31 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Check this is still branch HEAD
+        id: latest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          LATEST_SHA="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/agent/android-live-replay-apk" --jq '.object.sha')"
+          if [ "$LATEST_SHA" = "$GITHUB_SHA" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "This build is current branch HEAD; publishing Android Latest."
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "A newer commit exists ($LATEST_SHA); keep this CI result but do not overwrite Android Latest."
+          fi
+
       - name: Download built APKs
+        if: steps.latest.outputs.publish == 'true'
         uses: actions/download-artifact@v4
         with:
-          pattern: release-*
+          pattern: release-*-${{ github.sha }}
           path: release-assets
           merge-multiple: true
 
       - name: Verify release APKs
+        if: steps.latest.outputs.publish == 'true'
         shell: bash
         run: |
           test -s release-assets/Live-Replay-Android-ARM64.apk
@@ -129,12 +148,11 @@ jobs:
           ls -lh release-assets/*.apk
 
       - name: Publish raw APK files
+        if: steps.latest.outputs.publish == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Keep one rolling pre-release so the newest APK is always obvious and downloadable
-          # directly as .apk instead of GitHub's ZIP-wrapped Actions artifact.
           gh release delete android-latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
           gh release create android-latest \
             release-assets/Live-Replay-Android-ARM64.apk \

@@ -1,5 +1,6 @@
 use live_replay_core::recording::{LIVE_OFFLINE_GRACE, RecordingSegment};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -50,14 +51,53 @@ fn store_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| format!("无法获取录像恢复状态目录: {error}"))
 }
 
+fn backup_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.bak", path.to_string_lossy()))
+}
+
+async fn decode_store(path: &Path) -> Result<RecordingJournalStore, String> {
+    let bytes = fs::read(path)
+        .await
+        .map_err(|error| format!("读取录像恢复状态文件失败 {}: {error}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("解析录像恢复状态失败 {}: {error}", path.display()))
+}
+
 async fn read_store(path: &Path) -> Result<RecordingJournalStore, String> {
-    match fs::read(path).await {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map_err(|error| format!("读取录像恢复状态失败: {error}")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Ok(RecordingJournalStore::default())
+    match decode_store(path).await {
+        Ok(store) => Ok(store),
+        Err(primary_error) => {
+            let primary_missing = fs::metadata(path)
+                .await
+                .err()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+            let backup = backup_path(path);
+            match decode_store(&backup).await {
+                Ok(store) => Ok(store),
+                Err(backup_error) if primary_missing => {
+                    let backup_missing = fs::metadata(&backup)
+                        .await
+                        .err()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+                    if backup_missing {
+                        Ok(RecordingJournalStore::default())
+                    } else {
+                        Err(backup_error)
+                    }
+                }
+                Err(backup_error) => Err(format!(
+                    "录像恢复状态主文件与备份均不可用；主文件: {primary_error}; 备份: {backup_error}"
+                )),
+            }
         }
-        Err(error) => Err(format!("读取录像恢复状态文件失败: {error}")),
+    }
+}
+
+fn sync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(directory) = std::fs::File::open(parent) {
+            let _ = directory.sync_all();
+        }
     }
 }
 
@@ -70,19 +110,38 @@ async fn save_store(path: &Path, store: &RecordingJournalStore) -> Result<(), St
     let temp = PathBuf::from(format!("{}.tmp", path.to_string_lossy()));
     let bytes = serde_json::to_vec_pretty(store)
         .map_err(|error| format!("序列化录像恢复状态失败: {error}"))?;
-    fs::write(&temp, bytes)
-        .await
-        .map_err(|error| format!("写入录像恢复临时状态失败: {error}"))?;
-    if fs::metadata(path).await.is_ok() {
-        let backup = PathBuf::from(format!("{}.bak", path.to_string_lossy()));
-        let _ = fs::copy(path, backup).await;
-        fs::remove_file(path)
-            .await
-            .map_err(|error| format!("替换录像恢复状态失败: {error}"))?;
+    {
+        let mut file = std::fs::File::create(&temp)
+            .map_err(|error| format!("创建录像恢复临时状态失败: {error}"))?;
+        file.write_all(&bytes)
+            .map_err(|error| format!("写入录像恢复临时状态失败: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("同步录像恢复临时状态失败: {error}"))?;
     }
+
+    if fs::metadata(path).await.is_ok() {
+        let backup = backup_path(path);
+        let backup_temp = PathBuf::from(format!("{}.tmp", backup.to_string_lossy()));
+        fs::copy(path, &backup_temp)
+            .await
+            .map_err(|error| format!("创建录像恢复状态备份失败: {error}"))?;
+        if let Ok(file) = std::fs::OpenOptions::new().read(true).open(&backup_temp) {
+            file.sync_all()
+                .map_err(|error| format!("同步录像恢复状态备份失败: {error}"))?;
+        }
+        if fs::metadata(&backup).await.is_ok() {
+            let _ = fs::remove_file(&backup).await;
+        }
+        fs::rename(&backup_temp, &backup)
+            .await
+            .map_err(|error| format!("提交录像恢复状态备份失败: {error}"))?;
+    }
+
     fs::rename(&temp, path)
         .await
-        .map_err(|error| format!("提交录像恢复状态失败: {error}"))
+        .map_err(|error| format!("提交录像恢复状态文件失败: {error}"))?;
+    sync_parent_dir(path);
+    Ok(())
 }
 
 async fn mutate_store<F, T>(app: &tauri::AppHandle, mutate: F) -> Result<T, String>
@@ -117,7 +176,11 @@ pub async fn prepare_session(
     let grace = LIVE_OFFLINE_GRACE.as_secs() as i64;
     mutate_store(app, |store| {
         let mut stale_session = None;
-        if let Some(position) = store.sessions.iter().position(|item| item.room_url == room_url) {
+        if let Some(position) = store
+            .sessions
+            .iter()
+            .position(|item| item.room_url == room_url)
+        {
             let existing = store.sessions[position].clone();
             if now.saturating_sub(existing.last_heartbeat_at) <= grace {
                 let session = &mut store.sessions[position];
@@ -162,7 +225,11 @@ pub async fn prepare_session(
 pub async fn heartbeat(app: &tauri::AppHandle, room_url: &str) -> Result<(), String> {
     let now = chrono::Utc::now().timestamp();
     mutate_store(app, |store| {
-        if let Some(session) = store.sessions.iter_mut().find(|item| item.room_url == room_url) {
+        if let Some(session) = store
+            .sessions
+            .iter_mut()
+            .find(|item| item.room_url == room_url)
+        {
             session.last_heartbeat_at = now;
         }
         Ok(())
@@ -170,8 +237,6 @@ pub async fn heartbeat(app: &tauri::AppHandle, room_url: &str) -> Result<(), Str
     .await
 }
 
-/// Persist a completed raw segment before MP4 remux or uploader enqueue starts. This is the
-/// hand-off barrier: after this write succeeds, a process crash can always retry the segment.
 pub async fn register_completed_segment(
     app: &tauri::AppHandle,
     room_url: &str,
@@ -189,7 +254,11 @@ pub async fn register_completed_segment(
                     .then(a.segment_index.cmp(&b.segment_index))
             });
         }
-        if let Some(session) = store.sessions.iter_mut().find(|item| item.room_url == room_url) {
+        if let Some(session) = store
+            .sessions
+            .iter_mut()
+            .find(|item| item.room_url == room_url)
+        {
             session.next_segment_index = session
                 .next_segment_index
                 .max(segment.segment_index.saturating_add(1));
@@ -201,8 +270,6 @@ pub async fn register_completed_segment(
     .await
 }
 
-/// Remove only after the finalized MP4 is durably present and the Bilibili persistent queue has
-/// accepted the segment. A crash before this call leaves the segment recoverable.
 pub async fn complete_segment_handoff(
     app: &tauri::AppHandle,
     live_session_id: &str,

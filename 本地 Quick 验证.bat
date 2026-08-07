@@ -7,7 +7,7 @@ title Live Replay - Local Quick
 
 echo ============================================================
 echo [Live Replay] Local Quick Validation
-echo [Mode] Incremental frontend + Rust workspace check
+echo [Mode] Cached frontend + incremental Rust workspace check
 echo ============================================================
 echo.
 
@@ -84,58 +84,44 @@ if not defined LOCK_HASH (
     exit /b 1
 )
 
-set "LOCK_CACHE=node_modules\.live-replay-package-lock.sha256"
+rem v2 marker intentionally forces one exact refresh after the older ad-hoc npm repair logic.
+set "LOCK_CACHE=node_modules\.live-replay-package-lock-v2.sha256"
 
-if not exist "node_modules\" goto :deps_clean_install
-
-if not exist "!LOCK_CACHE!" (
-    echo [DEPS] Existing node_modules found. Creating cache marker...
-    call npm.cmd ls --depth=0 --silent >nul 2>nul
-    if errorlevel 1 goto :deps_sync
-    >"!LOCK_CACHE!" echo !LOCK_HASH!
-    echo [DEPS] Existing dependency tree accepted.
-    goto :deps_peer_check
-)
+if not exist "node_modules\" goto :deps_refresh
+if not exist "!LOCK_CACHE!" goto :deps_refresh
 
 set "CACHED_HASH="
 set /p "CACHED_HASH="<"!LOCK_CACHE!"
-if /I "!CACHED_HASH!"=="!LOCK_HASH!" (
-    echo [DEPS] package-lock.json unchanged. Skipping npm install.
-    goto :deps_peer_check
-)
+if /I not "!CACHED_HASH!"=="!LOCK_HASH!" goto :deps_refresh
 
-echo [DEPS] package-lock.json changed. Syncing dependencies using local cache first...
-goto :deps_sync
+rem Cheap integrity probes. If any critical package vanished, rebuild exactly from the lock file.
+if not exist "node_modules\next\package.json" goto :deps_refresh
+if not exist "node_modules\@douyinfe\semi-ui\package.json" goto :deps_refresh
+if not exist "node_modules\react-resizable\package.json" goto :deps_refresh
+if not exist "node_modules\react-draggable\package.json" goto :deps_refresh
 
-:deps_clean_install
-echo [DEPS] First run. Running npm ci...
-call npm.cmd ci
-if errorlevel 1 exit /b 1
->"!LOCK_CACHE!" echo !LOCK_HASH!
-goto :deps_peer_check
-
-:deps_sync
-call npm.cmd install --prefer-offline --no-audit --no-fund
-if errorlevel 1 exit /b 1
-for /f %%H in ('powershell -NoProfile -NonInteractive -Command "(Get-FileHash -Algorithm SHA256 'package-lock.json').Hash"') do set "LOCK_HASH=%%H"
->"!LOCK_CACHE!" echo !LOCK_HASH!
-goto :deps_peer_check
-
-:deps_peer_check
-if exist "node_modules\react-draggable\package.json" (
-    echo [DEPS] react-draggable peer dependency is present.
-    exit /b 0
-)
-
-echo [DEPS] npm did not install react-draggable peer dependency. Repairing once...
-call npm.cmd install --no-save --package-lock=false --prefer-offline --no-audit --no-fund react-draggable@4.7.0
-if errorlevel 1 exit /b 1
-if not exist "node_modules\react-draggable\package.json" (
-    echo [FAIL] react-draggable is still missing after repair.
-    exit /b 1
-)
-echo [DEPS] react-draggable repaired successfully.
+echo [DEPS] package-lock.json unchanged. Using cached node_modules.
 exit /b 0
+
+:deps_refresh
+echo [DEPS] Refreshing exact dependency tree from package-lock.json...
+echo [DEPS] npm cache will be preferred; this should only happen when the lock file changes or cache integrity fails.
+call npm.cmd ci --prefer-offline --no-audit --no-fund
+if errorlevel 1 exit /b 1
+
+if not exist "node_modules\next\package.json" goto :deps_invalid
+if not exist "node_modules\@douyinfe\semi-ui\package.json" goto :deps_invalid
+if not exist "node_modules\react-resizable\package.json" goto :deps_invalid
+if not exist "node_modules\react-draggable\package.json" goto :deps_invalid
+
+>"!LOCK_CACHE!" echo !LOCK_HASH!
+echo [DEPS] Exact dependency tree restored and cache marker updated.
+exit /b 0
+
+:deps_invalid
+echo [FAIL] npm ci completed but a required frontend package is still missing.
+echo [FAIL] Do not run npm install manually. Send this output for diagnosis.
+exit /b 1
 
 :node_missing
 echo [FAIL] Node.js was not found.

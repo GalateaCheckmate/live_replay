@@ -5,22 +5,22 @@ use live_replay_core::{
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use tauri::Manager;
 
 const MIN_START_FREE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const WARN_FREE_BYTES: u64 = 30 * 1024 * 1024 * 1024;
 
 #[derive(Default)]
-pub struct MultiRecordingState {
-    runtime: Mutex<MultiRecordingRuntime>,
-}
-
-#[derive(Default)]
 struct MultiRecordingRuntime {
     recordings: HashMap<String, ActiveRecording>,
     last_file: Option<String>,
     last_error: Option<String>,
+}
+
+fn runtime() -> &'static Mutex<MultiRecordingRuntime> {
+    static RUNTIME: OnceLock<Mutex<MultiRecordingRuntime>> = OnceLock::new();
+    RUNTIME.get_or_init(|| Mutex::new(MultiRecordingRuntime::default()))
 }
 
 struct ActiveRecording {
@@ -65,8 +65,8 @@ fn available_space(app: &tauri::AppHandle) -> Option<u64> {
     fs2::available_space(dir).ok()
 }
 
-fn build_status(app: &tauri::AppHandle, runtime: &MultiRecordingRuntime) -> MultiRecordingStatus {
-    let mut recordings: Vec<_> = runtime
+fn build_status(app: &tauri::AppHandle, state: &MultiRecordingRuntime) -> MultiRecordingStatus {
+    let mut recordings: Vec<_> = state
         .recordings
         .values()
         .map(|recording| RecordingStatusItem {
@@ -82,8 +82,8 @@ fn build_status(app: &tauri::AppHandle, runtime: &MultiRecordingRuntime) -> Mult
         active: !recordings.is_empty(),
         active_count: recordings.len(),
         recordings,
-        last_file: runtime.last_file.clone(),
-        last_error: runtime.last_error.clone(),
+        last_file: state.last_file.clone(),
+        last_error: state.last_error.clone(),
         low_space_warning: available_bytes.is_some_and(|bytes| bytes < WARN_FREE_BYTES),
         available_bytes,
     }
@@ -95,21 +95,17 @@ pub fn mobile_recordings_status(app: tauri::AppHandle) -> Result<MultiRecordingS
 }
 
 pub fn status(app: &tauri::AppHandle) -> Result<MultiRecordingStatus, String> {
-    let state = app.state::<MultiRecordingState>();
-    let runtime = state
-        .runtime
+    let state = runtime()
         .lock()
         .map_err(|_| "Android 多路录制状态锁异常".to_string())?;
-    Ok(build_status(app, &runtime))
+    Ok(build_status(app, &state))
 }
 
-pub fn is_recording(app: &tauri::AppHandle, room_url: &str) -> Result<bool, String> {
-    let state = app.state::<MultiRecordingState>();
-    let runtime = state
-        .runtime
+pub fn is_recording(room_url: &str) -> Result<bool, String> {
+    let state = runtime()
         .lock()
         .map_err(|_| "Android 多路录制状态锁异常".to_string())?;
-    Ok(runtime.recordings.contains_key(room_url))
+    Ok(state.recordings.contains_key(room_url))
 }
 
 #[tauri::command]
@@ -142,8 +138,7 @@ pub async fn start_recording(
     if url.is_empty() {
         return Err("直播间地址为空。".to_string());
     }
-
-    if is_recording(&app, &url)? {
+    if is_recording(&url)? {
         return status(&app);
     }
 
@@ -164,20 +159,17 @@ pub async fn start_recording(
         ProbeResult::Live { stream } => stream,
     };
 
-    // Re-check after network probing so two monitor ticks cannot start the same room twice.
-    if is_recording(&app, &url)? {
+    if is_recording(&url)? {
         return status(&app);
     }
 
     let stop_flag = new_stop_flag();
     let started_at = chrono::Utc::now().timestamp();
     {
-        let state = app.state::<MultiRecordingState>();
-        let mut runtime = state
-            .runtime
+        let mut state = runtime()
             .lock()
             .map_err(|_| "Android 多路录制状态锁异常".to_string())?;
-        runtime.recordings.insert(
+        state.recordings.insert(
             url.clone(),
             ActiveRecording {
                 room_url: url.clone(),
@@ -187,7 +179,7 @@ pub async fn start_recording(
                 stop_flag: stop_flag.clone(),
             },
         );
-        runtime.last_error = None;
+        state.last_error = None;
     }
 
     let worker_app = app.clone();
@@ -206,16 +198,15 @@ pub async fn start_recording(
             Err(error) => Err(error),
         };
 
-        let state = worker_app.state::<MultiRecordingState>();
-        if let Ok(mut runtime) = state.runtime.lock() {
-            runtime.recordings.remove(&worker_url);
+        if let Ok(mut state) = runtime().lock() {
+            state.recordings.remove(&worker_url);
             match result {
                 Ok(final_mp4) => {
-                    runtime.last_file = Some(final_mp4);
-                    runtime.last_error = None;
+                    state.last_file = Some(final_mp4);
+                    state.last_error = None;
                 }
                 Err(error) => {
-                    runtime.last_error = Some(error);
+                    state.last_error = Some(error);
                 }
             }
         }
@@ -229,18 +220,16 @@ pub fn mobile_stop_recording_multi(
     app: tauri::AppHandle,
     room_url: Option<String>,
 ) -> Result<MultiRecordingStatus, String> {
-    let state = app.state::<MultiRecordingState>();
     {
-        let runtime = state
-            .runtime
+        let state = runtime()
             .lock()
             .map_err(|_| "Android 多路录制状态锁异常".to_string())?;
         if let Some(room_url) = room_url.as_deref() {
-            if let Some(recording) = runtime.recordings.get(room_url) {
+            if let Some(recording) = state.recordings.get(room_url) {
                 request_stop(&recording.stop_flag);
             }
         } else {
-            for recording in runtime.recordings.values() {
+            for recording in state.recordings.values() {
                 request_stop(&recording.stop_flag);
             }
         }
@@ -248,12 +237,10 @@ pub fn mobile_stop_recording_multi(
     status(&app)
 }
 
-pub fn request_stop_all(app: &tauri::AppHandle) {
-    if let Some(state) = app.try_state::<MultiRecordingState>() {
-        if let Ok(runtime) = state.runtime.lock() {
-            for recording in runtime.recordings.values() {
-                request_stop(&recording.stop_flag);
-            }
+pub fn request_stop_all() {
+    if let Ok(state) = runtime().lock() {
+        for recording in state.recordings.values() {
+            request_stop(&recording.stop_flag);
         }
     }
 }

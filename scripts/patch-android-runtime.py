@@ -20,7 +20,7 @@ required_permissions = [
     "android.permission.ACCESS_NETWORK_STATE",
     "android.permission.WAKE_LOCK",
     "android.permission.FOREGROUND_SERVICE",
-    "android.permission.FOREGROUND_SERVICE_DATA_SYNC",
+    "android.permission.FOREGROUND_SERVICE_SPECIAL_USE",
     "android.permission.POST_NOTIFICATIONS",
 ]
 
@@ -55,8 +55,27 @@ if service is None:
 service.set(name_attr, service_name)
 service.set(android_attr("enabled"), "true")
 service.set(android_attr("exported"), "false")
-service.set(android_attr("foregroundServiceType"), "dataSync")
+# Android 15 limits dataSync FGS to six hours/24h. Live Replay is a user-configured long-running
+# livestream monitor/recorder, which is not adequately represented by another standard FGS type.
+service.set(android_attr("foregroundServiceType"), "specialUse")
 service.set(android_attr("stopWithTask"), "false")
+
+special_use_property_name = "android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+special_use_property = next(
+    (
+        item
+        for item in service.findall("property")
+        if item.get(name_attr) == special_use_property_name
+    ),
+    None,
+)
+if special_use_property is None:
+    special_use_property = ET.SubElement(service, "property")
+special_use_property.set(name_attr, special_use_property_name)
+special_use_property.set(
+    android_attr("value"),
+    "Continuous user-configured livestream monitoring, recording, and archival upload",
+)
 
 ET.indent(tree, space="    ")
 tree.write(manifest_path, encoding="utf-8", xml_declaration=True)
@@ -163,7 +182,7 @@ class LiveReplayForegroundService : Service() {{
                 "Live Replay 后台任务",
                 NotificationManager.IMPORTANCE_LOW,
             ).apply {{
-                description = "保持录制与上传任务在后台继续运行"
+                description = "保持直播监控、录制与上传任务在后台继续运行"
                 setShowBadge(false)
             }}
             getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
@@ -181,7 +200,7 @@ class LiveReplayForegroundService : Service() {{
         return builder
             .setSmallIcon(applicationInfo.icon)
             .setContentTitle("Live Replay 正在后台运行")
-            .setContentText("后台录制服务已启动")
+            .setContentText("直播监控与录制服务已启动")
             .setOngoing(true)
             .setCategory(Notification.CATEGORY_SERVICE)
             .build()
@@ -195,5 +214,6 @@ print("Android runtime tuning applied")
 print(f"  manifest: {manifest_path}")
 print(f"  activity: {main_activity_path}")
 print(f"  service:  {service_path}")
+print("  foreground service type: specialUse")
 for permission in required_permissions:
     print(f"  permission: {permission}")

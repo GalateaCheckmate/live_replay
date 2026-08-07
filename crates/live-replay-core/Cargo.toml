@@ -13,3 +13,4 @@ chrono = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true, features = ["charset", "http2", "brotli", "gzip", "json", "stream"] }
 tokio = { workspace = true, features = ["fs", "io-util", "sync", "time"] }
+fs2 = "0.4"

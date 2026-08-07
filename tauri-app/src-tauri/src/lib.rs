@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex};
 
 use tauri::RunEvent;
 #[cfg(desktop)]
-use tauri::{Emitter, Manager};
-#[cfg(desktop)]
 use tauri::path::BaseDirectory;
+#[cfg(desktop)]
+use tauri::{Emitter, Manager};
 #[cfg(desktop)]
 use tauri_plugin_shell::process::{CommandChild, CommandEvent, Encoding};
 #[cfg(desktop)]
@@ -77,8 +77,7 @@ fn spawn_and_monitor_sidecar(app_handle: tauri::AppHandle) -> Result<(), String>
 }
 
 #[cfg(desktop)]
-#[tauri::command]
-fn shutdown_sidecar(app_handle: &tauri::AppHandle) -> Result<String, String> {
+fn shutdown_sidecar_impl(app_handle: &tauri::AppHandle) -> Result<String, String> {
     let state = app_handle
         .try_state::<Arc<Mutex<Option<CommandChild>>>>()
         .ok_or_else(|| "Sidecar process state not found".to_string())?;
@@ -119,9 +118,15 @@ fn shutdown_sidecar(app_handle: &tauri::AppHandle) -> Result<String, String> {
     Ok("Sidecar shutdown requested.".to_string())
 }
 
+#[cfg(desktop)]
+#[tauri::command]
+fn shutdown_sidecar(app_handle: tauri::AppHandle) -> Result<String, String> {
+    shutdown_sidecar_impl(&app_handle)
+}
+
 #[cfg(mobile)]
 #[tauri::command]
-fn shutdown_sidecar(_app_handle: &tauri::AppHandle) -> Result<String, String> {
+fn shutdown_sidecar() -> Result<String, String> {
     Ok("Android does not use the Windows sidecar.".to_string())
 }
 
@@ -134,7 +139,7 @@ fn start_sidecar(app_handle: tauri::AppHandle) -> Result<String, String> {
 
 #[cfg(mobile)]
 #[tauri::command]
-fn start_sidecar(_app_handle: tauri::AppHandle) -> Result<String, String> {
+fn start_sidecar() -> Result<String, String> {
     Err("Android native Live Replay core is not wired yet.".to_string())
 }
 
@@ -171,7 +176,7 @@ pub fn run() {
         .run(|app_handle, event| {
             if let RunEvent::ExitRequested { .. } = event {
                 #[cfg(desktop)]
-                if let Err(error) = shutdown_sidecar(app_handle) {
+                if let Err(error) = shutdown_sidecar_impl(app_handle) {
                     eprintln!("[tauri] Sidecar shutdown failed: {error}");
                 }
 

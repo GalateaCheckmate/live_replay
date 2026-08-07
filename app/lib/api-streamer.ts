@@ -162,6 +162,7 @@ export interface User {
 export interface FileList {
 	key: number;
 	name: string;
+	path?: string;
 	updateTime: number;
 	size: number;
 }

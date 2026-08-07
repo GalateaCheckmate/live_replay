@@ -87,69 +87,6 @@ replace_once(
 ''',
 )
 
-full = ROOT / ".github/workflows/full.yml"
-replace_once(
-    full,
-    '''      - name: Smoke test double-click startup
-''',
-    '''      - name: Download bundled FFmpeg
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $archive = Join-Path $env:RUNNER_TEMP 'ffmpeg-lgpl.zip'
-          $extract = Join-Path $env:RUNNER_TEMP 'ffmpeg-lgpl'
-          $uri = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl.zip'
-          Invoke-WebRequest -Uri $uri -OutFile $archive
-          if (Test-Path $extract) { Remove-Item -Recurse -Force $extract }
-          Expand-Archive -Path $archive -DestinationPath $extract -Force
-          $ffmpeg = Get-ChildItem -Path $extract -Filter ffmpeg.exe -File -Recurse | Select-Object -First 1
-          $ffprobe = Get-ChildItem -Path $extract -Filter ffprobe.exe -File -Recurse | Select-Object -First 1
-          if (-not $ffmpeg -or -not $ffprobe) {
-            throw 'Downloaded FFmpeg archive does not contain ffmpeg.exe and ffprobe.exe'
-          }
-          New-Item -ItemType Directory -Force -Path dist/ffmpeg | Out-Null
-          Copy-Item $ffmpeg.FullName dist/ffmpeg/ffmpeg.exe
-          Copy-Item $ffprobe.FullName dist/ffmpeg/ffprobe.exe
-          & dist/ffmpeg/ffmpeg.exe -version
-          if ($LASTEXITCODE -ne 0) { throw 'Bundled ffmpeg.exe failed its version smoke test' }
-          & dist/ffmpeg/ffprobe.exe -version
-          if ($LASTEXITCODE -ne 0) { throw 'Bundled ffprobe.exe failed its version smoke test' }
-
-      - name: Smoke test double-click startup
-''',
-)
-replace_once(
-    full,
-    '''          Copy-Item target/release/biliup.exe dist/live-replay/live-replay.exe
-          Copy-Item '启动 Live Replay.bat' 'dist/live-replay/启动 Live Replay.bat'
-          Copy-Item LICENSE dist/live-replay/LICENSE
-''',
-    '''          Copy-Item target/release/biliup.exe dist/live-replay/live-replay.exe
-          Copy-Item dist/ffmpeg/ffmpeg.exe dist/live-replay/ffmpeg.exe
-          Copy-Item dist/ffmpeg/ffprobe.exe dist/live-replay/ffprobe.exe
-          Copy-Item '启动 Live Replay.bat' 'dist/live-replay/启动 Live Replay.bat'
-          Copy-Item LICENSE dist/live-replay/LICENSE
-          Copy-Item FFMPEG-NOTICE.txt dist/live-replay/FFMPEG-NOTICE.txt
-''',
-)
-replace_once(
-    full,
-    '''      - name: Upload Windows package
-''',
-    '''      - name: Validate portable media tools
-        shell: pwsh
-        run: |
-          if (-not (Test-Path dist/live-replay/ffmpeg.exe)) { throw 'portable package is missing ffmpeg.exe' }
-          if (-not (Test-Path dist/live-replay/ffprobe.exe)) { throw 'portable package is missing ffprobe.exe' }
-          & dist/live-replay/ffmpeg.exe -version
-          if ($LASTEXITCODE -ne 0) { throw 'portable ffmpeg.exe could not start' }
-          & dist/live-replay/ffprobe.exe -version
-          if ($LASTEXITCODE -ne 0) { throw 'portable ffprobe.exe could not start' }
-
-      - name: Upload Windows package
-''',
-)
-
 live_replay = ROOT / "LIVE_REPLAY.md"
 replace_once(
     live_replay,
@@ -161,24 +98,23 @@ replace_once(
 
 notice = ROOT / "FFMPEG-NOTICE.txt"
 notice.write_text(
-    """FFmpeg notice for Live Replay\n\n"
+    "FFmpeg notice for Live Replay\n\n"
     "The Windows portable package includes ffmpeg.exe and ffprobe.exe from BtbN/FFmpeg-Builds.\n"
-    "Live Replay uses the win64 LGPL build and invokes FFmpeg as a separate executable for container remux/probing.\n\n"
+    "Live Replay uses the win64 LGPL build and invokes FFmpeg as separate executables for container remux/probing.\n\n"
     "FFmpeg project: https://ffmpeg.org/\n"
     "FFmpeg source: https://git.ffmpeg.org/ffmpeg.git\n"
     "Windows builds: https://github.com/BtbN/FFmpeg-Builds\n"
     "FFmpeg licensing information: https://ffmpeg.org/legal.html\n"
     "GNU LGPL 2.1: https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html\n\n"
-    "FFmpeg and its libraries are separate third-party software and remain under their respective licenses.\n"
-    """,
+    "FFmpeg and its libraries are separate third-party software and remain under their respective licenses.\n",
     encoding="utf-8",
 )
 
 trigger = ROOT / ".github/full-trigger"
 trigger.write_text(
     "Validate bundled portable ffmpeg/ffprobe resolution and package assembly.\n"
-    "Triggered: 2026-08-07T16:05:00+08:00\n",
+    "Triggered: 2026-08-07T16:12:00+08:00\n",
     encoding="utf-8",
 )
 
-print("bundled FFmpeg patch applied")
+print("bundled FFmpeg source patch applied")

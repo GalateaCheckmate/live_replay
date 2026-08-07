@@ -288,20 +288,22 @@ async fn mobile_start_recording(
     let worker_app = app_handle.clone();
     tauri::async_runtime::spawn(async move {
         let result = record_direct_stream(resolved, &output_dir, stop_flag).await;
-        let state = worker_app.state::<MobileCoreState>();
-        if let Ok(mut runtime) = state.runtime.lock() {
-            runtime.active = false;
-            runtime.current_file = None;
-            runtime.stop_flag = None;
-            match result {
-                Ok(recording) => {
-                    runtime.last_file = Some(recording.file_path);
-                    runtime.last_error = None;
+        {
+            let state = worker_app.state::<MobileCoreState>();
+            if let Ok(mut runtime) = state.runtime.lock() {
+                runtime.active = false;
+                runtime.current_file = None;
+                runtime.stop_flag = None;
+                match result {
+                    Ok(recording) => {
+                        runtime.last_file = Some(recording.file_path);
+                        runtime.last_error = None;
+                    }
+                    Err(error) => {
+                        runtime.last_error = Some(error);
+                    }
                 }
-                Err(error) => {
-                    runtime.last_error = Some(error);
-                }
-            }
+            };
         }
     });
 
@@ -386,7 +388,7 @@ pub fn run() {
                         if let Some(flag) = runtime.stop_flag.as_ref() {
                             request_stop(flag);
                         }
-                    }
+                    };
                 }
             }
         });

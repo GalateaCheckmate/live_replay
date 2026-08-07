@@ -5,6 +5,7 @@ use live_replay_core::bilibili::{
 use qrcode::{QrCode, render::svg};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tauri::Manager;
@@ -39,6 +40,14 @@ fn pending_qr_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| format!("无法获取 B站二维码数据目录: {error}"))
 }
 
+fn sync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(directory) = std::fs::File::open(parent) {
+            let _ = directory.sync_all();
+        }
+    }
+}
+
 async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -46,17 +55,21 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
             .map_err(|error| format!("创建 B站登录目录失败: {error}"))?;
     }
     let temp = PathBuf::from(format!("{}.tmp", path.to_string_lossy()));
-    fs::write(&temp, bytes)
-        .await
-        .map_err(|error| format!("写入 B站登录临时文件失败: {error}"))?;
-    if fs::metadata(path).await.is_ok() {
-        fs::remove_file(path)
-            .await
-            .map_err(|error| format!("替换 B站登录文件失败: {error}"))?;
+    {
+        let mut file = std::fs::File::create(&temp)
+            .map_err(|error| format!("创建 B站登录临时文件失败: {error}"))?;
+        file.write_all(bytes)
+            .map_err(|error| format!("写入 B站登录临时文件失败: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("同步 B站登录临时文件失败: {error}"))?;
     }
+    // Android/Linux rename over an existing path is atomic. Never delete the valid credential
+    // first, otherwise a power loss between remove and rename logs the user out unnecessarily.
     fs::rename(&temp, path)
         .await
-        .map_err(|error| format!("提交 B站登录文件失败: {error}"))
+        .map_err(|error| format!("提交 B站登录文件失败: {error}"))?;
+    sync_parent_dir(path);
+    Ok(())
 }
 
 async fn save_login(app: &tauri::AppHandle, login: &LoginInfo) -> Result<(), String> {
@@ -74,6 +87,35 @@ async fn read_login(app: &tauri::AppHandle) -> Result<LoginInfo, String> {
             _ => format!("读取 B站登录信息失败: {error}"),
         })?;
     serde_json::from_slice(&bytes).map_err(|error| format!("B站登录信息损坏: {error}"))
+}
+
+fn cookie_header_from_login(login: &LoginInfo) -> Option<String> {
+    let cookies = login.cookie_info.get("cookies")?.as_array()?;
+    let header = cookies
+        .iter()
+        .filter_map(|cookie| {
+            let name = cookie.get("name")?.as_str()?.trim();
+            let value = cookie.get("value")?.as_str()?.trim();
+            if name.is_empty() || value.is_empty() {
+                None
+            } else {
+                Some(format!("{name}={value}"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    if header.is_empty() { None } else { Some(header) }
+}
+
+/// Reuse the account already logged into the Android app for Bilibili live probing/recording.
+/// Reading the cached cookie is intentionally local-only; upload/auth workers remain responsible
+/// for token refresh so a 20-second monitor loop never hammers the passport API.
+pub async fn cached_recording_cookie(app: &tauri::AppHandle) -> Option<String> {
+    read_login(app)
+        .await
+        .ok()
+        .as_ref()
+        .and_then(cookie_header_from_login)
 }
 
 pub async fn load_valid_login(app: &tauri::AppHandle) -> Result<LoginInfo, String> {

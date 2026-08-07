@@ -18,6 +18,8 @@ mod mobile_bilibili;
 #[cfg(mobile)]
 mod mobile_bilibili_auth;
 #[cfg(mobile)]
+mod mobile_bilibili_worker;
+#[cfg(mobile)]
 mod mobile_monitor;
 #[cfg(mobile)]
 mod mobile_recordings;
@@ -63,7 +65,7 @@ fn spawn_and_monitor_sidecar(app_handle: tauri::AppHandle) -> Result<(), String>
 
     if let Some(state) = app_handle.try_state::<Arc<Mutex<Option<CommandChild>>>>() {
         println!("[tauri] Sidecar pid: {}", child.pid());
-        *state.lock().map_err(|_| "Failed to access app state".to_string())? = Some(child);
+        *state.lock().map_err(|_| "Failed to lock sidecar state")? = Some(child);
     } else {
         return Err("Failed to access app state".to_string());
     }
@@ -236,10 +238,11 @@ pub fn run() {
             #[cfg(mobile)]
             {
                 mobile_monitor::start_monitor_worker(app.handle().clone());
+                mobile_bilibili_worker::start_upload_worker(app.handle().clone());
                 // Keep the already-built YouTube worker alive for existing tasks, but new 15GB
                 // recording segments now feed Bilibili first. YouTube session merging comes later.
                 mobile_youtube::start_upload_worker(app.handle().clone());
-                println!("[tauri] Android monitor + 15GB recorder + Bilibili queue + frozen YouTube worker loaded.");
+                println!("[tauri] Android monitor + 15GB recorder + Bilibili multi-P worker + frozen YouTube worker loaded.");
             }
 
             Ok(())

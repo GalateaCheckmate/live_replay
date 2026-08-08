@@ -149,28 +149,43 @@ export default function Home() {
     const values = await formApi?.validate()
     if (!values) return
 
+    const url = String(values.url ?? '').trim()
+    let remark = String(values.remark ?? '').trim()
     const tags = String(values.tags_text ?? '')
       .split(/[，,]/)
       .map((item: string) => item.trim())
       .filter(Boolean)
 
-    const body = {
-      url: String(values.url ?? '').trim(),
-      remark: String(values.remark ?? '').trim(),
-      user_cookie: String(values.user_cookie ?? '').trim(),
-      title: String(values.title ?? '').trim(),
-      tid: Number(values.tid),
-      tags,
-      copyright: Number(values.copyright),
-      copyright_source: String(values.copyright_source ?? '').trim(),
-      description: String(values.description ?? '').trim(),
-      is_only_self: Number(values.is_only_self),
-      segment_minutes: Number(values.segment_minutes),
-      delete_after_success: values.delete_after_success !== false,
-    }
-
     setSaving(true)
     try {
+      if (!remark) {
+        const detection = await fetch(`${API_BASE}/v1/replay/detect-streamer`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url }),
+        })
+        if (!detection.ok) throw new Error(await detection.text())
+        const detected = await detection.json()
+        remark = String(detected?.name ?? '').trim()
+        if (!remark) throw new Error('未识别到主播名称，请手动填写')
+        formApi?.setValue('remark', remark)
+      }
+
+      const body = {
+        url,
+        remark,
+        user_cookie: String(values.user_cookie ?? '').trim(),
+        title: String(values.title ?? '').trim(),
+        tid: Number(values.tid),
+        tags,
+        copyright: Number(values.copyright),
+        copyright_source: String(values.copyright_source ?? '').trim(),
+        description: String(values.description ?? '').trim(),
+        is_only_self: Number(values.is_only_self),
+        segment_minutes: Number(values.segment_minutes),
+        delete_after_success: values.delete_after_success !== false,
+      }
+
       const response = await fetch(`${API_BASE}/v1/replay/streamers`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -339,7 +354,7 @@ export default function Home() {
               onChange={(value: any) => formApi?.setValue('copyright_source', String(value ?? ''))}
               rules={[{ required: true, message: '请填写直播间链接' }]}
             />
-            <Form.Input field="remark" label="主播名称" placeholder="填写便于识别的主播名称" rules={[{ required: true, message: '请填写主播名称' }]} />
+            <Form.Input field="remark" label="主播名称" placeholder="留空自动识别" />
             <Form.Select
               field="user_cookie"
               label="投稿账号"

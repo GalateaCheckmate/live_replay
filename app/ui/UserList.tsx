@@ -147,7 +147,7 @@ const UserList: React.FC<UserListProps> = ({ onCancel, visible }) => {
       onCancel={onCancel}
     >
       {(list ?? []).length === 0 ? (
-        <Typography.Text type="tertiary">还没有投稿账号。点击下方“添加账号”，推荐使用扫码登录。</Typography.Text>
+        <Typography.Text type="tertiary">暂无投稿账号</Typography.Text>
       ) : (
         <List
           dataSource={list}
@@ -182,9 +182,6 @@ const UserList: React.FC<UserListProps> = ({ onCancel, visible }) => {
           paddingRight: 10,
         }}
       >
-        <Typography.Paragraph type="tertiary">
-          推荐扫码登录。登录成功后账号会自动加入 Live Replay，可在不同主播之间复用。
-        </Typography.Paragraph>
         <Row type="flex" justify="center">
           <RadioGroup type="button" buttonSize="large" onChange={onChange} value={value}>
             <Radio value={2}>扫码登录</Radio>

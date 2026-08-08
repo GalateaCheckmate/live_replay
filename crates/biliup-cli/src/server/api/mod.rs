@@ -8,6 +8,8 @@ pub mod endpoints;
 pub mod replay_detect_endpoints;
 /// Live Replay 场次与上传队列端点
 pub mod replay_endpoints;
+/// Live Replay 投稿页聚合端点
+pub mod replay_submission_endpoints;
 /// Live Replay 稳定领域状态端点
 pub mod replay_state_endpoints;
 /// Live Replay 主播设置/开关的并发安全端点

@@ -27,10 +27,17 @@ interface DiskStatus {
   directory: string
   free_bytes?: number
   free_gb?: number
+  used_bytes?: number
+  used_gb?: number
   warning_gb: number
   stop_gb: number
   state: 'ok' | 'warning' | 'blocked' | 'unknown'
   message: string
+}
+
+const formatStorage = (value?: number) => {
+  if (value === undefined) return '-'
+  return `${value < 10 ? value.toFixed(2) : value.toFixed(1)} GB`
 }
 
 const ReplaySettings: React.FC = () => {
@@ -103,49 +110,46 @@ const ReplaySettings: React.FC = () => {
             {biliUsersLoading ? (
               <Spin />
             ) : (biliUsers ?? []).length === 0 ? (
-              <div>
-                <Text strong>还没有投稿账号</Text><br />
-                <Text type="tertiary">添加 B 站账号后，可为每个主播选择对应的投稿账号。</Text>
-              </div>
+              <Text strong>暂无投稿账号</Text>
             ) : (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-                  {(biliUsers ?? []).map(account => (
-                    <div
-                      key={account.id}
-                      style={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: 10,
-                        padding: '8px 12px',
-                        border: '1px solid var(--semi-color-border)',
-                        borderRadius: 8,
-                        backgroundColor: 'var(--semi-color-bg-1)',
-                      }}
-                    >
-                      <Avatar size="small" src={account.face}>{account.name?.slice(0, 1)}</Avatar>
-                      <div style={{ display: 'flex', flexDirection: 'column' }}>
-                        <Text strong>{account.name}</Text>
-                        <Text type="tertiary" size="small">可用于自动投稿</Text>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-                <Text type="tertiary">账号添加一次即可在多个主播之间使用。</Text>
+              <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+                {(biliUsers ?? []).map(account => (
+                  <div
+                    key={account.id}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 10,
+                      padding: '8px 12px',
+                      border: '1px solid var(--semi-color-border)',
+                      borderRadius: 8,
+                      backgroundColor: 'var(--semi-color-bg-1)',
+                    }}
+                  >
+                    <Avatar size="small" src={account.face}>{account.name?.slice(0, 1)}</Avatar>
+                    <Text strong>{account.name}</Text>
+                  </div>
+                ))}
               </div>
             )}
           </Card>
 
           {disk && (
             <Card style={{ marginBottom: 16 }}>
-              <Row gutter={16}>
-                <Col span={16}>
+              <Row gutter={16} align="middle">
+                <Col span={12}>
                   <Title heading={5}>存储</Title>
-                  <Text>{disk.message}</Text><br />
                   <Text type="tertiary">录像目录：{disk.directory}</Text>
+                  {disk.state !== 'ok' && (
+                    <><br /><Text type={disk.state === 'warning' ? 'warning' : 'danger'}>{disk.message}</Text></>
+                  )}
                 </Col>
-                <Col span={8} style={{ textAlign: 'right' }}>
-                  <Title heading={4}>{disk.free_gb === undefined ? '-' : `${disk.free_gb.toFixed(1)} GB`}</Title>
+                <Col span={6} style={{ textAlign: 'right' }}>
+                  <Title heading={4}>{formatStorage(disk.used_gb)}</Title>
+                  <Text type="tertiary">录像占用</Text>
+                </Col>
+                <Col span={6} style={{ textAlign: 'right' }}>
+                  <Title heading={4}>{formatStorage(disk.free_gb)}</Title>
                   <Text type="tertiary">剩余空间</Text>
                 </Col>
               </Row>

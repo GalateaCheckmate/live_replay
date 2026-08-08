@@ -4,6 +4,8 @@ pub mod auth;
 pub mod bilibili_endpoints;
 /// 通用API端点
 pub mod endpoints;
+/// Live Replay 主播识别端点
+pub mod replay_detect_endpoints;
 /// Live Replay 场次与上传队列端点
 pub mod replay_endpoints;
 /// Live Replay 稳定领域状态端点

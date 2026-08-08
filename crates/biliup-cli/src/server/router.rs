@@ -51,6 +51,10 @@ pub fn router(service_register: ServiceRegister) -> Router<()> {
             get(get_replay_streamer_settings).put(update_replay_streamer_settings_safe),
         )
         .route(
+            "/v1/replay/streamers/{id}/submit-test",
+            post(upload_now_streamer_endpoint),
+        )
+        .route(
             "/v1/replay/settings",
             get(get_configuration).put(put_configuration),
         )

@@ -15,9 +15,9 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 #[cfg(not(windows))]
 use std::process::Command;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use struct_patch::Patch;
 use tracing::{error, info, warn};
 
@@ -25,12 +25,17 @@ const DEFAULT_SEGMENT_TIME: &str = "01:00:00";
 const DEFAULT_DISK_WARNING_GB: u64 = 30;
 const DEFAULT_DISK_STOP_GB: u64 = 10;
 const GIB: u64 = 1024 * 1024 * 1024;
+const RECORDING_USAGE_CACHE_TTL: Duration = Duration::from_secs(10);
+
+static RECORDING_USAGE_CACHE: OnceLock<Mutex<Option<(Instant, PathBuf, u64)>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RecordingDiskStatus {
     pub directory: String,
     pub free_bytes: Option<u64>,
     pub free_gb: Option<f64>,
+    pub used_bytes: u64,
+    pub used_gb: f64,
     pub warning_gb: u64,
     pub stop_gb: u64,
     pub state: String,
@@ -70,6 +75,8 @@ pub fn recording_disk_status() -> RecordingDiskStatus {
         }
     }
     let free_gb = free_bytes.map(|value| value as f64 / GIB as f64);
+    let used_bytes = recording_directory_usage_bytes(&directory);
+    let used_gb = used_bytes as f64 / GIB as f64;
     let (state, message) = match free_bytes {
         None => (
             "unknown",
@@ -103,11 +110,56 @@ pub fn recording_disk_status() -> RecordingDiskStatus {
         directory: directory.display().to_string(),
         free_bytes,
         free_gb,
+        used_bytes,
+        used_gb,
         warning_gb,
         stop_gb,
         state: state.to_string(),
         message,
     }
+}
+
+fn recording_directory_usage_bytes(root: &Path) -> u64 {
+    let cache = RECORDING_USAGE_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache.lock()
+        && let Some((checked_at, cached_root, value)) = guard.as_ref()
+        && cached_root == root
+        && checked_at.elapsed() < RECORDING_USAGE_CACHE_TTL
+    {
+        return *value;
+    }
+
+    let value = scan_directory_usage_bytes(root);
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((Instant::now(), root.to_path_buf(), value));
+    }
+    value
+}
+
+fn scan_directory_usage_bytes(root: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                stack.push(entry.path());
+                continue;
+            }
+            if let Ok(metadata) = entry.metadata() {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+    }
+    total
 }
 
 #[derive(Debug, Clone)]

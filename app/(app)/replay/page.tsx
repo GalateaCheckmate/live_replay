@@ -1,70 +1,91 @@
 'use client'
 
-import { Button, Card, Col, Layout, Nav, Row, Spin, Table, Tag, Toast, Typography } from '@douyinfe/semi-ui'
+import { Button, Card, Col, Layout, Nav, Row, Spin, Tag, Toast, Typography } from '@douyinfe/semi-ui'
 import { IconRefresh, IconVideoListStroked } from '@douyinfe/semi-icons'
 import useSWR from 'swr'
-import { API_BASE, fetcher, ReplayUserState } from '@/app/lib/api-streamer'
+import { API_BASE, fetcher, ReplayStreamerState } from '@/app/lib/api-streamer'
 
-interface ReplaySessionSummary {
-  id: number
-  streamer_name: string
-  live_title: string
-  started_at: string
-  ended_at?: string
-  user_state: ReplayUserState
-  completed: boolean
-  expected_parts: number
-  verified_parts: number
-  pending_parts: number
-  bvid?: string
-  last_error?: string
-  requires_submission_reconciliation: boolean
-}
+type SubmissionPartPhase = 'recording' | 'waiting' | 'uploading' | 'completed' | 'error'
 
-interface ReplaySegmentSummary {
-  job_id: number
-  session_id: number
-  streamer_name: string
+interface SubmissionPart {
+  job_id?: number
   part_number: number
-  user_state: ReplayUserState
-  completed: boolean
+  phase: SubmissionPartPhase
   file_size: number
-  attempts: number
   last_error?: string
-  next_attempt_at?: string
   can_retry: boolean
 }
 
-interface ReplayActivity {
-  sessions: ReplaySessionSummary[]
-  segments: ReplaySegmentSummary[]
+interface SubmissionSession {
+  id: number
+  streamer_name: string
+  bvid?: string
+  requires_submission_reconciliation: boolean
+  last_error?: string
+  parts: SubmissionPart[]
 }
 
-const stateText: Record<ReplayUserState, string> = {
-  waiting: '等待开播',
-  recording: '正在录制',
-  uploading: '正在上传',
+interface SubmissionActivity {
+  sessions: SubmissionSession[]
+}
+
+const phaseLabel: Record<SubmissionPartPhase, string> = {
+  recording: '录制',
+  uploading: '上传',
+  waiting: '等待上传',
+  completed: '已完成',
   error: '异常',
 }
 
-const stateColor: Record<ReplayUserState, 'green' | 'red' | 'blue' | 'orange'> = {
-  waiting: 'green',
+const phaseColor: Record<SubmissionPartPhase, 'red' | 'blue' | 'grey' | 'green' | 'orange'> = {
   recording: 'red',
   uploading: 'blue',
+  waiting: 'grey',
+  completed: 'green',
   error: 'orange',
 }
 
-const formatBytes = (value: number) => {
-  if (!value) return '0 B'
-  const units = ['B', 'KB', 'MB', 'GB', 'TB']
-  const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1)
-  return `${(value / Math.pow(1024, index)).toFixed(index >= 3 ? 2 : 1)} ${units[index]}`
+const phaseOrder: SubmissionPartPhase[] = ['error', 'recording', 'uploading', 'waiting', 'completed']
+
+const formatBytes = (value?: number) => {
+  const bytes = Math.max(0, value ?? 0)
+  if (bytes < 1024) return `${bytes} B`
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let current = bytes / 1024
+  let index = 0
+  while (current >= 1024 && index < units.length - 1) {
+    current /= 1024
+    index += 1
+  }
+  return `${current.toFixed(index >= 2 ? 2 : 1)} ${units[index]}`
 }
 
-const formatTime = (value?: string) => {
-  if (!value) return '-'
-  const normalized = /(?:Z|[+-]\d{2}:\d{2})$/.test(value) ? value : `${value}Z`
-  return new Date(normalized).toLocaleString()
+const formatDuration = (seconds?: number) => {
+  const value = Math.max(0, Math.floor(seconds ?? 0))
+  const hours = Math.floor(value / 3600)
+  const minutes = Math.floor((value % 3600) / 60)
+  const secs = value % 60
+  return [hours, minutes, secs].map(item => String(item).padStart(2, '0')).join(':')
+}
+
+const compactParts = (parts: SubmissionPart[]) => {
+  const values = [...new Set(parts.map(part => part.part_number))].sort((a, b) => a - b)
+  if (values.length === 0) return '-'
+
+  const ranges: string[] = []
+  let start = values[0]
+  let previous = values[0]
+  for (let index = 1; index <= values.length; index += 1) {
+    const current = values[index]
+    if (current === previous + 1) {
+      previous = current
+      continue
+    }
+    ranges.push(start === previous ? `P${start}` : `P${start}–P${previous}`)
+    start = current
+    previous = current
+  }
+  return ranges.join('　')
 }
 
 export default function ReplayPage() {
@@ -75,27 +96,29 @@ export default function ReplayPage() {
     error,
     isLoading,
     mutate: refresh,
-  } = useSWR<ReplayActivity>('/v1/replay/activity', fetcher, { refreshInterval: 3000 })
+  } = useSWR<SubmissionActivity>('/v1/replay/submissions', fetcher, { refreshInterval: 3000 })
+  const { data: streamers, mutate: refreshStreamers } = useSWR<ReplayStreamerState[]>('/v1/replay/streamers', fetcher, { refreshInterval: 3000 })
 
-  const retry = async (id: number) => {
+  const retry = async (id?: number) => {
+    if (!id) return
     const response = await fetch(`${API_BASE}/v1/replay/jobs/${id}/retry`, { method: 'POST' })
     if (!response.ok) {
       Toast.error(await response.text())
       return
     }
-    Toast.success('已安排重新处理')
+    Toast.success('已重试')
     await refresh()
   }
 
-  const bindSubmission = async (session: ReplaySessionSummary) => {
-    const aidText = window.prompt('请输入已经存在的稿件 AID（纯数字）')
+  const bindSubmission = async (session: SubmissionSession) => {
+    const aidText = window.prompt('AID')
     if (!aidText) return
     const aid = Number(aidText.trim())
     if (!Number.isSafeInteger(aid) || aid <= 0) {
-      Toast.error('AID 格式不正确')
+      Toast.error('AID 无效')
       return
     }
-    const bvid = window.prompt('请输入 BVID；不知道可以留空')?.trim() || undefined
+    const bvid = window.prompt('BVID（可留空）')?.trim() || undefined
     const response = await fetch(`${API_BASE}/v1/replay/sessions/${session.id}/bind-submission`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -105,14 +128,12 @@ export default function ReplayPage() {
       Toast.error(await response.text())
       return
     }
-    Toast.success('稿件已绑定，后续分P将继续处理')
+    Toast.success('已绑定')
     await refresh()
   }
 
-  const resetSubmission = async (session: ReplaySessionSummary) => {
-    const confirmed = window.confirm(
-      '只有确认 B 站创作中心没有生成这场直播的稿件时，才能重新创建投稿。\n\n确认远端没有稿件并继续吗？'
-    )
+  const resetSubmission = async (session: SubmissionSession) => {
+    const confirmed = window.confirm('确认 B 站没有生成这次投稿？')
     if (!confirmed) return
     const response = await fetch(`${API_BASE}/v1/replay/sessions/${session.id}/reset-submission`, {
       method: 'POST',
@@ -123,95 +144,28 @@ export default function ReplayPage() {
       Toast.error(await response.text())
       return
     }
-    Toast.success('已确认远端无稿，将重新创建投稿')
+    Toast.success('已重置')
     await refresh()
+  }
+
+  const refreshAll = async () => {
+    await Promise.all([refresh(), refreshStreamers()])
   }
 
   if (isLoading) return <Spin size="large" />
 
   const sessions = data?.sessions ?? []
-  const activeSessions = sessions.filter(item => !item.completed)
-  const activeSegments = (data?.segments ?? []).filter(item => !item.completed)
-  const errorSessions = activeSessions.filter(item => item.user_state === 'error').length
-  const pendingBytes = activeSegments.reduce((sum, item) => sum + item.file_size, 0)
+  const counts = sessions
+    .flatMap(session => session.parts)
+    .reduce<Record<SubmissionPartPhase, number>>((result, part) => {
+      result[part.phase] += 1
+      return result
+    }, { recording: 0, waiting: 0, uploading: 0, completed: 0, error: 0 })
 
-  const sessionColumns = [
-    { title: '主播', dataIndex: 'streamer_name', width: 130 },
-    { title: '开始时间', dataIndex: 'started_at', width: 180, render: formatTime },
-    {
-      title: '状态',
-      width: 110,
-      render: (_: unknown, record: ReplaySessionSummary) => record.completed
-        ? <Tag color="green">已完成</Tag>
-        : <Tag color={stateColor[record.user_state]}>{stateText[record.user_state]}</Tag>,
-    },
-    {
-      title: '分P',
-      width: 100,
-      render: (_: unknown, record: ReplaySessionSummary) => `${record.verified_parts}/${record.expected_parts}`,
-    },
-    {
-      title: 'B站投稿',
-      width: 180,
-      render: (_: unknown, record: ReplaySessionSummary) => record.bvid
-        ? <a href={`https://www.bilibili.com/video/${record.bvid}`} target="_blank" rel="noreferrer">{record.bvid}</a>
-        : <Text type="tertiary">尚未创建</Text>,
-    },
-    {
-      title: '说明',
-      render: (_: unknown, record: ReplaySessionSummary) => {
-        if (record.user_state === 'error') {
-          return <Text type="danger" ellipsis={{ showTooltip: true }}>{record.last_error || '投稿结果需要人工确认'}</Text>
-        }
-        if (record.completed) return <Text type="tertiary">本场直播处理完成。</Text>
-        if (record.user_state === 'recording') return <Text>直播仍在进行，已完成的录像分段会自动投稿。</Text>
-        return <Text>还有 {record.pending_parts} 个录像分段正在处理。</Text>
-      },
-    },
-    {
-      title: '操作',
-      width: 190,
-      render: (_: unknown, record: ReplaySessionSummary) => record.requires_submission_reconciliation ? (
-        <div style={{ display: 'flex', gap: 6 }}>
-          <Button size="small" theme="solid" onClick={() => bindSubmission(record)}>绑定稿件</Button>
-          <Button size="small" type="danger" onClick={() => resetSubmission(record)}>确认无稿</Button>
-        </div>
-      ) : '-',
-    },
-  ]
-
-  const segmentColumns = [
-    { title: '主播', dataIndex: 'streamer_name', width: 120 },
-    { title: '分P', dataIndex: 'part_number', width: 70, render: (value: number) => `P${value}` },
-    {
-      title: '状态',
-      width: 110,
-      render: (_: unknown, record: ReplaySegmentSummary) => (
-        <Tag color={stateColor[record.user_state]}>{stateText[record.user_state]}</Tag>
-      ),
-    },
-    { title: '文件大小', dataIndex: 'file_size', width: 110, render: formatBytes },
-    { title: '处理次数', dataIndex: 'attempts', width: 90 },
-    {
-      title: '下次处理',
-      dataIndex: 'next_attempt_at',
-      width: 180,
-      render: (value?: string) => value ? formatTime(value) : '自动',
-    },
-    {
-      title: '说明',
-      render: (_: unknown, record: ReplaySegmentSummary) => record.last_error
-        ? <Text type={record.user_state === 'error' ? 'danger' : 'tertiary'} ellipsis={{ showTooltip: true }}>{record.last_error}</Text>
-        : <Text type="tertiary">自动处理</Text>,
-    },
-    {
-      title: '操作',
-      width: 90,
-      render: (_: unknown, record: ReplaySegmentSummary) => (
-        <Button size="small" disabled={!record.can_retry} onClick={() => retry(record.job_id)}>重试</Button>
-      ),
-    },
-  ]
+  const activeStreamerBySession = new Map<number, ReplayStreamerState>()
+  for (const streamer of streamers ?? []) {
+    if (streamer.active_session_id) activeStreamerBySession.set(streamer.active_session_id, streamer)
+  }
 
   return (
     <>
@@ -227,44 +181,122 @@ export default function ReplayPage() {
             </>
           }
           mode="horizontal"
-          footer={<Button icon={<IconRefresh />} onClick={() => refresh()}>刷新</Button>}
+          footer={<Button icon={<IconRefresh />} onClick={refreshAll}>刷新</Button>}
         />
       </Header>
-      <Content style={{ padding: 16, backgroundColor: 'var(--semi-color-bg-0)', overflow: 'auto' }}>
-        {error && (
-          <Card style={{ marginBottom: 16 }}>
-            <Text type="danger">投稿状态加载失败：{String(error)}</Text>
-          </Card>
-        )}
 
-        <Row gutter={[12, 12]} style={{ marginBottom: 16 }}>
-          <Col span={8}><Card><Title heading={4}>{activeSessions.length}</Title><Text>正在处理的直播场次</Text></Card></Col>
-          <Col span={8}><Card><Title heading={4}>{errorSessions}</Title><Text>需要人工处理</Text></Card></Col>
-          <Col span={8}><Card><Title heading={4}>{formatBytes(pendingBytes)}</Title><Text>待处理本地录像</Text></Card></Col>
-        </Row>
+      <Content style={{ padding: 20, backgroundColor: 'var(--semi-color-bg-0)', overflow: 'auto' }}>
+        <div style={{ maxWidth: 980, margin: '0 auto' }}>
+          {error && (
+            <Card style={{ marginBottom: 16 }}>
+              <Text type="danger">加载失败：{String(error)}</Text>
+            </Card>
+          )}
 
-        <Title heading={5} style={{ marginBottom: 10 }}>直播场次</Title>
-        <Table<ReplaySessionSummary>
-          size="small"
-          rowKey="id"
-          columns={sessionColumns}
-          dataSource={sessions}
-          pagination={{ pageSize: 12 }}
-          empty="暂无投稿记录"
-          style={{ marginBottom: 24 }}
-        />
+          <Row gutter={[12, 12]} style={{ marginBottom: 18 }}>
+            <Col span={6}><Card><Title heading={4}>{counts.recording}</Title><Text type="tertiary">录制</Text></Card></Col>
+            <Col span={6}><Card><Title heading={4}>{counts.uploading}</Title><Text type="tertiary">上传</Text></Card></Col>
+            <Col span={6}><Card><Title heading={4}>{counts.waiting}</Title><Text type="tertiary">等待</Text></Card></Col>
+            <Col span={6}><Card><Title heading={4}>{counts.error}</Title><Text type={counts.error > 0 ? 'danger' : 'tertiary'}>异常</Text></Card></Col>
+          </Row>
 
-        <Title heading={5} style={{ marginBottom: 4 }}>待处理分段</Title>
-        <Text type="tertiary">显示尚未完成的录像分段，完成后会自动从这里移除。</Text>
-        <Table<ReplaySegmentSummary>
-          size="small"
-          rowKey="job_id"
-          columns={segmentColumns}
-          dataSource={activeSegments}
-          pagination={{ pageSize: 20 }}
-          empty="暂无待处理分段"
-          style={{ marginTop: 10 }}
-        />
+          {sessions.length === 0 && (
+            <Card style={{ textAlign: 'center', padding: 28 }}>
+              <Text type="tertiary">暂无投稿</Text>
+            </Card>
+          )}
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            {sessions.map(session => {
+              const grouped = phaseOrder.reduce<Record<SubmissionPartPhase, SubmissionPart[]>>((result, phase) => {
+                result[phase] = session.parts.filter(part => part.phase === phase)
+                return result
+              }, { recording: [], waiting: [], uploading: [], completed: [], error: [] })
+              const activeStreamer = activeStreamerBySession.get(session.id)
+              const hasError = grouped.error.length > 0 || session.requires_submission_reconciliation
+
+              return (
+                <Card
+                  key={session.id}
+                  style={hasError ? { borderColor: 'var(--semi-color-warning)' } : undefined}
+                  title={<Title heading={5} style={{ margin: 0 }}>{session.streamer_name}</Title>}
+                  headerExtraContent={session.bvid ? (
+                    <a href={`https://www.bilibili.com/video/${session.bvid}`} target="_blank" rel="noreferrer">
+                      {session.bvid}
+                    </a>
+                  ) : null}
+                >
+                  <div style={{ display: 'flex', flexDirection: 'column' }}>
+                    {phaseOrder.map(phase => {
+                      const parts = grouped[phase]
+                      if (parts.length === 0) return null
+
+                      const recordingDetail = phase === 'recording' && activeStreamer
+                        ? `${formatDuration(activeStreamer.recording_elapsed_seconds)}　${formatBytes(activeStreamer.recording_bytes)}`
+                        : ''
+                      const uploadDetail = phase === 'uploading' && parts.length === 1
+                        ? formatBytes(parts[0].file_size)
+                        : ''
+                      const firstError = phase === 'error' ? parts.find(part => part.last_error) : undefined
+
+                      return (
+                        <div
+                          key={phase}
+                          style={{
+                            minHeight: 44,
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 14,
+                            borderTop: '1px solid var(--semi-color-border)',
+                            padding: '10px 0',
+                          }}
+                        >
+                          <div style={{ width: 82, flexShrink: 0 }}>
+                            <Tag color={phaseColor[phase]}>{phaseLabel[phase]}</Tag>
+                          </div>
+                          <Text strong style={{ minWidth: 90 }}>{compactParts(parts)}</Text>
+                          {(recordingDetail || uploadDetail) && (
+                            <Text type="tertiary">{recordingDetail || uploadDetail}</Text>
+                          )}
+                          {firstError?.last_error && (
+                            <Text type="danger" ellipsis={{ showTooltip: true }} style={{ flex: 1, minWidth: 0 }}>
+                              {firstError.last_error}
+                            </Text>
+                          )}
+                          {phase === 'error' && parts.some(part => part.can_retry) && (
+                            <Button size="small" onClick={() => retry(parts.find(part => part.can_retry)?.job_id)}>重试</Button>
+                          )}
+                        </div>
+                      )
+                    })}
+
+                    {session.requires_submission_reconciliation && (
+                      <div
+                        style={{
+                          minHeight: 44,
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 10,
+                          borderTop: '1px solid var(--semi-color-border)',
+                          padding: '10px 0',
+                        }}
+                      >
+                        <Tag color="orange">投稿确认</Tag>
+                        {session.last_error && (
+                          <Text type="danger" ellipsis={{ showTooltip: true }} style={{ flex: 1, minWidth: 0 }}>
+                            {session.last_error}
+                          </Text>
+                        )}
+                        <Button size="small" theme="solid" onClick={() => bindSubmission(session)}>绑定稿件</Button>
+                        <Button size="small" type="danger" onClick={() => resetSubmission(session)}>确认无稿</Button>
+                      </div>
+                    )}
+                  </div>
+                </Card>
+              )
+            })}
+          </div>
+        </div>
       </Content>
     </>
   )

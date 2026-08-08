@@ -1,2 +1,2 @@
-Validate Windows streamer auto-detection and current release UX: detect streamer name from a live-room URL when the name is omitted, preserve manual names, and verify the latest UI/backend integration.
-Triggered: 2026-08-08T12:01:00+08:00
+Validate Windows submission-card redesign and streamer auto-detection: per-part recording/upload/waiting/completed/error states, BVID links, reconciliation actions, and current release UX.
+Triggered: 2026-08-08T12:22:00+08:00

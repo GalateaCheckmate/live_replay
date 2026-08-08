@@ -82,6 +82,7 @@ export default function Home() {
   const [refreshing, setRefreshing] = useState(false)
   const [formApi, setFormApi] = useState<any>()
   const [switching, setSwitching] = useState<Set<number>>(new Set())
+  const [testing, setTesting] = useState<Set<number>>(new Set())
   const [selectedAccount, setSelectedAccount] = useState<string>()
   const addModalContentRef = useRef<HTMLDivElement>(null)
   const { typeTree, isLoading: typeTreeLoading, isError: typeTreeError } = useTypeTree(selectedAccount)
@@ -176,7 +177,7 @@ export default function Home() {
         body: JSON.stringify(body),
       })
       if (!response.ok) throw new Error(await response.text())
-      Notification.success({ title: '主播已添加', content: '检测到开播后将自动开始录制。' })
+      Notification.success({ title: '主播已添加' })
       setVisible(false)
       formApi?.reset()
       await refreshStreamers()
@@ -208,17 +209,31 @@ export default function Home() {
     }
   }
 
+  const submitTest = async (streamer: ReplayStreamerState) => {
+    setTesting(previous => new Set(previous).add(streamer.id))
+    try {
+      const response = await fetch(`${API_BASE}/v1/replay/streamers/${streamer.id}/submit-test`, { method: 'POST' })
+      if (!response.ok) throw new Error(await response.text())
+      Notification.success({ title: '测试分段已提交' })
+      await refreshStreamers()
+    } catch (error: any) {
+      Notification.error({ title: '测试投稿失败', content: error?.message ?? String(error), duration: 0 })
+    } finally {
+      setTesting(previous => {
+        const next = new Set(previous)
+        next.delete(streamer.id)
+        return next
+      })
+    }
+  }
+
   const refreshAll = async () => {
     setRefreshing(true)
     try {
       const response = await fetch(`${API_BASE}/v1/replay/refresh`, { method: 'POST' })
       if (!response.ok) throw new Error(await response.text())
-      const result = await response.json().catch(() => ({ checked: 0 }))
       await Promise.all([refreshStreamers(), refreshDisk()])
-      Notification.success({
-        title: '刷新完成',
-        content: `已重新检查 ${Number(result?.checked ?? 0)} 个等待中的主播。`,
-      })
+      Notification.success({ title: '刷新完成' })
     } catch (error: any) {
       Notification.error({ title: '刷新失败', content: error?.message ?? String(error) })
     } finally {
@@ -232,10 +247,7 @@ export default function Home() {
     <>
       <Header style={{ backgroundColor: 'var(--semi-color-bg-1)', padding: '0 24px' }}>
         <div style={{ minHeight: 64, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
-          <div>
-            <Title heading={4}>主播</Title>
-            <Text type="tertiary">自动监控开播状态，并完成录制与投稿</Text>
-          </div>
+          <Title heading={4}>主播</Title>
           <div style={{ display: 'flex', gap: 8 }}>
             <Button icon={<IconRefresh />} loading={refreshing} onClick={refreshAll}>刷新</Button>
             <Button theme="solid" icon={<IconPlusCircle />} onClick={openAdd}>添加主播</Button>
@@ -253,8 +265,7 @@ export default function Home() {
 
         {!isLoading && (streamers?.length ?? 0) === 0 && (
           <Card style={{ maxWidth: 720, margin: '48px auto', textAlign: 'center' }}>
-            <Title heading={4}>还没有主播</Title>
-            <Text type="tertiary">添加主播后，Live Replay 会自动监控开播状态。</Text>
+            <Title heading={4}>暂无主播</Title>
             <div style={{ marginTop: 20 }}><Button theme="solid" onClick={openAdd}>添加主播</Button></div>
           </Card>
         )}
@@ -280,16 +291,15 @@ export default function Home() {
                   </div>
                   <Text ellipsis={{ showTooltip: true }} type="tertiary">{streamer.url}</Text>
                   {streamer.user_state === 'recording' && (
-                    <Text>已录制 {formatDuration(streamer.recording_elapsed_seconds)} · {formatBytes(streamer.recording_bytes)}</Text>
+                    <Text>录制 {formatDuration(streamer.recording_elapsed_seconds)} · {formatBytes(streamer.recording_bytes)}</Text>
                   )}
                   {streamer.pending_upload_parts > 0 && (
-                    <Text>还有 {streamer.pending_upload_parts} 个录像分段正在处理</Text>
-                  )}
-                  {streamer.user_state === 'error' && (
-                    <Text type="danger">有任务需要处理，请在“投稿”中查看详情。</Text>
+                    <Text>待处理分段：{streamer.pending_upload_parts}</Text>
                   )}
                   <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
-                    <Link href="/replay"><Button size="small">投稿</Button></Link>
+                    {streamer.user_state === 'recording' && (
+                      <Button size="small" loading={testing.has(streamer.id)} onClick={() => submitTest(streamer)}>测试投稿</Button>
+                    )}
                     <Link href="/streamers"><Button size="small" theme="borderless">主播设置</Button></Link>
                   </div>
                 </div>
@@ -341,12 +351,6 @@ export default function Home() {
               rules={[{ required: true, message: '请先登录B站账号' }]}
               style={{ width: '100%' }}
             />
-
-            <Card style={{ margin: '12px 0' }}>
-              <Text strong>投稿设置</Text><br />
-              <Text type="tertiary">每场直播作为一个投稿；录像分段会按顺序追加为分P。</Text>
-            </Card>
-
             <Form.Input field="title" label="视频标题" rules={[{ required: true, message: '请填写视频标题格式' }]} />
             <Form.Select
               field="tid"
@@ -358,7 +362,7 @@ export default function Home() {
               style={{ width: '100%' }}
             />
             {defaultPartitionTid === undefined && !typeTreeLoading && (
-              <Text type="warning">未找到默认的“游戏 / 网络游戏”分区，请手动选择。</Text>
+              <Text type="warning">未找到“游戏 / 网络游戏”分区，请手动选择。</Text>
             )}
             <Form.Input field="tags_text" label="视频标签" placeholder="多个标签用逗号分隔，例如：游戏,直播回放" />
             <Form.Select
@@ -382,7 +386,6 @@ export default function Home() {
               max={1440}
               style={{ width: '100%' }}
             />
-            <Text type="tertiary">默认使用全局设置：{defaultSegmentMinutes} 分钟。</Text>
             <Form.Switch field="delete_after_success" label="投稿确认可播放后自动删除本地录像" />
           </Form>
         </div>

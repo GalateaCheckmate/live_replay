@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 import useSWR from 'swr'
 import { Button, Card, Col, Form, Layout, Modal, Notification, Row, Switch, Tag, Typography } from '@douyinfe/semi-ui'
@@ -83,6 +83,7 @@ export default function Home() {
   const [formApi, setFormApi] = useState<any>()
   const [switching, setSwitching] = useState<Set<number>>(new Set())
   const [selectedAccount, setSelectedAccount] = useState<string>()
+  const addModalContentRef = useRef<HTMLDivElement>(null)
   const { typeTree, isLoading: typeTreeLoading, isError: typeTreeError } = useTypeTree(selectedAccount)
 
   const accountOptions = (biliUsers ?? []).map(item => ({ label: item.name, value: item.value }))
@@ -112,16 +113,26 @@ export default function Home() {
     })
   }, [typeTree])
 
-  const deltaForceTid = useMemo(
-    () => partitionOptions.find((item: any) => item.name?.trim() === '三角洲行动')?.value as number | undefined,
+  const defaultPartitionTid = useMemo(
+    () => partitionOptions.find((item: any) => item.label?.trim() === '游戏 / 网络游戏')?.value
+      ?? partitionOptions.find((item: any) => item.name?.trim() === '网络游戏')?.value as number | undefined,
     [partitionOptions],
   )
 
   useEffect(() => {
-    if (!formApi || deltaForceTid === undefined) return
+    if (!formApi || defaultPartitionTid === undefined) return
     const currentTid = formApi.getValue?.('tid')
-    if (!currentTid) formApi.setValue('tid', deltaForceTid)
-  }, [deltaForceTid, formApi, selectedAccount])
+    if (!currentTid) formApi.setValue('tid', defaultPartitionTid)
+  }, [defaultPartitionTid, formApi, selectedAccount])
+
+  useEffect(() => {
+    if (!visible) return
+    const frame = requestAnimationFrame(() => {
+      const modalBody = addModalContentRef.current?.closest('.semi-modal-body')
+      if (modalBody instanceof HTMLElement) modalBody.scrollTop = 0
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [visible])
 
   const openAdd = () => {
     setVisible(true)
@@ -232,7 +243,7 @@ export default function Home() {
         </div>
       </Header>
 
-      <Content style={{ padding: 24, backgroundColor: 'var(--semi-color-bg-0)' }}>
+      <Content style={{ padding: 24, backgroundColor: 'var(--semi-color-bg-0)', overflow: 'auto' }}>
         {diskAttention && (
           <Card style={{ marginBottom: 16, borderColor: diskStatus.state === 'warning' ? 'var(--semi-color-warning)' : 'var(--semi-color-danger)' }}>
             <Text type={diskStatus.state === 'warning' ? 'warning' : 'danger'} strong>{diskStatus.message}</Text><br />
@@ -275,10 +286,10 @@ export default function Home() {
                     <Text>还有 {streamer.pending_upload_parts} 个录像分段正在处理</Text>
                   )}
                   {streamer.user_state === 'error' && (
-                    <Text type="danger">有任务需要处理，请在“场次与投稿”中查看详情。</Text>
+                    <Text type="danger">有任务需要处理，请在“投稿”中查看详情。</Text>
                   )}
                   <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
-                    <Link href="/replay"><Button size="small">场次与投稿</Button></Link>
+                    <Link href="/replay"><Button size="small">投稿</Button></Link>
                     <Link href="/streamers"><Button size="small" theme="borderless">主播设置</Button></Link>
                   </div>
                 </div>
@@ -295,83 +306,86 @@ export default function Home() {
         onOk={createStreamer}
         onCancel={() => setVisible(false)}
         okText="添加主播"
-        style={{ width: 680 }}
+        style={{ width: 680, maxWidth: 'calc(100vw - 32px)' }}
+        bodyStyle={{ maxHeight: 'calc(100vh - 220px)', overflowY: 'auto' }}
       >
-        <Form
-          getFormApi={setFormApi}
-          initValues={{
-            title: DEFAULT_TITLE,
-            tags_text: '游戏',
-            copyright: 2,
-            is_only_self: 1,
-            description: '',
-            segment_minutes: defaultSegmentMinutes,
-            delete_after_success: true,
-          }}
-        >
-          <Form.Input
-            field="url"
-            label="直播间链接"
-            placeholder="粘贴抖音、B站或斗鱼直播间链接"
-            onChange={(value: any) => formApi?.setValue('copyright_source', String(value ?? ''))}
-            rules={[{ required: true, message: '请填写直播间链接' }]}
-          />
-          <Form.Input field="remark" label="主播名称" placeholder="填写便于识别的主播名称" rules={[{ required: true, message: '请填写主播名称' }]} />
-          <Form.Select
-            field="user_cookie"
-            label="投稿账号"
-            optionList={accountOptions}
-            onChange={(value: any) => {
-              setSelectedAccount(String(value))
-              formApi?.setValue('tid', undefined)
+        <div ref={addModalContentRef}>
+          <Form
+            getFormApi={setFormApi}
+            initValues={{
+              title: DEFAULT_TITLE,
+              tags_text: '游戏',
+              copyright: 2,
+              is_only_self: 1,
+              description: '',
+              segment_minutes: defaultSegmentMinutes,
+              delete_after_success: true,
             }}
-            rules={[{ required: true, message: '请先登录B站账号' }]}
-            style={{ width: '100%' }}
-          />
+          >
+            <Form.Input
+              field="url"
+              label="直播间链接"
+              placeholder="粘贴抖音、B站或斗鱼直播间链接"
+              onChange={(value: any) => formApi?.setValue('copyright_source', String(value ?? ''))}
+              rules={[{ required: true, message: '请填写直播间链接' }]}
+            />
+            <Form.Input field="remark" label="主播名称" placeholder="填写便于识别的主播名称" rules={[{ required: true, message: '请填写主播名称' }]} />
+            <Form.Select
+              field="user_cookie"
+              label="投稿账号"
+              optionList={accountOptions}
+              onChange={(value: any) => {
+                setSelectedAccount(String(value))
+                formApi?.setValue('tid', undefined)
+              }}
+              rules={[{ required: true, message: '请先登录B站账号' }]}
+              style={{ width: '100%' }}
+            />
 
-          <Card style={{ margin: '12px 0' }}>
-            <Text strong>投稿设置</Text><br />
-            <Text type="tertiary">每场直播作为一个投稿；录像分段会按顺序追加为分P。</Text>
-          </Card>
+            <Card style={{ margin: '12px 0' }}>
+              <Text strong>投稿设置</Text><br />
+              <Text type="tertiary">每场直播作为一个投稿；录像分段会按顺序追加为分P。</Text>
+            </Card>
 
-          <Form.Input field="title" label="视频标题" rules={[{ required: true, message: '请填写视频标题格式' }]} />
-          <Form.Select
-            field="tid"
-            label="视频分区"
-            optionList={partitionOptions}
-            loading={typeTreeLoading}
-            placeholder={typeTreeError ? '分区获取失败，请重新选择账号或刷新' : '请选择B站分区'}
-            rules={[{ required: true, message: '请选择视频分区' }]}
-            style={{ width: '100%' }}
-          />
-          {deltaForceTid === undefined && !typeTreeLoading && (
-            <Text type="warning">未找到默认的“三角洲行动”分区，请手动选择。</Text>
-          )}
-          <Form.Input field="tags_text" label="视频标签" placeholder="多个标签用逗号分隔，例如：游戏,直播回放" />
-          <Form.Select
-            field="is_only_self"
-            label="可见范围"
-            optionList={[{ label: '仅自己可见', value: 1 }, { label: '公开', value: 0 }]}
-            style={{ width: '100%' }}
-          />
-          <Form.Select
-            field="copyright"
-            label="投稿类型"
-            optionList={[{ label: '转载', value: 2 }, { label: '自制', value: 1 }]}
-            style={{ width: '100%' }}
-          />
-          <Form.Input field="copyright_source" label="转载来源" placeholder="默认使用当前直播间链接；自制投稿时无需填写" />
-          <Form.TextArea field="description" label="简介" placeholder="可选" autosize={{ minRows: 2, maxRows: 5 }} />
-          <Form.InputNumber
-            field="segment_minutes"
-            label="单段时长（分钟）"
-            min={1}
-            max={1440}
-            style={{ width: '100%' }}
-          />
-          <Text type="tertiary">默认使用全局设置：{defaultSegmentMinutes} 分钟。</Text>
-          <Form.Switch field="delete_after_success" label="投稿确认可播放后自动删除本地录像" />
-        </Form>
+            <Form.Input field="title" label="视频标题" rules={[{ required: true, message: '请填写视频标题格式' }]} />
+            <Form.Select
+              field="tid"
+              label="视频分区"
+              optionList={partitionOptions}
+              loading={typeTreeLoading}
+              placeholder={typeTreeError ? '分区获取失败，请重新选择账号或刷新' : '请选择B站分区'}
+              rules={[{ required: true, message: '请选择视频分区' }]}
+              style={{ width: '100%' }}
+            />
+            {defaultPartitionTid === undefined && !typeTreeLoading && (
+              <Text type="warning">未找到默认的“游戏 / 网络游戏”分区，请手动选择。</Text>
+            )}
+            <Form.Input field="tags_text" label="视频标签" placeholder="多个标签用逗号分隔，例如：游戏,直播回放" />
+            <Form.Select
+              field="is_only_self"
+              label="可见范围"
+              optionList={[{ label: '仅自己可见', value: 1 }, { label: '公开', value: 0 }]}
+              style={{ width: '100%' }}
+            />
+            <Form.Select
+              field="copyright"
+              label="投稿类型"
+              optionList={[{ label: '转载', value: 2 }, { label: '自制', value: 1 }]}
+              style={{ width: '100%' }}
+            />
+            <Form.Input field="copyright_source" label="转载来源" placeholder="默认使用当前直播间链接；自制投稿时无需填写" />
+            <Form.TextArea field="description" label="简介" placeholder="可选" autosize={{ minRows: 2, maxRows: 5 }} />
+            <Form.InputNumber
+              field="segment_minutes"
+              label="单段时长（分钟）"
+              min={1}
+              max={1440}
+              style={{ width: '100%' }}
+            />
+            <Text type="tertiary">默认使用全局设置：{defaultSegmentMinutes} 分钟。</Text>
+            <Form.Switch field="delete_after_success" label="投稿确认可播放后自动删除本地录像" />
+          </Form>
+        </div>
       </Modal>
     </>
   )

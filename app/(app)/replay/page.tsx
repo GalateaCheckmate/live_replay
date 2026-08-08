@@ -238,6 +238,7 @@ export default function ReplayPage() {
                         ? formatBytes(parts[0].file_size)
                         : ''
                       const firstError = phase === 'error' ? parts.find(part => part.last_error) : undefined
+                      const errorText = firstError?.last_error || (phase === 'error' ? session.last_error : undefined)
 
                       return (
                         <div
@@ -258,19 +259,25 @@ export default function ReplayPage() {
                           {(recordingDetail || uploadDetail) && (
                             <Text type="tertiary">{recordingDetail || uploadDetail}</Text>
                           )}
-                          {firstError?.last_error && (
+                          {errorText && (
                             <Text type="danger" ellipsis={{ showTooltip: true }} style={{ flex: 1, minWidth: 0 }}>
-                              {firstError.last_error}
+                              {errorText}
                             </Text>
                           )}
-                          {phase === 'error' && parts.some(part => part.can_retry) && (
+                          {phase === 'error' && parts.some(part => part.can_retry) && !session.requires_submission_reconciliation && (
                             <Button size="small" onClick={() => retry(parts.find(part => part.can_retry)?.job_id)}>重试</Button>
+                          )}
+                          {phase === 'error' && session.requires_submission_reconciliation && (
+                            <>
+                              <Button size="small" theme="solid" onClick={() => bindSubmission(session)}>绑定稿件</Button>
+                              <Button size="small" type="danger" onClick={() => resetSubmission(session)}>确认无稿</Button>
+                            </>
                           )}
                         </div>
                       )
                     })}
 
-                    {session.requires_submission_reconciliation && (
+                    {session.requires_submission_reconciliation && grouped.error.length === 0 && (
                       <div
                         style={{
                           minHeight: 44,
@@ -281,7 +288,7 @@ export default function ReplayPage() {
                           padding: '10px 0',
                         }}
                       >
-                        <Tag color="orange">投稿确认</Tag>
+                        <Tag color="orange">异常</Tag>
                         {session.last_error && (
                           <Text type="danger" ellipsis={{ showTooltip: true }} style={{ flex: 1, minWidth: 0 }}>
                             {session.last_error}

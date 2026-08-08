@@ -10,6 +10,7 @@ use crate::server::api::endpoints::{
     post_streamers_endpoint, post_uploads, put_configuration, put_streamers_endpoint,
     refresh_streamers_endpoint, upload_now_streamer_endpoint,
 };
+use crate::server::api::replay_detect_endpoints::detect_streamer;
 use crate::server::api::replay_endpoints::{
     bind_replay_submission, get_replay_jobs, get_replay_sessions, reset_replay_submission,
     retry_replay_job,
@@ -38,6 +39,7 @@ pub fn router(service_register: ServiceRegister) -> Router<()> {
             "/v1/replay/streamers",
             get(get_replay_streamer_states).post(post_simple_streamer_endpoint),
         )
+        .route("/v1/replay/detect-streamer", post(detect_streamer))
         .route(
             "/v1/replay/streamers/{id}",
             delete(delete_streamers_endpoint),

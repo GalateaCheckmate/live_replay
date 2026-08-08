@@ -40,8 +40,6 @@ export default function Layout({ children }: { children: React.ReactNode }) {
         if (width <= 640) setIsCollapsed(true)
     }, [width])
 
-    // 主导航只保留 Live Replay 自己的概念。
-    // 旧投稿模板、Job 与 raw 任务状态页已经移除；日志页仅保留为隐藏排障入口。
     const items = useMemo(
         () => [
             {
@@ -51,7 +49,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
             },
             {
                 itemKey: 'replay',
-                text: '场次与投稿',
+                text: '投稿',
                 icon: navIcon('rgb(250 102 76)', <IconVideoListStroked size="small" />),
             },
             {
@@ -87,9 +85,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
     const onCollapseChange = useCallback(() => setIsCollapsed(!isCollapsed), [isCollapsed])
 
     return (
-        <html lang="zh-Hans">
-        <body style={{ width: '100%' }}>
-        <SeLayout className="components-layout-demo semi-light-scrollbar">
+        <SeLayout className="components-layout-demo semi-light-scrollbar" style={{ minHeight: '100vh' }}>
             <Sider>
                 <Nav
                     style={navStyle}
@@ -128,10 +124,8 @@ export default function Layout({ children }: { children: React.ReactNode }) {
                     </Nav.Footer>
                 </Nav>
             </Sider>
-            <SeLayout style={{ height: '100vh' }}>{children}</SeLayout>
+            <SeLayout style={{ height: '100vh', minWidth: 0, overflow: 'hidden' }}>{children}</SeLayout>
         </SeLayout>
-        </body>
-        </html>
     )
 }
 

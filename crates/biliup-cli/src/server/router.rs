@@ -21,6 +21,7 @@ use crate::server::api::replay_state_endpoints::{
 use crate::server::api::replay_streamer_endpoints::{
     set_replay_streamer_enabled_safe, update_replay_streamer_settings_safe,
 };
+use crate::server::api::replay_submission_endpoints::get_submission_activity;
 use crate::server::infrastructure::context::default_recording_output_dir;
 use crate::server::infrastructure::service_register::ServiceRegister;
 use axum::Router;
@@ -63,6 +64,7 @@ pub fn router(service_register: ServiceRegister) -> Router<()> {
         .route("/v1/replay/storage", get(get_disk_status_endpoint))
         .route("/v1/replay/refresh", post(refresh_streamers_endpoint))
         .route("/v1/replay/activity", get(get_replay_activity))
+        .route("/v1/replay/submissions", get(get_submission_activity))
         .route("/v1/replay/sessions", get(get_replay_sessions))
         .route("/v1/replay/jobs", get(get_replay_jobs))
         .route("/v1/replay/jobs/{id}/retry", post(retry_replay_job))

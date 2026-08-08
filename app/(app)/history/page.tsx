@@ -1,5 +1,5 @@
 'use client'
-import { Layout, Modal, Nav, Typography } from '@douyinfe/semi-ui'
+import { Card, Layout, Modal, Nav, Spin, Typography } from '@douyinfe/semi-ui'
 import { IconUserCardVideo, IconVideoListStroked } from '@douyinfe/semi-icons'
 import { Table } from '@douyinfe/semi-ui'
 import { SortOrder } from '@douyinfe/semi-ui/lib/es/table'
@@ -21,7 +21,7 @@ const encodeRecordingPath = (path: string) => path
 
 export default function Home() {
   const { Header, Content } = Layout
-  const { data } = useSWR<FileList[]>('/v1/videos', fetcher, { refreshInterval: 5000 })
+  const { data, error, isLoading } = useSWR<FileList[]>('/v1/videos', fetcher, { refreshInterval: 5000 })
   const { Text } = Typography
   const [filePath, setFilePath] = useState<string>()
   const columns = [
@@ -90,14 +90,25 @@ export default function Home() {
       </Header>
       <Content
         style={{
-          paddingLeft: 12,
-          paddingRight: 12,
+          padding: 16,
           backgroundColor: 'var(--semi-color-bg-0)',
+          overflow: 'auto',
         }}
       >
-        <main>
-          <Table size="small" columns={columns} dataSource={data ?? []} />
-        </main>
+        {isLoading ? (
+          <div style={{ padding: 32, textAlign: 'center' }}><Spin size="large" /></div>
+        ) : error ? (
+          <Card>
+            <Text type="danger">本地录像加载失败：{String(error)}</Text>
+          </Card>
+        ) : (
+          <Table
+            size="small"
+            columns={columns}
+            dataSource={data ?? []}
+            empty="暂无本地录像"
+          />
+        )}
         <Modal
           visible={visible}
           onCancel={handleCancel}

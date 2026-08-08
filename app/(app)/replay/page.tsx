@@ -72,6 +72,7 @@ export default function ReplayPage() {
   const { Title, Text } = Typography
   const {
     data,
+    error,
     isLoading,
     mutate: refresh,
   } = useSWR<ReplayActivity>('/v1/replay/activity', fetcher, { refreshInterval: 3000 })
@@ -222,14 +223,20 @@ export default function ReplayPage() {
               <div style={{ backgroundColor: 'rgb(250 102 76)', borderRadius: 8, color: 'white', display: 'flex', padding: 6 }}>
                 <IconVideoListStroked size="large" />
               </div>
-              <h4 style={{ marginLeft: 12 }}>场次与投稿</h4>
+              <h4 style={{ marginLeft: 12 }}>投稿</h4>
             </>
           }
           mode="horizontal"
           footer={<Button icon={<IconRefresh />} onClick={() => refresh()}>刷新</Button>}
         />
       </Header>
-      <Content style={{ padding: 16, backgroundColor: 'var(--semi-color-bg-0)' }}>
+      <Content style={{ padding: 16, backgroundColor: 'var(--semi-color-bg-0)', overflow: 'auto' }}>
+        {error && (
+          <Card style={{ marginBottom: 16 }}>
+            <Text type="danger">投稿状态加载失败：{String(error)}</Text>
+          </Card>
+        )}
+
         <Row gutter={[12, 12]} style={{ marginBottom: 16 }}>
           <Col span={8}><Card><Title heading={4}>{activeSessions.length}</Title><Text>正在处理的直播场次</Text></Card></Col>
           <Col span={8}><Card><Title heading={4}>{errorSessions}</Title><Text>需要人工处理</Text></Card></Col>
@@ -243,6 +250,7 @@ export default function ReplayPage() {
           columns={sessionColumns}
           dataSource={sessions}
           pagination={{ pageSize: 12 }}
+          empty="暂无投稿记录"
           style={{ marginBottom: 24 }}
         />
 
@@ -254,6 +262,7 @@ export default function ReplayPage() {
           columns={segmentColumns}
           dataSource={activeSegments}
           pagination={{ pageSize: 20 }}
+          empty="暂无待处理分段"
           style={{ marginTop: 10 }}
         />
       </Content>

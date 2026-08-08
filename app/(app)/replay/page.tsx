@@ -69,7 +69,7 @@ const formatDuration = (seconds?: number) => {
 }
 
 const compactParts = (parts: SubmissionPart[]) => {
-  const values = [...new Set(parts.map(part => part.part_number))].sort((a, b) => a - b)
+  const values = Array.from(new Set(parts.map(part => part.part_number))).sort((a, b) => a - b)
   if (values.length === 0) return '-'
 
   const ranges: string[] = []
